@@ -32,6 +32,12 @@ load fixtures/common
     echo "${PROXY_BLOCK?}" | grep -E "^  public_addr:" ${TELEPORT_CONFIG_PATH?} | grep -q "${TELEPORT_DOMAIN_NAME?}:443"
 }
 
+@test "[${TEST_SUITE?}] proxy_service.postgres_public_addr is set correctly" {
+    load ${TELEPORT_CONFD_DIR?}/conf
+    echo "${PROXY_BLOCK?}"
+    echo "${PROXY_BLOCK?}" | grep -E "^  postgres_public_addr:" | grep -q "${TELEPORT_PROXY_SERVER_NLB_ALIAS?}:443"
+}
+
 @test "[${TEST_SUITE?}] proxy_service.ssh_public_addr is set correctly" {
     load ${TELEPORT_CONFD_DIR?}/conf
     echo "${PROXY_BLOCK?}"

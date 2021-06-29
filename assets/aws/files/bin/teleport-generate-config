@@ -108,6 +108,7 @@ EOS
 write_ssh_and_tunnel_section() {
     PASSED_EXTERNAL_TUNNEL_PORT="$1"
     SSH_PORT=3023
+    POSTGRES_PORT=443
     if [[ "${TELEPORT_PROXY_SERVER_LB}" != "" ]]; then
         # ACM
         if [[ "${USE_ACM}" == "true" ]]; then
@@ -121,6 +122,9 @@ write_ssh_and_tunnel_section() {
                 # when using ACM, we have to set up a dedicated listener and target group as
                 # SSL termination is handled by the ACM ALB and it can't multiplex the tunnel connections
                 TUNNEL_HOSTNAME="${TELEPORT_PROXY_SERVER_NLB_ALIAS}"
+                # when using ACM, we have to add a specific public addr for postgres which lives on the NLB
+                # (rather than the ACM ALB) so that Teleport's multiplexer can be used to route connections
+                POSTGRES_HOSTNAME="${TELEPORT_PROXY_SERVER_NLB_ALIAS}"
             fi
         # non-ACM
         else
@@ -135,10 +139,13 @@ write_ssh_and_tunnel_section() {
                 # can be multiplexed over the same connection as regular web proxy traffic
                 # this is automatically enabled when Teleport's web and tunnel listeners are configured to use the same port
                 TUNNEL_HOSTNAME="${TELEPORT_DOMAIN_NAME}"
+                # when ACM is not being used, Postgres connections are multiplexed on the regular web listener
+                POSTGRES_HOSTNAME="${TELEPORT_DOMAIN_NAME}"
             fi
         fi
     fi
     cat << EOS >> ${USE_CONFIG_PATH}
+  postgres_public_addr: ${POSTGRES_HOSTNAME}:${POSTGRES_PORT}
   ssh_public_addr: ${SSH_HOSTNAME}:${SSH_PORT}
   tunnel_public_addr: ${TUNNEL_HOSTNAME}:${TUNNEL_PORT}
 EOS
