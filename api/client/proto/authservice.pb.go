@@ -8469,7 +8469,7 @@ type AuthServiceServer interface {
 	GetSessionEvents(context.Context, *GetSessionEventsRequest) (*Events, error)
 	// GetLock gets a lock by name.
 	GetLock(context.Context, *GetLockRequest) (*types.LockV2, error)
-	// GetLocks gets all locks matching at least one of the targets.
+	// GetLocks gets all locks, matching at least one of the targets when specified.
 	GetLocks(context.Context, *GetLocksRequest) (*GetLocksResponse, error)
 	// UpsertLock upserts a lock.
 	UpsertLock(context.Context, *types.LockV2) (*empty.Empty, error)

@@ -581,14 +581,14 @@ func (c *lockCollection) resources() (r []types.Resource) {
 }
 
 func (c *lockCollection) writeText(w io.Writer) error {
-	t := asciitable.MakeTable([]string{"ID", "Target", "In Force Until"})
+	t := asciitable.MakeTable([]string{"ID", "Target", "Message", "Expires"})
 	for _, lock := range c.locks {
-		inForceUntil := "unlimited"
-		if lock.InForceUntil() != nil {
-			inForceUntil = lock.InForceUntil().Format(time.RFC822)
-		}
 		target := lock.Target()
-		t.AddRow([]string{lock.GetName(), target.String(), inForceUntil})
+		expires := "never"
+		if lock.LockExpiry() != nil {
+			expires = lock.LockExpiry().Format(time.RFC822)
+		}
+		t.AddRow([]string{lock.GetName(), target.String(), lock.Message(), expires})
 	}
 	_, err := t.AsBuffer().WriteTo(w)
 	return trace.Wrap(err)

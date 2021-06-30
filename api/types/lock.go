@@ -28,11 +28,14 @@ import (
 type Lock interface {
 	Resource
 
-	// Target gets the lock's target.
+	// Target returns the lock's target.
 	Target() LockTarget
 
-	// InForceUntil gets the time until the lock is in force.
-	InForceUntil() *time.Time
+	// Message returns the message displayed to locked-out users.
+	Message() string
+
+	// LockExpiry returns when the lock ceases to be in force.
+	LockExpiry() *time.Time
 
 	// IsInForce returns whether the lock is in force.
 	IsInForce(clockwork.Clock) bool
@@ -109,22 +112,27 @@ func (c *LockV2) SetSubKind(sk string) {
 	c.SubKind = sk
 }
 
-// Target gets the lock's target.
+// Target returns the lock's target.
 func (c *LockV2) Target() LockTarget {
 	return c.Spec.Target
 }
 
-// InForceUntil gets the time until the lock is in force.
-func (c *LockV2) InForceUntil() *time.Time {
-	return c.Spec.InForceUntil
+// Message returns the message displayed to locked-out users.
+func (c *LockV2) Message() string {
+	return c.Spec.Message
+}
+
+// LockExpiry returns when the lock ceases to be in force.
+func (c *LockV2) LockExpiry() *time.Time {
+	return c.Spec.Expires
 }
 
 // IsInForce returns whether the lock is in force.
 func (c *LockV2) IsInForce(clock clockwork.Clock) bool {
-	if c.Spec.InForceUntil == nil {
+	if c.Spec.Expires == nil {
 		return true
 	}
-	return clock.Now().Before(*c.Spec.InForceUntil)
+	return clock.Now().Before(*c.Spec.Expires)
 }
 
 // setStaticFields sets static resource header and metadata fields.

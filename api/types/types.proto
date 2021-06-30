@@ -2206,11 +2206,11 @@ message LockSpecV2 {
     LockTarget Target = 1 [ (gogoproto.nullable) = false, (gogoproto.jsontag) = "target" ];
     // Message is the message displayed to locked-out users.
     string Message = 2 [ (gogoproto.jsontag) = "message,omitempty" ];
-    // InForceUntil specifies the time when the lock ceases to be in force.
-    google.protobuf.Timestamp InForceUntil = 3 [
+    // Expires if set specifies when the lock ceases to be in force.
+    google.protobuf.Timestamp Expires = 3 [
         (gogoproto.stdtime) = true,
         (gogoproto.nullable) = true,
-        (gogoproto.jsontag) = "in_force_until,omitempty"
+        (gogoproto.jsontag) = "expires,omitempty"
     ];
 }
 
