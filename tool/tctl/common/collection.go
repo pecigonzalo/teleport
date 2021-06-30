@@ -586,7 +586,7 @@ func (c *lockCollection) writeText(w io.Writer) error {
 		target := lock.Target()
 		expires := "never"
 		if lock.LockExpiry() != nil {
-			expires = lock.LockExpiry().Format(time.RFC822)
+			expires = apiutils.HumanTimeFormat(*lock.LockExpiry())
 		}
 		t.AddRow([]string{lock.GetName(), target.String(), lock.Message(), expires})
 	}
