@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package protocol implements reading/writing MongoDB wire protocol messages
 // from/to client/server and converting them into parsed data structures.
@@ -30,18 +32,18 @@ limitations under the License.
 //
 // Package layout:
 //
-// * message.go: Defines wire message common interface and provides methods for
-//   reading wire messages from client/server connections.
+//   - message.go: Defines wire message common interface and provides methods for
+//     reading wire messages from client/server connections.
 //
-// * opmsg.go: Contains marshal/unmarshal for OP_MSG - extensible message that
-//   MongoDB 3.6 and higher use for all commands.
+//   - opmsg.go: Contains marshal/unmarshal for OP_MSG - extensible message that
+//     MongoDB 3.6 and higher use for all commands.
 //
-// * opquery.go: Contains marshal/unmarshal for OP_QUERY - a legacy command,
-//   still used for some operations (e.g. first "isMaster" handshake message).
+//   - opquery.go: Contains marshal/unmarshal for OP_QUERY - a legacy command,
+//     still used for some operations (e.g. first "isMaster" handshake message).
 //
-// * opreply.go: Contains marshal/unmarshal for OP_REPLY - a reply message sent
-//   by a database to an OP_QUERY command.
+//   - opreply.go: Contains marshal/unmarshal for OP_REPLY - a reply message sent
+//     by a database to an OP_QUERY command.
 //
-// * errors.go: Provides methods for sending errors in wire message to client
-//   connections.
+//   - errors.go: Provides methods for sending errors in wire message to client
+//     connections.
 package protocol

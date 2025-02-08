@@ -1,32 +1,39 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package postgres
 
 import (
-	"os/user"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/gravitational/teleport/lib/client/db/profile"
-
 	"github.com/gravitational/trace"
 	"gopkg.in/ini.v1"
+
+	"github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/lib/client/db/profile"
 )
+
+func init() {
+	ini.PrettyFormat = false // Pretty format breaks psql.
+}
 
 // ServiceFile represents Postgres connection service file.
 //
@@ -38,18 +45,33 @@ type ServiceFile struct {
 	path string
 }
 
-// Load loads Postgres connection service file from the default location.
-func Load() (*ServiceFile, error) {
+// DefaultConfigPath returns the default config path, which is .pg_service.conf
+// file in the user's home directory.
+func defaultConfigPath() (string, error) {
 	// Default location is .pg_service.conf file in the user's home directory.
 	// TODO(r0mant): Check PGSERVICEFILE and PGSYSCONFDIR env vars as well.
-	user, err := user.Current()
-	if err != nil {
-		return nil, trace.ConvertSystemError(err)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		usr, err := utils.CurrentUser()
+		if err != nil {
+			return "", trace.ConvertSystemError(err)
+		}
+		home = usr.HomeDir
 	}
-	return LoadFromPath(filepath.Join(user.HomeDir, pgServiceFile))
+
+	return filepath.Join(home, pgServiceFile), nil
 }
 
-// LoadFromPath loads Posrtgres connection service file from the specified path.
+// Load loads Postgres connection service file from the default location.
+func Load() (*ServiceFile, error) {
+	cnfPath, err := defaultConfigPath()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return LoadFromPath(cnfPath)
+}
+
+// LoadFromPath loads Postgres connection service file from the specified path.
 func LoadFromPath(path string) (*ServiceFile, error) {
 	// Loose load will ignore file not found error.
 	iniFile, err := ini.LooseLoad(path)
@@ -67,18 +89,18 @@ func LoadFromPath(path string) (*ServiceFile, error) {
 // The profile goes into a separate section with the name equal to the
 // name of the database that user is logged into and looks like this:
 //
-//   [postgres]
-//   host=proxy.example.com
-//   port=3080
-//   sslmode=verify-full
-//   sslrootcert=/home/user/.tsh/keys/proxy.example.com/certs.pem
-//   sslcert=/home/user/.tsh/keys/proxy.example.com/alice-db/root/aurora-x509.pem
-//   sslkey=/home/user/.tsh/keys/proxy.example.com/user
+//	[postgres]
+//	host=proxy.example.com
+//	port=3080
+//	sslmode=verify-full
+//	sslrootcert=/home/user/.tsh/keys/proxy.example.com/certs.pem
+//	sslcert=/home/user/.tsh/keys/proxy.example.com/alice-db/root/aurora-x509.pem
+//	sslkey=/home/user/.tsh/keys/proxy.example.com/user
 //
 // With the profile like this, a user can refer to it using "service" psql
 // parameter:
 //
-//   $ psql "service=postgres <other parameters>"
+//	$ psql "service=postgres <other parameters>"
 func (s *ServiceFile) Upsert(profile profile.ConnectProfile) error {
 	section := s.iniFile.Section(profile.Name)
 	if section != nil {
@@ -104,7 +126,7 @@ func (s *ServiceFile) Upsert(profile profile.ConnectProfile) error {
 	section.NewKey("sslrootcert", profile.CACertPath)
 	section.NewKey("sslcert", profile.CertPath)
 	section.NewKey("sslkey", profile.KeyPath)
-	ini.PrettyFormat = false // Pretty format breaks psql.
+	section.NewKey("gssencmode", "disable") // we dont support GSS encryption.
 	return s.iniFile.SaveTo(s.path)
 }
 
@@ -163,6 +185,13 @@ func (s *ServiceFile) Env(serviceName string) (map[string]string, error) {
 			return nil, trace.Wrap(err)
 		}
 		env["PGDATABASE"] = database.Value()
+	}
+	if section.HasKey("gssencmode") {
+		gssEncMode, err := section.GetKey("gssencmode")
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		env["PGGSSENCMODE"] = gssEncMode.Value()
 	}
 	return env, nil
 }

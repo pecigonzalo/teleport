@@ -18,6 +18,8 @@ package main
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/tls"
 	"encoding/base64"
@@ -31,7 +33,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/square/go-jose.v2/jwt"
+	"github.com/go-jose/go-jose/v3/jwt"
 )
 
 // jwk is a JSON Web Key, described in detail in RFC 7517.
@@ -40,10 +42,18 @@ type jwk struct {
 	KeyType string `json:"kty"`
 	// Algorithm used to sign.
 	Algorithm string `json:"alg"`
+
 	// N is the modulus of the public key.
 	N string `json:"n"`
 	// E is the exponent of the public key.
 	E string `json:"e"`
+
+	// Curve identifies the cryptographic curve used with an ECDSA public key.
+	Curve string `json:"crv,omitempty"`
+	// X is the x coordinate parameter of an ECDSA public key.
+	X string `json:"x,omitempty"`
+	// Y is the y coordinate parameter of an ECDSA public key.
+	Y string `json:"y,omitempty"`
 }
 
 // jwksResponse is the response format for the JWK endpoint.
@@ -62,6 +72,9 @@ type claims struct {
 
 	// Roles returns the list of roles assigned to the user within Teleport.
 	Roles []string `json:"roles"`
+
+	// Traits returns the mapping of traits assigned to the user within Teleport.
+	Traits map[string][]string `json:"traits"`
 }
 
 // getPublicKey fetches the public key from the JWK endpoint.
@@ -91,6 +104,21 @@ func getPublicKey(url string, insecureSkipVerify bool) (crypto.PublicKey, error)
 
 	// Construct a crypto.PublicKey from the response.
 	jwk := response.Keys[0]
+	switch jwk.KeyType {
+	case "RSA":
+		return unmarshalRSAJWK(jwk)
+	case "EC":
+		return unmarshalECDSAJWK(jwk)
+	default:
+		return nil, fmt.Errorf("unsupported key type %v", jwk.KeyType)
+	}
+}
+
+func unmarshalRSAJWK(jwk jwk) (*rsa.PublicKey, error) {
+	if jwk.Algorithm != "RS256" {
+		return nil, fmt.Errorf("unsupported algorithm %v", jwk.Algorithm)
+	}
+
 	n, err := base64.RawURLEncoding.DecodeString(jwk.N)
 	if err != nil {
 		return nil, err
@@ -99,9 +127,34 @@ func getPublicKey(url string, insecureSkipVerify bool) (crypto.PublicKey, error)
 	if err != nil {
 		return nil, err
 	}
+
 	return &rsa.PublicKey{
 		N: new(big.Int).SetBytes(n),
 		E: int(new(big.Int).SetBytes(e).Uint64()),
+	}, nil
+}
+
+func unmarshalECDSAJWK(jwk jwk) (*ecdsa.PublicKey, error) {
+	if jwk.Algorithm != "ES256" {
+		return nil, fmt.Errorf("unsupported algorithm %v", jwk.Algorithm)
+	}
+	if jwk.Curve != elliptic.P256().Params().Name {
+		return nil, fmt.Errorf("unsupported curve %v", jwk.Curve)
+	}
+
+	x, err := base64.RawURLEncoding.DecodeString(jwk.X)
+	if err != nil {
+		return nil, err
+	}
+	y, err := base64.RawURLEncoding.DecodeString(jwk.Y)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     new(big.Int).SetBytes(x),
+		Y:     new(big.Int).SetBytes(y),
 	}, nil
 }
 
@@ -140,6 +193,27 @@ func printClaims(claims *claims) {
 	fmt.Printf("-----------\n")
 	fmt.Printf("Username: %v.\n", claims.Username)
 	fmt.Printf("Roles:    %v.\n", strings.Join(claims.Roles, ","))
+
+	// Calculate the spacing between trait name and trait values.
+	maxLength := 0
+	printTraits := false
+	for name := range claims.Traits {
+		printTraits = true
+		nameLength := len(name)
+		if nameLength > maxLength {
+			maxLength = nameLength
+		}
+	}
+	maxLength++ // Increment by one for aligned trait values.
+
+	// Pretty print the traits (if there are any)
+	if printTraits {
+		fmt.Println("Traits:")
+		for name, values := range claims.Traits {
+			fmt.Printf("  %-*s %s\n", maxLength, name+":", strings.Join(values, ","))
+		}
+	}
+
 	fmt.Printf("Issuer:   %v.\n", claims.Issuer)
 	fmt.Printf("Subject:  %v.\n", claims.Subject)
 	fmt.Printf("Audience: %v.\n", claims.Audience)

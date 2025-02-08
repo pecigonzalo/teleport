@@ -2,32 +2,34 @@
 // +build bpf,!386
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package bpf
 
 import (
+	_ "embed"
+
 	"github.com/aquasecurity/libbpfgo"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/trace"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/gravitational/teleport"
-
-	_ "embed"
+	"github.com/gravitational/teleport/lib/observability/metrics"
 )
 
 var (
@@ -95,7 +97,7 @@ type rawConn6Event struct {
 }
 
 type conn struct {
-	module *libbpfgo.Module
+	session
 
 	event4Buf *RingBuffer
 	event6Buf *RingBuffer
@@ -104,7 +106,7 @@ type conn struct {
 }
 
 func startConn(bufferSize int) (*conn, error) {
-	err := utils.RegisterPrometheusCollectors(lostNetworkEvents)
+	err := metrics.RegisterPrometheusCollectors(lostNetworkEvents)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -116,45 +118,45 @@ func startConn(bufferSize int) (*conn, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	c.module, err = libbpfgo.NewModuleFromBuffer(networkBPF, "network")
+	c.session.module, err = libbpfgo.NewModuleFromBuffer(networkBPF, "network")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Resizing the ring buffer must be done here, after the module
 	// was created but before it's loaded into the kernel.
-	if err = ResizeMap(c.module, network4EventsBuffer, uint32(bufferSize*pageSize)); err != nil {
+	if err = ResizeMap(c.session.module, network4EventsBuffer, uint32(bufferSize*pageSize)); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	if err = ResizeMap(c.module, network6EventsBuffer, uint32(bufferSize*pageSize)); err != nil {
+	if err = ResizeMap(c.session.module, network6EventsBuffer, uint32(bufferSize*pageSize)); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Load into the kernel
-	if err = c.module.BPFLoadObject(); err != nil {
+	if err = c.session.module.BPFLoadObject(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	if err = AttachKprobe(c.module, "tcp_v4_connect"); err != nil {
+	if err = AttachKprobe(c.session.module, "tcp_v4_connect"); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	if err = AttachKprobe(c.module, "tcp_v6_connect"); err != nil {
+	if err = AttachKprobe(c.session.module, "tcp_v6_connect"); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	c.event4Buf, err = NewRingBuffer(c.module, network4EventsBuffer)
+	c.event4Buf, err = NewRingBuffer(c.session.module, network4EventsBuffer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	c.event6Buf, err = NewRingBuffer(c.module, network6EventsBuffer)
+	c.event6Buf, err = NewRingBuffer(c.session.module, network6EventsBuffer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	c.lost, err = NewCounter(c.module, "lost", lostNetworkEvents)
+	c.lost, err = NewCounter(c.session.module, "lost", lostNetworkEvents)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -168,7 +170,7 @@ func (c *conn) close() {
 	c.lost.Close()
 	c.event4Buf.Close()
 	c.event6Buf.Close()
-	c.module.Close()
+	c.session.module.Close()
 }
 
 // v4Events contains raw events off the perf buffer.

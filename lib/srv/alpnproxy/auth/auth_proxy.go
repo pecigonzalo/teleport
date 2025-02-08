@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package alpnproxyauth
 
@@ -20,35 +22,34 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"strings"
 
 	"github.com/gravitational/trace"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
-	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/defaults"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/multiplexer"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/srv/alpnproxy"
 	"github.com/gravitational/teleport/lib/srv/alpnproxy/common"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
 type sitesGetter interface {
-	GetSites() ([]reversetunnel.RemoteSite, error)
-}
-
-type authGetter interface {
-	GetClusterName(opts ...services.MarshalOption) (types.ClusterName, error)
-	GetAuthServers() ([]types.Server, error)
+	GetSites() ([]reversetunnelclient.RemoteSite, error)
 }
 
 // NewAuthProxyDialerService create new instance of AuthProxyDialerService.
-func NewAuthProxyDialerService(reverseTunnelServer sitesGetter, accessPoint authGetter) *AuthProxyDialerService {
+func NewAuthProxyDialerService(reverseTunnelServer sitesGetter, localClusterName string, authServers []string, proxySigner multiplexer.PROXYHeaderSigner, tracer oteltrace.Tracer) *AuthProxyDialerService {
 	return &AuthProxyDialerService{
 		reverseTunnelServer: reverseTunnelServer,
-		accessPoint:         accessPoint,
+		localClusterName:    localClusterName,
+		authServers:         authServers,
+		proxySigner:         proxySigner,
+		tracer:              tracer,
 	}
 }
 
@@ -56,7 +57,10 @@ func NewAuthProxyDialerService(reverseTunnelServer sitesGetter, accessPoint auth
 // cluster name and ALPN set to teleport-auth protocol.
 type AuthProxyDialerService struct {
 	reverseTunnelServer sitesGetter
-	accessPoint         authGetter
+	localClusterName    string
+	authServers         []string
+	proxySigner         multiplexer.PROXYHeaderSigner
+	tracer              oteltrace.Tracer
 }
 
 func (s *AuthProxyDialerService) HandleConnection(ctx context.Context, conn net.Conn, connInfo alpnproxy.ConnectionInfo) error {
@@ -65,11 +69,13 @@ func (s *AuthProxyDialerService) HandleConnection(ctx context.Context, conn net.
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	authConn, err := s.dialAuthServer(ctx, clusterName)
+
+	authConn, err := s.dialAuthServer(ctx, clusterName, conn.RemoteAddr(), conn.LocalAddr())
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	defer authConn.Close()
+
 	if err := s.proxyConn(ctx, conn, authConn); err != nil {
 		return trace.Wrap(err)
 	}
@@ -92,57 +98,77 @@ func getClusterName(info alpnproxy.ConnectionInfo) (string, error) {
 	return cn, nil
 }
 
-func (s *AuthProxyDialerService) dialAuthServer(ctx context.Context, clusterNameFromSNI string) (net.Conn, error) {
-	clusterName, err := s.accessPoint.GetClusterName()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if clusterName.GetClusterName() == clusterNameFromSNI {
-		return s.dialLocalAuthServer(ctx)
+func (s *AuthProxyDialerService) dialAuthServer(ctx context.Context, clusterNameFromSNI string, clientSrcAddr, clientDstAddr net.Addr) (net.Conn, error) {
+	if clusterNameFromSNI == s.localClusterName {
+		return s.dialLocalAuthServer(ctx, clientSrcAddr, clientDstAddr)
 	}
 	if s.reverseTunnelServer != nil {
-		return s.dialRemoteAuthServer(ctx, clusterNameFromSNI)
+		return s.dialRemoteAuthServer(ctx, clusterNameFromSNI, clientSrcAddr, clientDstAddr)
 	}
 	return nil, trace.NotFound("auth server for %q cluster name not found", clusterNameFromSNI)
 }
 
-func (s *AuthProxyDialerService) dialLocalAuthServer(ctx context.Context) (net.Conn, error) {
-	authServers, err := s.accessPoint.GetAuthServers()
+func (s *AuthProxyDialerService) dialLocalAuthServer(ctx context.Context, clientSrcAddr, clientDstAddr net.Addr) (net.Conn, error) {
+	ctx, span := s.tracer.Start(ctx, "authProxyDialerService/dialLocalAuthServer",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			attribute.String("src_addr", fmt.Sprintf("%v", clientSrcAddr)),
+			attribute.String("dst_addr", fmt.Sprintf("%v", clientDstAddr)),
+			attribute.String("cluster_name", s.localClusterName),
+		))
+	defer span.End()
+
+	if len(s.authServers) == 0 {
+		return nil, trace.NotFound("empty auth servers list")
+	}
+
+	addr := utils.ChooseRandomString(s.authServers)
+	d := &net.Dialer{
+		Timeout: defaults.DefaultIOTimeout,
+	}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if len(authServers) == 0 {
-		return nil, trace.NotFound("empty auth servers list")
-	}
-	var errors []error
+	span.AddEvent("dialed remote server")
 
-	// iterate over the addresses in random order
-	for len(authServers) > 0 {
-		l := len(authServers)
-		authServerIndex := rand.Intn(l)
-		addr := authServers[authServerIndex].GetAddr()
-		var d net.Dialer
-		conn, err := d.DialContext(ctx, "tcp", addr)
-		if err == nil {
-			return conn, nil
+	// We'll write signed PROXY header to the outgoing connection to securely
+	// propagate observed client ip to the auth server.
+	if s.proxySigner != nil && clientSrcAddr != nil && clientDstAddr != nil {
+		b, err := s.proxySigner.SignPROXYHeader(clientSrcAddr, clientDstAddr)
+		if err != nil {
+			return nil, trace.Wrap(err, "could not create signed PROXY header")
 		}
-		errors = append(errors, fmt.Errorf("%s: %w", addr, err))
-		authServers[authServerIndex] = authServers[l-1]
-		authServers = authServers[:l-1]
+
+		_, err = conn.Write(b)
+		if err != nil {
+			return nil, trace.Wrap(err, "could not write PROXY line to remote connection")
+		}
+		span.AddEvent("wrote signed PROXY header")
 	}
-	return nil, trace.NewAggregate(errors...)
+
+	return conn, nil
 }
 
-func (s *AuthProxyDialerService) dialRemoteAuthServer(ctx context.Context, clusterName string) (net.Conn, error) {
+func (s *AuthProxyDialerService) dialRemoteAuthServer(ctx context.Context, clusterName string, clientSrcAddr, clientDstAddr net.Addr) (net.Conn, error) {
+	_, span := s.tracer.Start(ctx, "authProxyDialerService/dialRemoteAuthServer",
+		oteltrace.WithSpanKind(oteltrace.SpanKindServer),
+		oteltrace.WithAttributes(
+			attribute.String("src_addr", fmt.Sprintf("%v", clientSrcAddr)),
+			attribute.String("dst_addr", fmt.Sprintf("%v", clientDstAddr)),
+			attribute.String("cluster_name", clusterName),
+		))
+	defer span.End()
+
 	sites, err := s.reverseTunnelServer.GetSites()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	for _, s := range sites {
-		if s.GetName() != clusterName {
+	for _, site := range sites {
+		if site.GetName() != clusterName {
 			continue
 		}
-		conn, err := s.DialAuthServer()
+		conn, err := site.DialAuthServer(reversetunnelclient.DialParams{From: clientSrcAddr, OriginalClientDstAddr: clientDstAddr})
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}

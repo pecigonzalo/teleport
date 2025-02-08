@@ -17,21 +17,31 @@ limitations under the License.
 package client
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"log"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-
-	"github.com/gravitational/teleport/api/identityfile"
-	"github.com/gravitational/teleport/api/profile"
-	"github.com/gravitational/teleport/api/utils/sshutils"
-
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/identityfile"
+	"github.com/gravitational/teleport/api/profile"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/api/utils/sshutils"
 )
 
 func TestLoadTLS(t *testing.T) {
@@ -45,6 +55,9 @@ func TestLoadTLS(t *testing.T) {
 	tlsConfig, err := creds.TLSConfig()
 	require.NoError(t, err)
 	requireEqualTLSConfig(t, expectedTLSConfig, tlsConfig)
+	expiry, ok := creds.Expiry()
+	require.False(t, ok, "Expiry should not be knows on creds built only from TLS Config")
+	require.True(t, expiry.IsZero(), "unknown expiry should be zero")
 
 	// Load invalid tls.Config.
 	invalidTLSCreds := LoadTLS(nil)
@@ -89,12 +102,18 @@ func TestLoadIdentityFile(t *testing.T) {
 	require.NoError(t, err)
 	requireEqualSSHConfig(t, expectedSSHConfig, sshConfig)
 
+	expiry, ok := creds.Expiry()
+	require.True(t, ok, "Expiry should be known when we build creds from an identity file")
+	require.Equal(t, tlsCertNotAfter, expiry)
+
 	// Load invalid identity.
 	creds = LoadIdentityFile("invalid_path")
 	_, err = creds.TLSConfig()
 	require.Error(t, err)
 	_, err = creds.SSHClientConfig()
 	require.Error(t, err)
+	_, ok = creds.Expiry()
+	require.False(t, ok, "expiry should be unknown on a broken id file")
 }
 
 func TestLoadIdentityFileFromString(t *testing.T) {
@@ -135,12 +154,18 @@ func TestLoadIdentityFileFromString(t *testing.T) {
 	require.NoError(t, err)
 	requireEqualSSHConfig(t, expectedSSHConfig, sshConfig)
 
+	expiry, ok := creds.Expiry()
+	require.True(t, ok, "expiry should be known when we build creds from an identity file")
+	require.Equal(t, tlsCertNotAfter, expiry)
+
 	// Load invalid identity.
 	creds = LoadIdentityFileFromString("invalid_creds")
 	_, err = creds.TLSConfig()
 	require.Error(t, err)
 	_, err = creds.SSHClientConfig()
 	require.Error(t, err)
+	_, ok = creds.Expiry()
+	require.False(t, ok, "expiry should be unknown on a broken id file")
 }
 
 func TestLoadKeyPair(t *testing.T) {
@@ -165,10 +190,41 @@ func TestLoadKeyPair(t *testing.T) {
 	tlsConfig, err := creds.TLSConfig()
 	require.NoError(t, err)
 	requireEqualTLSConfig(t, expectedTLSConfig, tlsConfig)
+	expiry, ok := creds.Expiry()
+	require.True(t, ok, "expiry should be known when we build creds from cert files")
+	require.Equal(t, tlsCertNotAfter, expiry)
 
 	// Load invalid keypairs.
 	invalidIdentityCreds := LoadKeyPair("invalid_path", "invalid_path", "invalid_path")
 	_, err = invalidIdentityCreds.TLSConfig()
+	require.Error(t, err)
+	_, ok = invalidIdentityCreds.Expiry()
+	require.False(t, ok, "expiry should be unknown on a broken credential")
+}
+
+func TestKeyPair(t *testing.T) {
+	t.Parallel()
+
+	// Load expected tls.Config.
+	expectedTLSConfig := getExpectedTLSConfig(t)
+
+	// Load key pair from disk.
+	creds, err := KeyPair(tlsCert, keyPEM, tlsCACert)
+	require.NoError(t, err)
+
+	// Build tls.Config and compare to expected tls.Config.
+	tlsConfig, err := creds.TLSConfig()
+	require.NoError(t, err)
+	requireEqualTLSConfig(t, expectedTLSConfig, tlsConfig)
+
+	// Load invalid keypairs.
+	invalidIdentityCreds, err := KeyPair([]byte("invalid_cert"), []byte("invalid_key"), []byte("invalid_ca_cert"))
+	require.NoError(t, err)
+	_, err = invalidIdentityCreds.TLSConfig()
+	require.Error(t, err)
+
+	// Load missing keypairs
+	_, err = KeyPair(nil, nil, nil)
 	require.Error(t, err)
 }
 
@@ -196,8 +252,8 @@ func TestLoadProfile(t *testing.T) {
 		require.Error(t, err)
 		_, err = creds.SSHClientConfig()
 		require.Error(t, err)
-		_, err = creds.Dialer(Config{})
-		require.Error(t, err)
+		_, ok := creds.Expiry()
+		require.False(t, ok, "expiry should be unknown on a broken profile")
 	})
 }
 
@@ -217,9 +273,10 @@ func testProfileContents(t *testing.T, dir, name string) {
 	sshConfig, err := creds.SSHClientConfig()
 	require.NoError(t, err)
 	requireEqualSSHConfig(t, expectedSSHConfig, sshConfig)
-	// Build Dialer
-	_, err = creds.Dialer(Config{})
-	require.NoError(t, err)
+
+	expiry, ok := creds.Expiry()
+	require.True(t, ok, "expiry should be known when we build creds from a profile")
+	require.Equal(t, tlsCertNotAfter, expiry)
 }
 
 func writeProfile(t *testing.T, p *profile.Profile) {
@@ -228,12 +285,14 @@ func writeProfile(t *testing.T, p *profile.Profile) {
 	require.NoError(t, os.MkdirAll(p.KeyDir(), 0700))
 	require.NoError(t, os.MkdirAll(p.ProxyKeyDir(), 0700))
 	require.NoError(t, os.MkdirAll(p.TLSClusterCASDir(), 0700))
-	require.NoError(t, os.WriteFile(p.UserKeyPath(), keyPEM, 0600))
+	require.NoError(t, os.WriteFile(p.UserSSHKeyPath(), keyPEM, 0600))
+	require.NoError(t, os.WriteFile(p.UserTLSKeyPath(), keyPEM, 0600))
 	require.NoError(t, os.WriteFile(p.TLSCertPath(), tlsCert, 0600))
 	require.NoError(t, os.WriteFile(p.TLSCAPathCluster(p.SiteName), tlsCACert, 0600))
 	require.NoError(t, os.WriteFile(p.KnownHostsPath(), sshCACert, 0600))
 	require.NoError(t, os.MkdirAll(p.SSHDir(), 0700))
 	require.NoError(t, os.WriteFile(p.SSHCertPath(), sshCert, 0600))
+	require.NoError(t, os.WriteFile(p.PPKFilePath(), ppkFile, 0600))
 }
 
 func getExpectedTLSConfig(t *testing.T) *tls.Config {
@@ -250,7 +309,13 @@ func getExpectedTLSConfig(t *testing.T) *tls.Config {
 }
 
 func getExpectedSSHConfig(t *testing.T) *ssh.ClientConfig {
-	config, err := sshutils.ProxyClientSSHConfig(sshCert, keyPEM, [][]byte{sshCACert})
+	cert, err := sshutils.ParseCertificate(sshCert)
+	require.NoError(t, err)
+
+	priv, err := keys.ParsePrivateKey(keyPEM)
+	require.NoError(t, err)
+
+	config, err := sshutils.ProxyClientSSHConfig(cert, priv, sshCACert)
 	require.NoError(t, err)
 
 	return config
@@ -293,6 +358,7 @@ m1gfG9yqEte7pxv3yWM+7X2bzEjCBds4feahuKPNxOAOSfLUZiTpmOVlRzrpRIhu
 WQdM2NXAMABGAofGrVklPIiraUoHzr0Xxpia4vQwRewYXv8bCPHW+8g8vGBGvoG2
 gtLit9DL5DR5ac/CRGJt
 -----END CERTIFICATE-----`)
+	tlsCertNotAfter = time.Date(2021, 2, 18, 8, 28, 21, 0, time.UTC)
 
 	keyPEM = []byte(`-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAzkUVoJ4rn2XAi2HJeBIIxlsdMPGzLroJub9eHAVspAueDJLS
@@ -347,4 +413,167 @@ Na6B0YR7mdrrL+lyzymnOr6UOrT5nUWRAB1QeY7dhBNnsvoZwaS3VLSc1KCk
 	sshCert = []byte("ssh-rsa-cert-v01@openssh.com AAAAHHNzaC1yc2EtY2VydC12MDFAb3BlbnNzaC5jb20AAAAg8C10PShw+GxCadSlC4nFURIAyvDtgWRvHPabpL5wzDQAAAADAQABAAABAQDORRWgniufZcCLYcl4EgjGWx0w8bMuugm5v14cBWykC54MktKCpB24dOiDTVH0wABGhZTBtAs3QMhskUrvRSvARNdu5ERwbOoW9aU4Mtn+kxZBaP4eFk1luBkEojvAJewNrbkY3N5gJ5O9avpL6UGEu7Z5IZhQmBPIysTLZWBt/ceJEOm7ZZez/cyOl2b+UUa5c6gA7sGaRHC2FYtE4yE6j28d6w2U+JfhJrJYWqBvsROVbvhmFy5b8AfRP2pnzdWfSqbODm+iccbHvZI3jIq/ZsIjZAVlcoR/yxEwwPV2urE0Nnu+TGDO8lyS2DpgSleINe+kH9U9cnu2vxoJ+LdlAAAAAAAAAAAAAAABAAAADGFjY2Vzcy1hZG1pbgAAABAAAAAMYWNjZXNzLWFkbWluAAAAAGAtfCkAAAAAYC4lJQAAAAAAAACdAAAAFnBlcm1pdC1wb3J0LWZvcndhcmRpbmcAAAAAAAAACnBlcm1pdC1wdHkAAAAAAAAADnRlbGVwb3J0LXJvbGVzAAAALQAAACl7InZlcnNpb24iOiJ2MSIsInJvbGVzIjpbImFjY2Vzcy1hZG1pbiJdfQAAAA90ZWxlcG9ydC10cmFpdHMAAAATAAAAD3sibG9naW5zIjpudWxsfQAAAAAAAAEXAAAAB3NzaC1yc2EAAAADAQABAAABAQD3VbuNmR0h3tjYIkTVG+HfNByigp6tuNl8XVylIWx7a7ojRA1nJVzAtNs9QQMut8XY+7jxf4Ue83eIaE0e0QKA0GZlRdbSG0zaYzK8CDAcPVN6Ywt8jnGKuuMhBAckGkN/9nyuJHgTAKeHYgdgQgijPuW/D59s3Sk3vCRHryZzJfZDQ52i40B1q2zLvCcQa6UBvPblHAF3usRa08DnsNkgLey1EkkyvBazqt1amH2Epl3uJRHHUtRVSp2a+0597leT58RZNFfFfB9pccPJfD7cn+iiDmN62T/8YslLYl/O6xCJ43Or7wIRHwJ1tY5hq/Bw7LYn29zeBrIkxIvsH8WtAAABFAAAAAxyc2Etc2hhMi01MTIAAAEAhIz0X+wgA0B8Bi67ALpTEA3kHVWaQY3aT+Ig8obof9upq51H0YlySPJph8h6pVzfSJzQYtuGbmzQ/XAGRMn541mnSUGoy0WCHzscyCowaj9VgjFyVpct7Nz98dB3PnRocNTajGGla+AteZEU3d6KXv/CaA4NGwO3k0rYB+UfX0AAaatAwwxnzYehpCvwSqPdrq/OIyb0aljZHADoNRrcnmYDbB1V76WWY6eTCxYGXx1QyU4A8kH9U8pIZ1fVif/i8dSTbBTftTtv5bmO4WUbVscRw/xIqgZ8v6StNLGHPTt/+Zn+iUoiIrwcnpy+yQp2SRTv7+Lg2SSvJO818x3NNg==")
 
 	sshCACert = []byte("@cert-authority *.example.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDMIgxZpT5362npj0x6NQA76IB73bcK85K8cEyKURuHtFC83RjBzvzqtUz6X02+6ohVZiR2MdmsXkCLznzwEIZ0NtoxgnLTZLmduPLeAuYW2vIFpd0G17y6Yog9vxhQ0BLdlhU5Y3JYjRYjmQMfe1iD/RXWD6rEvgWlz+c3HMQR33JqkVIEFH34upfkC2RQG3TXjMe5t14l3yCTtyF5YGzN7+6z/4+/EDto/F3zVtSEp+k8XE/m0ddTGo7usa8ErAom31RwrgkNRmgJmPleDwEflybEsgGKApJXkfFxmG2wu20JoEt/CFjY3fIIa/5aqIGJPpMH4aEdLcj/iyNCog8D type=host")
+
+	ppkFile = []byte(`PuTTY-User-Key-File-3: ssh-rsa
+Encryption: none
+Comment: test.com
+Public-Lines: 6
+AAAAB3NzaC1yc2EAAAADAQABAAABAQDORRWgniufZcCLYcl4EgjGWx0w8bMuugm5
+v14cBWykC54MktKCpB24dOiDTVH0wABGhZTBtAs3QMhskUrvRSvARNdu5ERwbOoW
+9aU4Mtn+kxZBaP4eFk1luBkEojvAJewNrbkY3N5gJ5O9avpL6UGEu7Z5IZhQmBPI
+ysTLZWBt/ceJEOm7ZZez/cyOl2b+UUa5c6gA7sGaRHC2FYtE4yE6j28d6w2U+Jfh
+JrJYWqBvsROVbvhmFy5b8AfRP2pnzdWfSqbODm+iccbHvZI3jIq/ZsIjZAVlcoR/
+yxEwwPV2urE0Nnu+TGDO8lyS2DpgSleINe+kH9U9cnu2vxoJ+Ld
+Private-Lines: 14
+AAABAE1Vk207wAksAgt/5yQwRr/vizs9czuSnnDYsbT5x6idfm0iYvB+DXKJyl7o
+D1Ee5zuJe6NAGHBnxn0F4D1jBqs4ZDj8NjicbQucn4w5bIfIp7BwZ83p+KypYB/f
+n11EGoNqXZpXvLv6Oqbqw9rQIjNcmWZC1TNqQQioFS5Y3NV/gw5uYCRXZlSLMsRC
+vcX2+LN2EP76ZbkpIVpTCidC2TxwFPPbyMsG774Olfz4U2IDgX1mO+milF7RIa/v
+PADSeHAX6tJHmZ13GsyP0GAdPbFa0Ls/uykeGi1uGPFkdkNEqbWlDf1Z9IG0dr/c
+k2eh8G2X8E+VFgzsKp4kWtH9nGEAAACBAOQgKFCPDVQPRqgCX7O4ZBh0MKV9V9fi
+aRYReHWSrFeNDUXqmitL3f5lk2I5TDjzuqKJaz6Ag1JUGFOqaCA7RJ3yeipGLizI
+MWSp0tjpQ7YSqGSXvWlEwj9UYU1R8sgAUV2xoLTTChWJGd/AvfiTPl+U9HimUx3i
+vsI4mXeefrJtAAAAgQDneUWh0uIpCNBHsihSYan4/qqesPA51TVF9P2Ox7fnE5v2
+1i9mzdeRRdT4wQYAxbU++ajW/3E6Nlt0VgH0j+0hhNLKNhA1oWOAkw8wtLHaqMzO
+EVcBjl/y3bT8IG3ZXWrjppry1HaWX/9C9jiaq8lRpoHSmS5qwVsoxclwYp292QAA
+AIBV1ZA8WqvC+xZrPwmtmN87BHwGjqpE52kbUfcD94k8IqqhPR9oN9uOlcoBzZiS
+3SkunUpmzKlcXe63RQYOEqEVlTNOafcYNc5gW8NXKrgF7vBE91VsfmOGJvLt3pIv
+k53lH1qmEOm9+vrhNwNzpHk4AqDkP+0YDG++B4n0BtJJpw==
+Private-MAC: 8951bbe929e0714a61df01bc8fbc5223e3688f174aee29339931984fb9224c7d`)
 )
+
+func TestDynamicIdentityFileCreds(t *testing.T) {
+	dir := t.TempDir()
+	identityPath := filepath.Join(dir, "identity")
+
+	idFile := &identityfile.IdentityFile{
+		PrivateKey: keyPEM,
+		Certs: identityfile.Certs{
+			TLS: tlsCert,
+			SSH: sshCert,
+		},
+		CACerts: identityfile.CACerts{
+			TLS: [][]byte{tlsCACert},
+			SSH: [][]byte{sshCACert},
+		},
+	}
+	require.NoError(t, identityfile.Write(idFile, identityPath))
+
+	cred, err := NewDynamicIdentityFileCreds(identityPath)
+	require.NoError(t, err)
+
+	// Check the initial TLS certificate/key has been loaded.
+	tlsConfig, err := cred.TLSConfig()
+	require.NoError(t, err)
+	gotTLSCert, err := tlsConfig.GetClientCertificate(&tls.CertificateRequestInfo{
+		// We always return the same cert so this can be empty
+	})
+	require.NoError(t, err)
+	wantTLSCert, err := tls.X509KeyPair(tlsCert, keyPEM)
+	require.NoError(t, err)
+	wantTLSCert.Leaf = nil
+	require.Equal(t, wantTLSCert, *gotTLSCert)
+
+	expiry, ok := cred.Expiry()
+	require.True(t, ok, "expiry should be known when we build creds from an identity file")
+	require.Equal(t, tlsCertNotAfter, expiry)
+
+	tlsCACertPEM, _ := pem.Decode(tlsCACert)
+	tlsCACertDER, err := x509.ParseCertificate(tlsCACertPEM.Bytes)
+	require.NoError(t, err)
+	wantCertPool := x509.NewCertPool()
+	wantCertPool.AddCert(tlsCACertDER)
+	require.True(t, wantCertPool.Equal(tlsConfig.RootCAs), "tlsconfig.RootCAs mismatch")
+
+	newExpiry := tlsCertNotAfter.Add(24 * time.Hour)
+	// Generate a new TLS certificate that contains the same private key as
+	// the original.
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(0),
+		Subject: pkix.Name{
+			CommonName: "example",
+		},
+		NotAfter:              newExpiry,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		DNSNames:              []string{constants.APIDomain},
+	}
+	secondTLSCert, err := x509.CreateCertificate(
+		rand.Reader, template, template, &wantTLSCert.PrivateKey.(*rsa.PrivateKey).PublicKey, wantTLSCert.PrivateKey,
+	)
+	require.NoError(t, err)
+	secondTLSCertPem := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: secondTLSCert,
+	})
+
+	// Write the new TLS certificate as part of the identity file and reload.
+	secondIDFile := &identityfile.IdentityFile{
+		PrivateKey: keyPEM,
+		Certs: identityfile.Certs{
+			TLS: secondTLSCertPem,
+			SSH: sshCert,
+		},
+		CACerts: identityfile.CACerts{
+			TLS: [][]byte{tlsCACert},
+			SSH: [][]byte{sshCACert},
+		},
+	}
+	require.NoError(t, identityfile.Write(secondIDFile, identityPath))
+	require.NoError(t, cred.Reload())
+
+	// Test that calling GetClientCertificate on the original tls.Config now
+	// returns the new certificate we wrote and reloaded.
+	gotTLSCert, err = tlsConfig.GetClientCertificate(&tls.CertificateRequestInfo{
+		// We always return the same cert so this can be empty
+	})
+	require.NoError(t, err)
+	wantTLSCert, err = tls.X509KeyPair(secondTLSCertPem, keyPEM)
+	require.NoError(t, err)
+	wantTLSCert.Leaf = nil
+	require.Equal(t, wantTLSCert, *gotTLSCert)
+
+	expiry, ok = cred.Expiry()
+	require.True(t, ok, "expiry should be known when we build creds from an identity file")
+	require.Equal(t, newExpiry, expiry)
+}
+
+func ExampleDynamicIdentityFileCreds() {
+	// load credentials from identity files on disk
+	cred, err := NewDynamicIdentityFileCreds("./identity")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// periodically reload credentials from disk
+	go func() {
+		for {
+			log.Println("reloading credentials")
+			if err := cred.Reload(); err != nil {
+				log.Fatal(err)
+			}
+			log.Println("reloaded credentials")
+			time.Sleep(5 * time.Minute)
+		}
+	}()
+
+	ctx := context.Background()
+	clt, err := New(ctx, Config{
+		Addrs:       []string{"leaf.tele.ottr.sh:443"},
+		Credentials: []Credentials{cred},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	for {
+		log.Println("Fetching nodes")
+		_, err := clt.GetNodes(ctx, defaults.Namespace)
+		if err != nil {
+			log.Printf("ERROR Fetching nodes: %v", err)
+		} else {
+			log.Println("Fetching nodes: OK")
+		}
+		time.Sleep(1 * time.Second)
+	}
+}

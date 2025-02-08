@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package services implements API services exposed by Teleport:
 // * presence service that takes care of heartbeats
@@ -22,46 +24,55 @@ package services
 
 import (
 	"context"
+	"crypto"
+	"crypto/x509"
 	"time"
 
-	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/types"
-	wantypes "github.com/gravitational/teleport/api/types/webauthn"
-	"github.com/gravitational/teleport/lib/defaults"
-
-	"github.com/gokyle/hotp"
 	"github.com/gravitational/trace"
-	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/client/proto"
+	userspb "github.com/gravitational/teleport/api/gen/proto/go/teleport/users/v1"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
+	"github.com/gravitational/teleport/lib/defaults"
 )
 
 // UserGetter is responsible for getting users
 type UserGetter interface {
 	// GetUser returns a user by name
-	GetUser(user string, withSecrets bool) (types.User, error)
+	GetUser(ctx context.Context, user string, withSecrets bool) (types.User, error)
 }
 
 // UsersService is responsible for basic user management
 type UsersService interface {
 	UserGetter
 	// UpdateUser updates an existing user.
-	UpdateUser(ctx context.Context, user types.User) error
+	UpdateUser(ctx context.Context, user types.User) (types.User, error)
+	// UpdateAndSwapUser reads an existing user, runs `fn` against it and writes
+	// the result to storage. Return `false` from `fn` to avoid storage changes.
+	// Roughly equivalent to [GetUser] followed by [CompareAndSwapUser].
+	// Returns the storage user.
+	UpdateAndSwapUser(ctx context.Context, user string, withSecrets bool, fn func(types.User) (changed bool, err error)) (types.User, error)
 	// UpsertUser updates parameters about user
-	UpsertUser(user types.User) error
+	UpsertUser(ctx context.Context, user types.User) (types.User, error)
 	// CompareAndSwapUser updates an existing user, but fails if the user does
 	// not match an expected backend value.
 	CompareAndSwapUser(ctx context.Context, new, existing types.User) error
 	// DeleteUser deletes a user with all the keys from the backend
 	DeleteUser(ctx context.Context, user string) error
 	// GetUsers returns a list of users registered with the local auth server
-	GetUsers(withSecrets bool) ([]types.User, error)
+	GetUsers(ctx context.Context, withSecrets bool) ([]types.User, error)
+	// ListUsers returns a page of users.
+	ListUsers(ctx context.Context, req *userspb.ListUsersRequest) (*userspb.ListUsersResponse, error)
 	// DeleteAllUsers deletes all users
-	DeleteAllUsers() error
+	DeleteAllUsers(ctx context.Context) error
 }
 
 // Identity is responsible for managing user entries and external identities
 type Identity interface {
 	// CreateUser creates user, only if the user entry does not exist
-	CreateUser(user types.User) error
+	CreateUser(ctx context.Context, user types.User) (types.User, error)
 
 	// UsersService implements most methods
 	UsersService
@@ -87,19 +98,8 @@ type Identity interface {
 	// GetUserByGithubIdentity returns a user by its specified Github identity
 	GetUserByGithubIdentity(id types.ExternalIdentity) (types.User, error)
 
-	// UpsertPasswordHash upserts user password hash
-	UpsertPasswordHash(user string, hash []byte) error
-
 	// GetPasswordHash returns the password hash for a given user
 	GetPasswordHash(user string) ([]byte, error)
-
-	// UpsertHOTP upserts HOTP state for user
-	// Deprecated: HOTP use is deprecated, use UpsertTOTP instead.
-	UpsertHOTP(user string, otp *hotp.HOTP) error
-
-	// GetHOTP gets HOTP token state for a user
-	// Deprecated: HOTP use is deprecated, use GetTOTP instead.
-	GetHOTP(user string) (*hotp.HOTP, error)
 
 	// UpsertUsedTOTPToken upserts a TOTP token to the backend so it can't be used again
 	// during the 30 second window it's valid.
@@ -108,8 +108,14 @@ type Identity interface {
 	// GetUsedTOTPToken returns the last successfully used TOTP token.
 	GetUsedTOTPToken(user string) (string, error)
 
-	// UpsertPassword upserts new password and OTP token
+	// UpsertPassword upserts a new password. It also sets the user's
+	// `PasswordState` status flag accordingly. Returns an error if the user
+	// doesn't exist.
 	UpsertPassword(user string, password []byte) error
+
+	// DeletePassword deletes user's password and sets the `PasswordState` status
+	// flag accordingly.
+	DeletePassword(ctx context.Context, username string) error
 
 	// UpsertWebauthnLocalAuth creates or updates the local auth configuration for
 	// Webauthn.
@@ -166,8 +172,12 @@ type Identity interface {
 	// DeleteMFADevice deletes an MFA device for the user by ID.
 	DeleteMFADevice(ctx context.Context, user, id string) error
 
-	// UpsertOIDCConnector upserts OIDC Connector
-	UpsertOIDCConnector(ctx context.Context, connector types.OIDCConnector) error
+	// CreateOIDCConnector creates a new OIDC connector.
+	CreateOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error)
+	// UpdateOIDCConnector updates an existing OIDC connector.
+	UpdateOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error)
+	// UpsertOIDCConnector updates or creates an OIDC connector.
+	UpsertOIDCConnector(ctx context.Context, connector types.OIDCConnector) (types.OIDCConnector, error)
 
 	// DeleteOIDCConnector deletes OIDC Connector
 	DeleteOIDCConnector(ctx context.Context, connectorID string) error
@@ -175,20 +185,22 @@ type Identity interface {
 	// GetOIDCConnector returns OIDC connector data, withSecrets adds or removes client secret from return results
 	GetOIDCConnector(ctx context.Context, id string, withSecrets bool) (types.OIDCConnector, error)
 
-	// GetOIDCConnectors returns registered connectors, withSecrets adds or removes client secret from return results
+	// GetOIDCConnectors returns valid registered connectors, withSecrets adds or removes client secret from return
+	// results.  Invalid Connectors are simply logged but errors are not forwarded.
 	GetOIDCConnectors(ctx context.Context, withSecrets bool) ([]types.OIDCConnector, error)
 
 	// CreateOIDCAuthRequest creates new auth request
-	CreateOIDCAuthRequest(req OIDCAuthRequest, ttl time.Duration) error
+	CreateOIDCAuthRequest(ctx context.Context, req types.OIDCAuthRequest, ttl time.Duration) error
 
 	// GetOIDCAuthRequest returns OIDC auth request if found
-	GetOIDCAuthRequest(stateToken string) (*OIDCAuthRequest, error)
+	GetOIDCAuthRequest(ctx context.Context, stateToken string) (*types.OIDCAuthRequest, error)
 
-	// CreateSAMLConnector creates SAML Connector
-	CreateSAMLConnector(connector types.SAMLConnector) error
-
-	// UpsertSAMLConnector upserts SAML Connector
-	UpsertSAMLConnector(ctx context.Context, connector types.SAMLConnector) error
+	// CreateSAMLConnector creates a new SAML connector.
+	CreateSAMLConnector(ctx context.Context, connector types.SAMLConnector) (types.SAMLConnector, error)
+	// UpdateSAMLConnector updates an existing SAML connector
+	UpdateSAMLConnector(ctx context.Context, connector types.SAMLConnector) (types.SAMLConnector, error)
+	// UpsertSAMLConnector updates or creates a SAML connector
+	UpsertSAMLConnector(ctx context.Context, connector types.SAMLConnector) (types.SAMLConnector, error)
 
 	// DeleteSAMLConnector deletes OIDC Connector
 	DeleteSAMLConnector(ctx context.Context, connectorID string) error
@@ -196,22 +208,30 @@ type Identity interface {
 	// GetSAMLConnector returns OIDC connector data, withSecrets adds or removes secrets from return results
 	GetSAMLConnector(ctx context.Context, id string, withSecrets bool) (types.SAMLConnector, error)
 
-	// GetSAMLConnectors returns registered connectors, withSecrets adds or removes secret from return results
+	// GetSAMLConnectors returns valid registered connectors, withSecrets adds or removes secret from return results.
+	// Invalid Connectors are simply logged but errors are not forwarded.
 	GetSAMLConnectors(ctx context.Context, withSecrets bool) ([]types.SAMLConnector, error)
 
 	// CreateSAMLAuthRequest creates new auth request
-	CreateSAMLAuthRequest(req SAMLAuthRequest, ttl time.Duration) error
+	CreateSAMLAuthRequest(ctx context.Context, req types.SAMLAuthRequest, ttl time.Duration) error
 
-	// GetSAMLAuthRequest returns OSAML auth request if found
-	GetSAMLAuthRequest(id string) (*SAMLAuthRequest, error)
+	// GetSAMLAuthRequest returns SAML auth request if found
+	GetSAMLAuthRequest(ctx context.Context, id string) (*types.SAMLAuthRequest, error)
 
-	// CreateGithubConnector creates a new Github connector
-	CreateGithubConnector(connector types.GithubConnector) error
+	// CreateSSODiagnosticInfo creates new SSO diagnostic info record.
+	CreateSSODiagnosticInfo(ctx context.Context, authKind string, authRequestID string, entry types.SSODiagnosticInfo) error
 
-	// UpsertGithubConnector creates or updates a new Github connector
-	UpsertGithubConnector(ctx context.Context, connector types.GithubConnector) error
+	// GetSSODiagnosticInfo returns SSO diagnostic info records.
+	GetSSODiagnosticInfo(ctx context.Context, authKind string, authRequestID string) (*types.SSODiagnosticInfo, error)
 
-	// GetGithubConnectors returns all configured Github connectors
+	// CreateGithubConnector creates a new Github connector.
+	CreateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error)
+	// UpdateGithubConnector updates an existing Github connector.
+	UpdateGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error)
+	// UpsertGithubConnector creates or updates a Github connector.
+	UpsertGithubConnector(ctx context.Context, connector types.GithubConnector) (types.GithubConnector, error)
+
+	// GetGithubConnectors returns valid Github connectors, invalid Connectors are simply logged but errors are not forwarded.
 	GetGithubConnectors(ctx context.Context, withSecrets bool) ([]types.GithubConnector, error)
 
 	// GetGithubConnector returns a Github connector by its name
@@ -221,10 +241,21 @@ type Identity interface {
 	DeleteGithubConnector(ctx context.Context, name string) error
 
 	// CreateGithubAuthRequest creates a new auth request for Github OAuth2 flow
-	CreateGithubAuthRequest(req GithubAuthRequest) error
+	CreateGithubAuthRequest(ctx context.Context, req types.GithubAuthRequest) error
 
 	// GetGithubAuthRequest retrieves Github auth request by the token
-	GetGithubAuthRequest(stateToken string) (*GithubAuthRequest, error)
+	GetGithubAuthRequest(ctx context.Context, stateToken string) (*types.GithubAuthRequest, error)
+
+	// UpsertSSOMFASessionData creates or updates SSO MFA session data in
+	// storage, for the purpose of later verifying an MFA authentication attempt.
+	// SSO MFA session data is expected to expire according to backend settings.
+	UpsertSSOMFASessionData(ctx context.Context, sd *SSOMFASessionData) error
+
+	// GetSSOMFASessionData retrieves SSO MFA session data by ID.
+	GetSSOMFASessionData(ctx context.Context, sessionID string) (*SSOMFASessionData, error)
+
+	// DeleteSSOMFASessionData deletes SSO MFA session data by ID.
+	DeleteSSOMFASessionData(ctx context.Context, sessionID string) error
 
 	// CreateUserToken creates a new user token.
 	CreateUserToken(ctx context.Context, token types.UserToken) (types.UserToken, error)
@@ -250,34 +281,91 @@ type Identity interface {
 	// GetRecoveryCodes gets a user's recovery codes.
 	GetRecoveryCodes(ctx context.Context, user string, withSecrets bool) (*types.RecoveryCodesV1, error)
 
-	// CreateUserRecoveryAttempt logs user recovery attempt.
-	CreateUserRecoveryAttempt(ctx context.Context, user string, attempt *types.RecoveryAttempt) error
+	// UpsertKeyAttestationData upserts a verified public key attestation response.
+	UpsertKeyAttestationData(ctx context.Context, attestationData *keys.AttestationData, ttl time.Duration) error
 
-	// GetUserRecoveryAttempts returns user recovery attempts sorted by oldest to latest time.
-	GetUserRecoveryAttempts(ctx context.Context, user string) ([]*types.RecoveryAttempt, error)
+	// GetKeyAttestationData gets a verified public key attestation response.
+	GetKeyAttestationData(ctx context.Context, pubDer []byte) (*keys.AttestationData, error)
 
-	// DeleteUserRecoveryAttempts removes all recovery attempts of a user.
-	DeleteUserRecoveryAttempts(ctx context.Context, user string) error
+	HeadlessAuthenticationService
 
 	types.WebSessionsGetter
 	types.WebTokensGetter
 
 	// AppSession defines application session features.
 	AppSession
+	// SnowflakeSession defines Snowflake session features.
+	SnowflakeSession
+	// SAMLIdPSession defines SAML IdP session features.
+	SAMLIdPSession
 }
 
 // AppSession defines application session features.
 type AppSession interface {
 	// GetAppSession gets an application web session.
 	GetAppSession(context.Context, types.GetAppSessionRequest) (types.WebSession, error)
-	// GetAppSessions gets all application web sessions.
-	GetAppSessions(context.Context) ([]types.WebSession, error)
-	// UpsertAppSession upserts and application web session.
+	// ListAppSessions gets a paginated list of application web sessions.
+	ListAppSessions(ctx context.Context, pageSize int, pageToken, user string) ([]types.WebSession, string, error)
+	// UpsertAppSession upserts an application web session.
 	UpsertAppSession(context.Context, types.WebSession) error
 	// DeleteAppSession removes an application web session.
 	DeleteAppSession(context.Context, types.DeleteAppSessionRequest) error
 	// DeleteAllAppSessions removes all application web sessions.
 	DeleteAllAppSessions(context.Context) error
+	// DeleteUserAppSessions deletes all user’s application sessions.
+	DeleteUserAppSessions(ctx context.Context, req *proto.DeleteUserAppSessionsRequest) error
+}
+
+// SnowflakeSession defines Snowflake session features.
+type SnowflakeSession interface {
+	// GetSnowflakeSession gets a Snowflake web session.
+	GetSnowflakeSession(context.Context, types.GetSnowflakeSessionRequest) (types.WebSession, error)
+	// GetSnowflakeSessions gets all Snowflake web sessions.
+	GetSnowflakeSessions(context.Context) ([]types.WebSession, error)
+	// UpsertSnowflakeSession upserts a Snowflake web session.
+	UpsertSnowflakeSession(context.Context, types.WebSession) error
+	// DeleteSnowflakeSession removes a Snowflake web session.
+	DeleteSnowflakeSession(context.Context, types.DeleteSnowflakeSessionRequest) error
+	// DeleteAllSnowflakeSessions removes all Snowflake web sessions.
+	DeleteAllSnowflakeSessions(context.Context) error
+}
+
+// SAMLIdPSession defines SAML IdP session features.
+type SAMLIdPSession interface {
+	// GetSAMLIdPSession gets a SAML IdP session.
+	GetSAMLIdPSession(context.Context, types.GetSAMLIdPSessionRequest) (types.WebSession, error)
+	// ListSAMLIdPSessions gets a paginated list of SAML IdP sessions.
+	ListSAMLIdPSessions(ctx context.Context, pageSize int, pageToken, user string) ([]types.WebSession, string, error)
+	// UpsertSAMLIdPSession upserts a SAML IdP session.
+	UpsertSAMLIdPSession(context.Context, types.WebSession) error
+	// DeleteSAMLIdPSession removes a SAML IdP session.
+	DeleteSAMLIdPSession(context.Context, types.DeleteSAMLIdPSessionRequest) error
+	// DeleteAllSAMLIdPSessions removes all SAML IdP sessions.
+	DeleteAllSAMLIdPSessions(context.Context) error
+	// DeleteUserSAMLIdPSessions deletes all of a user's SAML IdP sessions.
+	DeleteUserSAMLIdPSessions(ctx context.Context, user string) error
+}
+
+// HeadlessAuthenticationService is responsible for headless authentication resource management
+type HeadlessAuthenticationService interface {
+	// GetHeadlessAuthentication gets a headless authentication.
+	GetHeadlessAuthentication(ctx context.Context, username, name string) (*types.HeadlessAuthentication, error)
+
+	// GetHeadlessAuthentications gets all headless authentications.
+	GetHeadlessAuthentications(ctx context.Context) ([]*types.HeadlessAuthentication, error)
+
+	// UpsertHeadlessAuthentication upserts a headless authentication.
+	UpsertHeadlessAuthentication(ctx context.Context, ha *types.HeadlessAuthentication) error
+
+	// CompareAndSwapHeadlessAuthentication performs a compare
+	// and swap replacement on a headless authentication resource.
+	CompareAndSwapHeadlessAuthentication(ctx context.Context, old, new *types.HeadlessAuthentication) (*types.HeadlessAuthentication, error)
+
+	// DeleteHeadlessAuthentication deletes a headless authentication from the backend.
+	DeleteHeadlessAuthentication(ctx context.Context, username, name string) error
+
+	// DeleteAllHeadlessAuthentications deletes all headless authentications from the backend.
+	DeleteAllHeadlessAuthentications(ctx context.Context) error
 }
 
 // VerifyPassword makes sure password satisfies our requirements (relaxed),
@@ -291,205 +379,6 @@ func VerifyPassword(password []byte) error {
 		return trace.BadParameter(
 			"password is too long, max length is %v", defaults.MaxPasswordLength)
 	}
-	return nil
-}
-
-// GithubAuthRequest is the request to start Github OAuth2 flow
-type GithubAuthRequest struct {
-	// ConnectorID is the name of the connector to use
-	ConnectorID string `json:"connector_id"`
-	// Type is opaque string that helps callbacks identify the request type
-	Type string `json:"type"`
-	// StateToken is used to validate the request
-	StateToken string `json:"state_token"`
-	// CSRFToken is used to protect against CSRF attacks
-	CSRFToken string `json:"csrf_token"`
-	// PublicKey is an optional public key to sign in case of successful auth
-	PublicKey []byte `json:"public_key"`
-	// CertTTL is TTL of the cert that's generated in case of successful auth
-	CertTTL time.Duration `json:"cert_ttl"`
-	// CreateWebSession indicates that a user wants to generate a web session
-	// after successul authentication
-	CreateWebSession bool `json:"create_web_session"`
-	// RedirectURL will be used by browser
-	RedirectURL string `json:"redirect_url"`
-	// ClientRedirectURL is the URL where client will be redirected after
-	// successful auth
-	ClientRedirectURL string `json:"client_redirect_url"`
-	// Compatibility specifies OpenSSH compatibility flags
-	Compatibility string `json:"compatibility,omitempty"`
-	// Expires is a global expiry time header can be set on any resource in the system.
-	Expires *time.Time `json:"expires,omitempty"`
-	// RouteToCluster is the name of Teleport cluster to issue credentials for.
-	RouteToCluster string `json:"route_to_cluster,omitempty"`
-	// KubernetesCluster is the name of Kubernetes cluster to issue credentials for.
-	KubernetesCluster string `json:"kubernetes_cluster,omitempty"`
-}
-
-// SetExpiry sets expiry time for the object
-func (r *GithubAuthRequest) SetExpiry(expires time.Time) {
-	r.Expires = &expires
-}
-
-// Expiry returns object expiry setting.
-func (r *GithubAuthRequest) Expiry() time.Time {
-	if r.Expires == nil {
-		return time.Time{}
-	}
-	return *r.Expires
-}
-
-// Check makes sure the request is valid
-func (r *GithubAuthRequest) Check() error {
-	if r.ConnectorID == "" {
-		return trace.BadParameter("missing ConnectorID")
-	}
-	if r.StateToken == "" {
-		return trace.BadParameter("missing StateToken")
-	}
-	if len(r.PublicKey) != 0 {
-		_, _, _, _, err := ssh.ParseAuthorizedKey(r.PublicKey)
-		if err != nil {
-			return trace.BadParameter("bad PublicKey: %v", err)
-		}
-		if (r.CertTTL > apidefaults.MaxCertDuration) || (r.CertTTL < defaults.MinCertDuration) {
-			return trace.BadParameter("wrong CertTTL")
-		}
-	}
-	return nil
-}
-
-// OIDCAuthRequest is a request to authenticate with OIDC
-// provider, the state about request is managed by auth server
-type OIDCAuthRequest struct {
-	// ConnectorID is ID of OIDC connector this request uses
-	ConnectorID string `json:"connector_id"`
-
-	// Type is opaque string that helps callbacks identify the request type
-	Type string `json:"type"`
-
-	// CheckUser tells validator if it should expect and check user
-	CheckUser bool `json:"check_user"`
-
-	// StateToken is generated by service and is used to validate
-	// reuqest coming from
-	StateToken string `json:"state_token"`
-
-	// CSRFToken is associated with user web session token
-	CSRFToken string `json:"csrf_token"`
-
-	// RedirectURL will be used by browser
-	RedirectURL string `json:"redirect_url"`
-
-	// PublicKey is an optional public key, users want these
-	// keys to be signed by auth servers user CA in case
-	// of successful auth
-	PublicKey []byte `json:"public_key"`
-
-	// CertTTL is the TTL of the certificate user wants to get
-	CertTTL time.Duration `json:"cert_ttl"`
-
-	// CreateWebSession indicates if user wants to generate a web
-	// session after successful authentication
-	CreateWebSession bool `json:"create_web_session"`
-
-	// ClientRedirectURL is a URL client wants to be redirected
-	// after successful authentication
-	ClientRedirectURL string `json:"client_redirect_url"`
-
-	// Compatibility specifies OpenSSH compatibility flags.
-	Compatibility string `json:"compatibility,omitempty"`
-
-	// RouteToCluster is the name of Teleport cluster to issue credentials for.
-	RouteToCluster string `json:"route_to_cluster,omitempty"`
-
-	// KubernetesCluster is the name of Kubernetes cluster to issue credentials for.
-	KubernetesCluster string `json:"kubernetes_cluster,omitempty"`
-}
-
-// Check returns nil if all parameters are great, err otherwise
-func (i *OIDCAuthRequest) Check() error {
-	if i.ConnectorID == "" {
-		return trace.BadParameter("ConnectorID: missing value")
-	}
-	if i.StateToken == "" {
-		return trace.BadParameter("StateToken: missing value")
-	}
-	if len(i.PublicKey) != 0 {
-		_, _, _, _, err := ssh.ParseAuthorizedKey(i.PublicKey)
-		if err != nil {
-			return trace.BadParameter("PublicKey: bad key: %v", err)
-		}
-		if (i.CertTTL > apidefaults.MaxCertDuration) || (i.CertTTL < defaults.MinCertDuration) {
-			return trace.BadParameter("CertTTL: wrong certificate TTL")
-		}
-	}
-
-	return nil
-}
-
-// SAMLAuthRequest is a request to authenticate with OIDC
-// provider, the state about request is managed by auth server
-type SAMLAuthRequest struct {
-	// ID is a unique request ID
-	ID string `json:"id"`
-
-	// ConnectorID is ID of OIDC connector this request uses
-	ConnectorID string `json:"connector_id"`
-
-	// Type is opaque string that helps callbacks identify the request type
-	Type string `json:"type"`
-
-	// CheckUser tells validator if it should expect and check user
-	CheckUser bool `json:"check_user"`
-
-	// RedirectURL will be used by browser
-	RedirectURL string `json:"redirect_url"`
-
-	// PublicKey is an optional public key, users want these
-	// keys to be signed by auth servers user CA in case
-	// of successful auth
-	PublicKey []byte `json:"public_key"`
-
-	// CertTTL is the TTL of the certificate user wants to get
-	CertTTL time.Duration `json:"cert_ttl"`
-
-	// CSRFToken is associated with user web session token
-	CSRFToken string `json:"csrf_token"`
-
-	// CreateWebSession indicates if user wants to generate a web
-	// session after successful authentication
-	CreateWebSession bool `json:"create_web_session"`
-
-	// ClientRedirectURL is a URL client wants to be redirected
-	// after successful authentication
-	ClientRedirectURL string `json:"client_redirect_url"`
-
-	// Compatibility specifies OpenSSH compatibility flags.
-	Compatibility string `json:"compatibility,omitempty"`
-
-	// RouteToCluster is the name of Teleport cluster to issue credentials for.
-	RouteToCluster string `json:"route_to_cluster,omitempty"`
-
-	// KubernetesCluster is the name of Kubernetes cluster to issue credentials for.
-	KubernetesCluster string `json:"kubernetes_cluster,omitempty"`
-}
-
-// Check returns nil if all parameters are great, err otherwise
-func (i *SAMLAuthRequest) Check() error {
-	if i.ConnectorID == "" {
-		return trace.BadParameter("ConnectorID: missing value")
-	}
-	if len(i.PublicKey) != 0 {
-		_, _, _, _, err := ssh.ParseAuthorizedKey(i.PublicKey)
-		if err != nil {
-			return trace.BadParameter("PublicKey: bad key: %v", err)
-		}
-		if (i.CertTTL > apidefaults.MaxCertDuration) || (i.CertTTL < defaults.MinCertDuration) {
-			return trace.BadParameter("CertTTL: wrong certificate TTL")
-		}
-	}
-
 	return nil
 }
 
@@ -541,4 +430,21 @@ func LastFailed(x int, attempts []LoginAttempt) bool {
 		}
 	}
 	return false
+}
+
+// NewWebSessionAttestationData creates attestation data for a web session key.
+// Inserting data to the Auth server will allow certificates generated for the
+// web session key to pass private key policies that are unobtainable in the web
+// (hardware key policies). In exchange, these keys must be kept strictly in the
+// Auth and Proxy processes and Auth storage. These keys and certs can only be
+// retrieved by users in the form of web session cookies.
+func NewWebSessionAttestationData(pub crypto.PublicKey) (*keys.AttestationData, error) {
+	pubDER, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return &keys.AttestationData{
+		PublicKeyDER:     pubDER,
+		PrivateKeyPolicy: keys.PrivateKeyPolicyWebSession,
+	}, nil
 }

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2021 Gravitational, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,8 @@ import (
 	"github.com/gravitational/trace"
 )
 
-// NewRecoveryCodes creates a new RecoveryCodes with the given codes and created time.
+// NewRecoveryCodes creates a new RecoveryCodes with the given codes and created
+// time.
 func NewRecoveryCodes(codes []RecoveryCode, created time.Time, username string) (*RecoveryCodesV1, error) {
 	rc := &RecoveryCodesV1{
 		Metadata: Metadata{

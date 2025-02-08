@@ -1,0 +1,60 @@
+name: Lint UI
+run-name: Lint UI - ${{ github.run_id }} - @${{ github.actor }}
+
+on:
+  pull_request:
+    paths:
+      - 'web/**'
+      - 'gen/proto/js/**'
+      - 'gen/proto/ts/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tsconfig.json'
+      - 'tsconfig.node.json'
+  merge_group:
+    paths:
+      - 'web/**'
+      - 'gen/proto/js/**'
+      - 'gen/proto/ts/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tsconfig.json'
+      - 'tsconfig.node.json'
+
+jobs:
+  lint:
+    name: Prettier, ESLint, & TSC
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/gravitational/teleport-buildbox:teleport17
+    steps:
+      - name: Checkout OSS Teleport
+        uses: actions/checkout@v4
+
+      - name: Print Node version
+        run: |
+          node --version
+
+      - name: Install JS dependencies
+        run: |
+          export COREPACK_INTEGRITY_KEYS='{"npm":[{"expires":"2025-01-29T00:00:00.000Z","keyid":"SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA","keytype":"ecdsa-sha2-nistp256","scheme":"ecdsa-sha2-nistp256","key":"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1Olb3zMAFFxXKHiIkQO5cJ3Yhl5i6UPp+IhuteBJbuHcA5UogKo0EWtlWwW6KSaKoTNEYL7JlCQiVnkhBktUgg=="},{"expires":null,"keyid":"SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U","keytype":"ecdsa-sha2-nistp256","scheme":"ecdsa-sha2-nistp256","key":"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEY6Ya7W++7aUPzvMTrezH6Ycx3c+HOKYCcNGybJZSCJq/fd7Qa8uuAKtdIkUQtQiEKERhAmE5lMMJhP8OkDOa2g=="}]}'
+          pnpm install --frozen-lockfile
+
+      - name: Build WASM
+        run: pnpm build-wasm
+
+      - name: Run Type Check
+        run: pnpm type-check
+
+      - name: Run lint
+        run: pnpm lint
+
+      - name: Run Storybook smoke test
+        run: pnpm storybook-smoke-test
+
+      - name: Lint licenses
+        run: make lint-license

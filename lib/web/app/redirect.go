@@ -1,58 +1,115 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package app
 
 import (
 	"fmt"
+	"html/template"
+	"io"
 	"net/http"
+	"slices"
 	"strings"
+
+	"github.com/gravitational/trace"
+	"golang.org/x/net/html"
 
 	"github.com/gravitational/teleport/lib/httplib"
 )
 
+const metaRedirectHTML = `
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>Teleport Redirection Service</title>
+		<meta http-equiv="cache-control" content="no-cache"/>
+		<meta http-equiv="refresh" content="0;URL='{{.}}'" />
+	</head>
+	<body></body>
+</html>
+`
+
+var metaRedirectTemplate = template.Must(template.New("meta-redirect").Parse(metaRedirectHTML))
+
 func SetRedirectPageHeaders(h http.Header, nonce string) {
-	httplib.SetIndexHTMLHeaders(h)
-	// Set content policy flags
+	httplib.SetNoCacheHeaders(h)
+	httplib.SetDefaultSecurityHeaders(h)
+
+	// Set content security policy flags
 	scriptSrc := "none"
 	if nonce != "" {
-		// Should match the <script> tab nonce (random value).
+		// Sets a rule where script can only be ran if the
+		// <script> tag contains the same nonce (a random value)
+		// we set here.
 		scriptSrc = fmt.Sprintf("nonce-%v", nonce)
 	}
-	var csp = strings.Join([]string{
-		fmt.Sprintf("script-src '%v'", scriptSrc),
-		"style-src 'self'",
-		"object-src 'none'",
-		"img-src 'self'",
-		"base-uri 'self'",
-	}, ";")
-
-	h.Set("Referrer-Policy", "no-referrer")
-	h.Set("Content-Security-Policy", csp)
+	httplib.SetRedirectPageContentSecurityPolicy(h, scriptSrc)
 }
 
-const js = `
+// MetaRedirect issues a "meta refresh" redirect.
+func MetaRedirect(w http.ResponseWriter, redirectURL string) error {
+	SetRedirectPageHeaders(w.Header(), "")
+	return trace.Wrap(metaRedirectTemplate.Execute(w, redirectURL))
+}
+
+// GetURLFromMetaRedirect parses an HTML redirect response written by
+// [MetaRedirect] and returns the redirect URL. Useful for tests.
+func GetURLFromMetaRedirect(body io.Reader) (string, error) {
+	tokenizer := html.NewTokenizer(body)
+	for tt := tokenizer.Next(); tt != html.ErrorToken; tt = tokenizer.Next() {
+		token := tokenizer.Token()
+		if token.Data != "meta" {
+			continue
+		}
+		if !slices.Contains(token.Attr, html.Attribute{Key: "http-equiv", Val: "refresh"}) {
+			continue
+		}
+		contentAttrIndex := slices.IndexFunc(token.Attr, func(attr html.Attribute) bool { return attr.Key == "content" })
+		if contentAttrIndex < 0 {
+			return "", trace.BadParameter("refresh tag did not contain content")
+		}
+		content := token.Attr[contentAttrIndex].Val
+		parts := strings.Split(content, "URL=")
+		if len(parts) < 2 {
+			return "", trace.BadParameter("refresh tag content did not contain URL")
+		}
+		quotedURL := parts[1]
+		return strings.TrimPrefix(strings.TrimSuffix(quotedURL, "'"), "'"), nil
+	}
+	return "", trace.NotFound("body did not contain refresh tag")
+}
+
+var appRedirectTemplate = template.Must(template.New("index").Parse(appRedirectHTML))
+
+const appRedirectHTML = `
 <!DOCTYPE html>
 <html lang="en">
   <head>
     <title>Teleport Redirection Service</title>
-    <script nonce="%v">
+    <script nonce="{{.}}">
       (function() {
-        var searchParts = window.location.search.split('=');
-        if (searchParts.length !== 2 || searchParts[0] !== '?state') {
+        var currentUrl = new URL(window.location);
+        var currentOrigin = currentUrl.origin;
+        var params = new URLSearchParams(currentUrl.search);
+        var stateValue = params.get('state');
+        var subjectValue = params.get('subject');
+        var path = params.get('path');
+        if (!stateValue) {
           return;
         }
         var hashParts = window.location.hash.split('=');
@@ -60,8 +117,10 @@ const js = `
           return;
         }
         const data = {
-          state_value: searchParts[1],
+          state_value: stateValue,
           cookie_value: hashParts[1],
+          subject_cookie_value: subjectValue,
+          required_apps: params.get('required-apps'),
         };
         fetch('/x-teleport-auth', {
           method: 'POST',
@@ -73,8 +132,27 @@ const js = `
           body: JSON.stringify(data),
         }).then(response => {
           if (response.ok) {
-            // redirect to the root and remove current URL from history (back button)
-            window.location.replace('/');
+            const nextAppRedirectUrl = response.headers.get("X-Teleport-NextAppRedirectUrl")
+            if (nextAppRedirectUrl) {
+              window.location.replace(nextAppRedirectUrl)
+              return;
+            }
+            try {
+              // if a path parameter was passed through the redirect, append that path to the current origin
+              if (path) {
+                var redirectUrl = new URL(path, currentOrigin)
+                if (redirectUrl.origin === currentOrigin) {
+                  window.location.replace(redirectUrl.toString())
+                } else {
+                  window.location.replace(currentOrigin)
+                }
+              } else {
+                window.location.replace(currentOrigin)
+              }
+            } catch (error) {
+              // in case of malformed url, return to current origin
+              window.location.replace(currentOrigin)
+            }
           }
         });
       })();

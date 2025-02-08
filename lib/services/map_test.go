@@ -1,35 +1,37 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/api/types"
-
-	"gopkg.in/check.v1"
+	"fmt"
+	"testing"
 
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
 )
 
-type RoleMapSuite struct{}
+func TestRoleParsing(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&RoleMapSuite{})
-
-func (s *RoleMapSuite) TestRoleParsing(c *check.C) {
 	testCases := []struct {
 		roleMap types.RoleMap
 		err     error
@@ -64,18 +66,21 @@ func (s *RoleMapSuite) TestRoleParsing(c *check.C) {
 	}
 
 	for i, tc := range testCases {
-		comment := check.Commentf("test case '%v'", i)
-		_, err := parseRoleMap(tc.roleMap)
-		if tc.err != nil {
-			c.Assert(err, check.NotNil, comment)
-			c.Assert(err, check.FitsTypeOf, tc.err)
-		} else {
-			c.Assert(err, check.IsNil)
-		}
+		t.Run(fmt.Sprintf("test case '%v'", i), func(t *testing.T) {
+			_, err := parseRoleMap(tc.roleMap)
+			if tc.err != nil {
+				require.Error(t, err)
+				require.IsType(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
 }
 
-func (s *RoleMapSuite) TestRoleMap(c *check.C) {
+func TestRoleMap(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		remote  []string
 		local   []string
@@ -173,6 +178,14 @@ func (s *RoleMapSuite) TestRoleMap(c *check.C) {
 			},
 		},
 		{
+			name:   "mapping is deduplicated",
+			remote: []string{"role1", "role2"},
+			local:  []string{"foo"},
+			roleMap: types.RoleMap{
+				{Remote: "*", Local: []string{"foo"}},
+			},
+		},
+		{
 			name:   "different expand groups can be referred",
 			remote: []string{"remote-devs"},
 			local:  []string{"remote-devs", "devs"},
@@ -183,14 +196,16 @@ func (s *RoleMapSuite) TestRoleMap(c *check.C) {
 	}
 
 	for _, tc := range testCases {
-		comment := check.Commentf("test case '%v'", tc.name)
-		local, err := MapRoles(tc.roleMap, tc.remote)
-		if tc.err != nil {
-			c.Assert(err, check.NotNil, comment)
-			c.Assert(err, check.FitsTypeOf, tc.err)
-		} else {
-			c.Assert(err, check.IsNil, comment)
-			c.Assert(local, check.DeepEquals, tc.local, comment)
-		}
+		t.Run(fmt.Sprintf("test case '%v'", tc.name), func(t *testing.T) {
+
+			local, err := MapRoles(tc.roleMap, tc.remote)
+			if tc.err != nil {
+				require.Error(t, err)
+				require.IsType(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+				require.ElementsMatch(t, tc.local, local)
+			}
+		})
 	}
 }

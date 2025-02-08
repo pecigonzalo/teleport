@@ -21,10 +21,11 @@ import (
 	"sort"
 	"time"
 
-	"github.com/gravitational/teleport/api"
-
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // AppServer represents a single proxied web app.
@@ -47,10 +48,17 @@ type AppServer interface {
 	String() string
 	// Copy returns a copy of this app server object.
 	Copy() AppServer
+
+	// CloneResource returns a copy of the AppServer as a ResourceWithLabels
+	CloneResource() ResourceWithLabels
 	// GetApp returns the app this app server proxies.
 	GetApp() Application
 	// SetApp sets the app this app server proxies.
 	SetApp(Application) error
+	// GetTunnelType returns the tunnel type associated with the app server.
+	GetTunnelType() TunnelType
+	// ProxiedService provides common methods for a proxied service.
+	ProxiedService
 }
 
 // NewAppServerV3 creates a new app server instance.
@@ -76,49 +84,23 @@ func NewAppServerV3FromApp(app *AppV3, hostname, hostID string) (*AppServerV3, e
 	})
 }
 
-// NewLegacyAppServer creates legacy app server object. Used in tests.
-//
-// DELETE IN 9.0.
-func NewLegacyAppServer(app *AppV3, hostname, hostID string) (Server, error) {
-	return NewServer(hostID, KindAppServer,
-		ServerSpecV2{
-			Hostname: hostname,
-			Apps: []*App{
-				{
-					Name:         app.GetName(),
-					URI:          app.GetURI(),
-					PublicAddr:   app.GetPublicAddr(),
-					StaticLabels: app.GetStaticLabels(),
-				},
-			},
-		})
-}
-
-// NewAppServersV3FromServer creates a list of app servers from Server resource.
-//
-// DELETE IN 9.0.
-func NewAppServersV3FromServer(server Server) (result []AppServer, err error) {
-	for _, legacyApp := range server.GetApps() {
-		app, err := NewAppV3FromLegacyApp(legacyApp)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		appServer, err := NewAppServerV3(Metadata{
-			Name:    app.GetName(),
-			Expires: server.GetMetadata().Expires,
-		}, AppServerSpecV3{
-			Version:  server.GetTeleportVersion(),
-			Hostname: server.GetHostname(),
-			HostID:   server.GetName(),
-			Rotation: server.GetRotation(),
-			App:      app,
-		})
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		result = append(result, appServer)
-	}
-	return result, nil
+// NewAppServerForAWSOIDCIntegration creates a new AppServer that will be used to grant AWS App Access
+// using the AWSOIDC credentials.
+func NewAppServerForAWSOIDCIntegration(integrationName, hostID, publicAddr string, labels map[string]string) (*AppServerV3, error) {
+	return NewAppServerV3(Metadata{
+		Name:   integrationName,
+		Labels: labels,
+	}, AppServerSpecV3{
+		HostID: hostID,
+		App: &AppV3{Metadata: Metadata{
+			Name:   integrationName,
+			Labels: labels,
+		}, Spec: AppSpecV3{
+			URI:         constants.AWSConsoleURL,
+			Integration: integrationName,
+			PublicAddr:  publicAddr,
+		}},
+	})
 }
 
 // GetVersion returns the database server resource version.
@@ -156,14 +138,14 @@ func (s *AppServerV3) SetSubKind(sk string) {
 	s.SubKind = sk
 }
 
-// GetResourceID returns the resource ID.
-func (s *AppServerV3) GetResourceID() int64 {
-	return s.Metadata.ID
+// GetRevision returns the revision
+func (s *AppServerV3) GetRevision() string {
+	return s.Metadata.GetRevision()
 }
 
-// SetResourceID sets the resource ID.
-func (s *AppServerV3) SetResourceID(id int64) {
-	s.Metadata.ID = id
+// SetRevision sets the revision
+func (s *AppServerV3) SetRevision(rev string) {
+	s.Metadata.SetRevision(rev)
 }
 
 // GetMetadata returns the resource metadata.
@@ -208,6 +190,9 @@ func (s *AppServerV3) SetRotation(r Rotation) {
 
 // GetApp returns the app this app server proxies.
 func (s *AppServerV3) GetApp() Application {
+	if s.Spec.App == nil {
+		return nil
+	}
 	return s.Spec.App
 }
 
@@ -219,6 +204,16 @@ func (s *AppServerV3) SetApp(app Application) error {
 	}
 	s.Spec.App = appV3
 	return nil
+}
+
+// GetTunnelType returns the tunnel type associated with the app server.
+func (s *AppServerV3) GetTunnelType() TunnelType {
+	switch {
+	case s.Origin() == OriginOkta:
+		return OktaTunnel
+	default:
+		return AppTunnel
+	}
 }
 
 // String returns the server string representation.
@@ -264,6 +259,29 @@ func (s *AppServerV3) SetOrigin(origin string) {
 	s.Metadata.SetOrigin(origin)
 }
 
+// GetProxyID returns a list of proxy ids this server is connected to.
+func (s *AppServerV3) GetProxyIDs() []string {
+	return s.Spec.ProxyIDs
+}
+
+// SetProxyID sets the proxy ids this server is connected to.
+func (s *AppServerV3) SetProxyIDs(proxyIDs []string) {
+	s.Spec.ProxyIDs = proxyIDs
+}
+
+// GetLabel retrieves the label with the provided key. If not found
+// value will be empty and ok will be false.
+func (s *AppServerV3) GetLabel(key string) (value string, ok bool) {
+	if s.Spec.App != nil {
+		if v, ok := s.Spec.App.GetLabel(key); ok {
+			return v, ok
+		}
+	}
+
+	v, ok := s.Metadata.Labels[key]
+	return v, ok
+}
+
 // GetAllLabels returns all resource's labels. Considering:
 // * Static labels from `Metadata.Labels` and `Spec.App`.
 // * Dynamic labels from `Spec.App.Spec`.
@@ -285,9 +303,23 @@ func (s *AppServerV3) GetAllLabels() map[string]string {
 	return CombineLabels(staticLabels, dynamicLabels)
 }
 
+// GetStaticLabels returns the app server static labels.
+func (s *AppServerV3) GetStaticLabels() map[string]string {
+	return s.Metadata.Labels
+}
+
+// SetStaticLabels sets the app server static labels.
+func (s *AppServerV3) SetStaticLabels(sl map[string]string) {
+	s.Metadata.Labels = sl
+}
+
 // Copy returns a copy of this app server object.
 func (s *AppServerV3) Copy() AppServer {
-	return proto.Clone(s).(*AppServerV3)
+	return utils.CloneProtoMsg(s)
+}
+
+func (s *AppServerV3) CloneResource() ResourceWithLabels {
+	return s.Copy()
 }
 
 // MatchSearch goes through select field values and tries to

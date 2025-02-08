@@ -1,34 +1,36 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package socks
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"testing"
 
+	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/proxy"
 
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
-
-	"gopkg.in/check.v1"
 )
 
 func TestMain(m *testing.M) {
@@ -36,13 +38,9 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestSocks(t *testing.T) { check.TestingT(t) }
+func TestHandshake(t *testing.T) {
+	t.Parallel()
 
-type SOCKSSuite struct{}
-
-var _ = check.Suite(&SOCKSSuite{})
-
-func (s *SOCKSSuite) TestHandshake(c *check.C) {
 	remoteAddrs := []string{
 		"example.com:443",
 		"9.8.7.6:443",
@@ -50,28 +48,28 @@ func (s *SOCKSSuite) TestHandshake(c *check.C) {
 
 	// Create and start a debug SOCKS5 server that calls socks.Handshake().
 	socksServer, err := newDebugServer()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	go socksServer.Serve()
 
 	// Create a proxy dialer that can perform a SOCKS5 handshake.
 	proxy, err := proxy.SOCKS5("tcp", socksServer.Addr().String(), nil, nil)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	for _, remoteAddr := range remoteAddrs {
 		// Connect to the SOCKS5 server, this is where the handshake function is called.
 		conn, err := proxy.Dial("tcp", remoteAddr)
-		c.Assert(err, check.IsNil)
+		require.NoError(t, err)
 
 		// Read in what was written on the connection. With the debug server it's
 		// always the address requested.
 		buf := make([]byte, len(remoteAddr))
 		_, err = io.ReadFull(conn, buf)
-		c.Assert(err, check.IsNil)
-		c.Assert(string(buf), check.Equals, remoteAddr)
+		require.NoError(t, err)
+		require.Equal(t, string(buf), remoteAddr)
 
 		// Close and cleanup.
 		err = conn.Close()
-		c.Assert(err, check.IsNil)
+		require.NoError(t, err)
 	}
 }
 
@@ -103,7 +101,7 @@ func (d *debugServer) Serve() {
 	for {
 		conn, err := d.ln.Accept()
 		if err != nil {
-			log.Debugf("Failed to accept connection: %v.", err)
+			slog.DebugContext(context.Background(), "Failed to accept connection", "error", err)
 			break
 		}
 
@@ -118,17 +116,17 @@ func (d *debugServer) handle(conn net.Conn) {
 
 	remoteAddr, err := Handshake(conn)
 	if err != nil {
-		log.Debugf("Handshake failed: %v.", err)
+		slog.DebugContext(context.Background(), "Handshake failed", "error", err)
 		return
 	}
 
 	n, err := conn.Write([]byte(remoteAddr))
 	if err != nil {
-		log.Debugf("Failed to write to connection: %v.", err)
+		slog.DebugContext(context.Background(), "Failed to write to connection", "error", err)
 		return
 	}
 	if n != len(remoteAddr) {
-		log.Debugf("Short write, wrote %v wanted %v.", n, len(remoteAddr))
+		slog.DebugContext(context.Background(), "Short write", "wrote", n, "wanted", len(remoteAddr))
 		return
 	}
 }

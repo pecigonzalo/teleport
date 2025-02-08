@@ -1,30 +1,32 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package protocol
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"testing"
 	"testing/iotest"
 
 	"github.com/gravitational/trace"
-
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,7 +61,8 @@ var (
 				0x64, 0x65, 0x6e, 0x69, 0x65, 0x64, // message
 			},
 		},
-		message: "denied",
+		Code:    1105,
+		Message: "denied",
 	}
 
 	sampleErrorWithSQLStatePacket = &Error{
@@ -73,7 +76,8 @@ var (
 				0x64, 0x65, 0x6e, 0x69, 0x65, 0x64, // message
 			},
 		},
-		message: "denied",
+		Code:    1105,
+		Message: "denied",
 	}
 
 	sampleQuitPacket = &Quit{
@@ -94,6 +98,86 @@ var (
 			},
 		},
 		user: "bob",
+	}
+
+	sampleInitDBPacket = &InitDB{
+		schemaNamePacket: schemaNamePacket{
+			packet: packet{
+				bytes: []byte{
+					0x05, 0x00, 0x00, 0x00, // header
+					0x02,                   // type
+					0x74, 0x65, 0x73, 0x74, // schema "test"
+				},
+			},
+			schemaName: "test",
+		},
+	}
+
+	sampleCreateDBPacket = &CreateDB{
+		schemaNamePacket: schemaNamePacket{
+			packet: packet{
+				bytes: []byte{
+					0x05, 0x00, 0x00, 0x00, // header
+					0x05,                   // type
+					0x74, 0x65, 0x73, 0x74, // schema "test"
+				},
+			},
+			schemaName: "test",
+		},
+	}
+
+	sampleDropDBPacket = &DropDB{
+		schemaNamePacket: schemaNamePacket{
+			packet: packet{
+				bytes: []byte{
+					0x05, 0x00, 0x00, 0x00, // header
+					0x06,                   // type
+					0x74, 0x65, 0x73, 0x74, // schema "test"
+				},
+			},
+			schemaName: "test",
+		},
+	}
+
+	sampleShutDownPacket = &ShutDown{
+		packet: packet{
+			bytes: []byte{
+				0x02, 0x00, 0x00, 0x00, // header
+				0x08, // type
+				0x00, // optional shutdown type
+			},
+		},
+	}
+
+	sampleProcessKillPacket = &ProcessKill{
+		packet: packet{
+			bytes: []byte{
+				0x05, 0x00, 0x00, 0x00, // header
+				0x0c,                   // type
+				0x15, 0x00, 0x00, 0x00, // process ID
+			},
+		},
+		processID: 21,
+	}
+
+	sampleDebugPacket = &Debug{
+		packet: packet{
+			bytes: []byte{
+				0x01, 0x00, 0x00, 0x00, // header
+				0x0d, // type
+			},
+		},
+	}
+
+	sampleRefreshPacket = &Refresh{
+		packet: packet{
+			bytes: []byte{
+				0x02, 0x00, 0x00, 0x00, // header
+				0x07, // type
+				0x40, // subcommand
+			},
+		},
+		subcommand: "REFRESH_SLAVE",
 	}
 
 	sampleStatementPreparePacket = &StatementPreparePacket{
@@ -290,6 +374,50 @@ func TestParsePacket(t *testing.T) {
 			expectedPacket: sampleChangeUserPacket,
 		},
 		{
+			name: "COM_CHANGE_USER invalid",
+			input: bytes.NewBuffer([]byte{
+				0x04, 0x00, 0x00, 0x00, // header
+				0x11,             // type
+				0x62, 0x6f, 0x62, // missing null at the end of the string
+			}),
+			expectErrorIs: trace.IsBadParameter,
+		},
+		{
+			name:           "COM_INIT_DB",
+			input:          bytes.NewBuffer(sampleInitDBPacket.Bytes()),
+			expectedPacket: sampleInitDBPacket,
+		},
+		{
+			name:           "COM_CREATE_DB",
+			input:          bytes.NewBuffer(sampleCreateDBPacket.Bytes()),
+			expectedPacket: sampleCreateDBPacket,
+		},
+		{
+			name:           "COM_DROP_DB",
+			input:          bytes.NewBuffer(sampleDropDBPacket.Bytes()),
+			expectedPacket: sampleDropDBPacket,
+		},
+		{
+			name:           "COM_SHUTDOWN",
+			input:          bytes.NewBuffer(sampleShutDownPacket.Bytes()),
+			expectedPacket: sampleShutDownPacket,
+		},
+		{
+			name:           "COM_PROCESS_KILL",
+			input:          bytes.NewBuffer(sampleProcessKillPacket.Bytes()),
+			expectedPacket: sampleProcessKillPacket,
+		},
+		{
+			name:           "COM_DEBUG",
+			input:          bytes.NewBuffer(sampleDebugPacket.Bytes()),
+			expectedPacket: sampleDebugPacket,
+		},
+		{
+			name:           "COM_REFRESH",
+			input:          bytes.NewBuffer(sampleRefreshPacket.Bytes()),
+			expectedPacket: sampleRefreshPacket,
+		},
+		{
 			name:           "COM_STMT_PREPARE",
 			input:          bytes.NewBuffer(sampleStatementPreparePacket.Bytes()),
 			expectedPacket: sampleStatementPreparePacket,
@@ -344,5 +472,5 @@ func TestParsePacket(t *testing.T) {
 }
 
 func isUnexpectedEOFError(err error) bool {
-	return trace.Unwrap(err) == io.ErrUnexpectedEOF
+	return errors.Is(trace.Unwrap(err), io.ErrUnexpectedEOF)
 }

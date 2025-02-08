@@ -1,28 +1,30 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
+	"slices"
 	"time"
 
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils"
 )
 
 // Fields represents a generic string-keyed map.
@@ -139,14 +141,14 @@ func ToFieldsCondition(expr *types.WhereExpr) (FieldsCondition, error) {
 		left, right := expr.Contains.L, expr.Contains.R
 		switch {
 		case left.Field != "" && right.Field != "":
-			return func(f Fields) bool { return utils.SliceContainsStr(f.GetStrings(left.Field), f.GetString(right.Field)) }, nil
+			return func(f Fields) bool { return slices.Contains(f.GetStrings(left.Field), f.GetString(right.Field)) }, nil
 		case left.Literal != nil && right.Field != "":
 			if ss, ok := left.Literal.([]string); ok {
-				return func(f Fields) bool { return utils.SliceContainsStr(ss, f.GetString(right.Field)) }, nil
+				return func(f Fields) bool { return slices.Contains(ss, f.GetString(right.Field)) }, nil
 			}
 		case left.Field != "" && right.Literal != nil:
 			if s, ok := right.Literal.(string); ok {
-				return func(f Fields) bool { return utils.SliceContainsStr(f.GetStrings(left.Field), s) }, nil
+				return func(f Fields) bool { return slices.Contains(f.GetStrings(left.Field), s) }, nil
 			}
 		}
 	}

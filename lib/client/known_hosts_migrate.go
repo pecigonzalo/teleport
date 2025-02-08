@@ -1,28 +1,32 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
 	"bytes"
+	"context"
+	"log/slog"
+
+	"github.com/gravitational/trace"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh"
 )
 
 // knownHostEntry is a parsed entry from a Teleport/OpenSSH known_hosts file,
@@ -114,7 +118,7 @@ func canPruneOldHostsEntry(oldEntry *knownHostEntry, newEntries []*knownHostEntr
 // duplicate entry exists. This may modify order of host keys, but will not
 // change their content.
 func pruneOldHostKeys(output []string) []string {
-	log := logrus.WithField(trace.Component, teleport.ComponentMigrate)
+	log := slog.With(teleport.ComponentKey, teleport.ComponentMigrate)
 
 	var (
 		oldEntries   = make([]*knownHostEntry, 0)
@@ -127,7 +131,10 @@ func pruneOldHostKeys(output []string) []string {
 		parsed, err := parseKnownHost(line)
 		if err != nil {
 			// If the line isn't parseable, pass it through.
-			log.WithError(err).Debugf("Unable to parse known host on line %d, skipping", i+1)
+			log.DebugContext(context.Background(), "Unable to parse known host, skipping",
+				"invalid_line_number", i+1,
+				"error", err,
+			)
 			prunedOutput = append(prunedOutput, line)
 			continue
 		}
@@ -150,7 +157,7 @@ func pruneOldHostKeys(output []string) []string {
 	// exists. If not, pass it through.
 	for _, entry := range oldEntries {
 		if canPruneOldHostsEntry(entry, newEntries) {
-			log.Debugf("Pruning old known_hosts entry for %s.", entry.hosts[0])
+			log.DebugContext(context.Background(), "Pruning old known_hosts entry for host", "host", entry.hosts[0])
 		} else {
 			prunedOutput = append(prunedOutput, entry.raw)
 		}

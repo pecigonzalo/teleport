@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 /*
 Package events implements the audit log interface events.IAuditLog
@@ -27,11 +29,12 @@ and session log events like session.start.
 Example audit log event:
 
 {"addr.local":"172.10.1.20:3022",
- "addr.remote":"172.10.1.254:58866",
- "event":"session.start",
- "login":"root",
- "user":"klizhentas@gmail.com"
-}
+
+	 "addr.remote":"172.10.1.254:58866",
+	 "event":"session.start",
+	 "login":"root",
+	 "user":"klizhentas@gmail.com"
+	}
 
 Session Logs
 ------------
@@ -40,15 +43,15 @@ Session logs are a series of events and recorded SSH interactive session playbac
 
 Example session log event:
 
-{
-  "time":"2018-01-04T02:12:40.245Z",
-  "event":"print",
-  "bytes":936,
-  "ms":40962,
-  "offset":16842,
-  "ei":31,
-  "ci":29
-}
+	{
+	  "time":"2018-01-04T02:12:40.245Z",
+	  "event":"print",
+	  "bytes":936,
+	  "ms":40962,
+	  "offset":16842,
+	  "ei":31,
+	  "ci":29
+	}
 
 Print event fields
 ------------------
@@ -124,8 +127,8 @@ Files:
 	/var/lib/teleport/log/<auth-server-id>/<session-id>-<first-chunk-in-file-offset>.chunks
 
 Where:
-	- .events   (same events as in the main log, but related to the session)
-	- .chunks (recorded session bytes: PTY IO)
+  - .events   (same events as in the main log, but related to the session)
+  - .chunks (recorded session bytes: PTY IO)
 
 Examples
 ~~~~~~~~
@@ -159,7 +162,8 @@ emitted by print event with chunk index 0
 **Multiple Auth Servers**
 
 In High Availability mode scenario, multiple auth servers will be
- deployed behind a load balancer.
+
+	deployed behind a load balancer.
 
 Any auth server can go down during session and clients will retry the delivery
 to the other auth server.
@@ -217,6 +221,5 @@ Log Search and Playback
 
 Log search and playback is aware of multiple auth servers, merges
 indexes, event streams stored on multiple auth servers.
-
 */
 package events

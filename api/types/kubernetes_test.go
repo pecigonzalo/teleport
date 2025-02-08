@@ -26,11 +26,11 @@ import (
 func TestKubeClustersSorter(t *testing.T) {
 	t.Parallel()
 
-	makeClusters := func(testVals []string, testField string) []KubeCluster {
+	makeClusters := func(testVals []string) []KubeCluster {
 		servers := make([]KubeCluster, len(testVals))
 		for i := 0; i < len(testVals); i++ {
 			var err error
-			servers[i], err = NewKubernetesClusterV3FromLegacyCluster("_", &KubernetesCluster{
+			servers[i], err = NewKubernetesClusterV3FromLegacyCluster("", &KubernetesCluster{
 				Name: testVals[i],
 			})
 			require.NoError(t, err)
@@ -42,7 +42,7 @@ func TestKubeClustersSorter(t *testing.T) {
 
 	// Test descending.
 	sortBy := SortBy{Field: ResourceMetadataName, IsDesc: true}
-	clusters := KubeClusters(makeClusters(testValsUnordered, ResourceMetadataName))
+	clusters := KubeClusters(makeClusters(testValsUnordered))
 	require.NoError(t, clusters.SortByCustom(sortBy))
 	targetVals, err := clusters.GetFieldVals(ResourceMetadataName)
 	require.NoError(t, err)
@@ -50,7 +50,7 @@ func TestKubeClustersSorter(t *testing.T) {
 
 	// Test ascending.
 	sortBy = SortBy{Field: ResourceMetadataName}
-	clusters = KubeClusters(makeClusters(testValsUnordered, ResourceMetadataName))
+	clusters = KubeClusters(makeClusters(testValsUnordered))
 	require.NoError(t, clusters.SortByCustom(sortBy))
 	targetVals, err = clusters.GetFieldVals(ResourceMetadataName)
 	require.NoError(t, err)
@@ -58,7 +58,7 @@ func TestKubeClustersSorter(t *testing.T) {
 
 	// Test error.
 	sortBy = SortBy{Field: "unsupported"}
-	clusters = KubeClusters(makeClusters(testValsUnordered, ResourceMetadataName))
+	clusters = KubeClusters(makeClusters(testValsUnordered))
 	require.True(t, trace.IsNotImplemented(clusters.SortByCustom(sortBy)))
 }
 

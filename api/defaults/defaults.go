@@ -28,14 +28,19 @@ const (
 	// Namespace is default namespace
 	Namespace = "default"
 
-	// DefaultDialTimeout is a default TCP dial timeout we set for our
-	// connection attempts
-	DefaultDialTimeout = 30 * time.Second
+	// DefaultIOTimeout is a default network IO timeout.
+	DefaultIOTimeout = 30 * time.Second
+
+	// DefaultIdleTimeout is a default idle connection timeout.
+	DefaultIdleTimeout = 30 * time.Second
 
 	// KeepAliveCountMax is the number of keep-alive messages that can be sent
 	// without receiving a response from the client before the client is
 	// disconnected. The max count mirrors ClientAliveCountMax of sshd.
 	KeepAliveCountMax = 3
+
+	// MinCertDuration specifies minimum duration of validity of issued certificate
+	MinCertDuration = time.Minute
 
 	// MaxCertDuration limits maximum duration of validity of issued certificate
 	MaxCertDuration = 30 * time.Hour
@@ -43,11 +48,39 @@ const (
 	// CertDuration is a default certificate duration.
 	CertDuration = 12 * time.Hour
 
-	// ServerAnnounceTTL is a period between heartbeats
-	// Median sleep time between node pings is this value / 2 + random
-	// deviation added to this time to avoid lots of simultaneous
-	// heartbeats coming to auth server
-	ServerAnnounceTTL = 600 * time.Second
+	// ServerAnnounceTTL is the default TTL of server presence resources.
+	ServerAnnounceTTL = 10 * time.Minute
+
+	// InstanceHeartbeatTTL is the default TTL of the instance presence resource.
+	InstanceHeartbeatTTL = 20 * time.Minute
+
+	// MaxInstanceHeartbeatInterval is the upper bound of the variable instance
+	// heartbeat interval.
+	MaxInstanceHeartbeatInterval = 18 * time.Minute
+
+	// SessionTrackerTTL defines the default base ttl of a session tracker.
+	SessionTrackerTTL = 30 * time.Minute
+
+	// BreakerInterval is the period in time the circuit breaker will
+	// tally metrics for
+	BreakerInterval = time.Minute
+
+	// TrippedPeriod is the default period of time the circuit breaker will
+	// remain in breaker.StateTripped before transitioning to breaker.StateRecovering. No
+	// outbound requests are allowed for the duration of this period.
+	TrippedPeriod = 60 * time.Second
+
+	// RecoveryLimit is the default number of consecutive successful requests needed to transition
+	// from breaker.StateRecovering to breaker.StateStandby
+	RecoveryLimit = 3
+
+	// BreakerRatio is the default ratio of failed requests to successful requests that will
+	// result in the circuit breaker transitioning to breaker.StateTripped
+	BreakerRatio = 0.9
+
+	// BreakerRatioMinExecutions is the minimum number of requests before the ratio tripper
+	// will consider examining the request pass rate
+	BreakerRatioMinExecutions = 10
 )
 
 var (
@@ -55,13 +88,17 @@ var (
 
 	// serverKeepAliveTTL is a period between server keep-alives,
 	// when servers announce only presence without sending full data
-	serverKeepAliveTTL = 60 * time.Second
+	serverKeepAliveTTL = 1 * time.Minute
 
 	// keepAliveInterval is interval at which Teleport will send keep-alive
 	// messages to the client. The default interval of 5 minutes (300 seconds) is
 	// set to help keep connections alive when using AWS NLBs (which have a default
 	// timeout of 350 seconds)
 	keepAliveInterval = 5 * time.Minute
+
+	// minInstanceHeartbeatInterval is the lower bound of the variable instance
+	// heartbeat interval.
+	minInstanceHeartbeatInterval = 3 * time.Minute
 )
 
 func SetTestTimeouts(svrKeepAliveTTL, keepAliveTick time.Duration) {
@@ -70,12 +107,22 @@ func SetTestTimeouts(svrKeepAliveTTL, keepAliveTick time.Duration) {
 
 	serverKeepAliveTTL = svrKeepAliveTTL
 	keepAliveInterval = keepAliveTick
+
+	// maintain the proportional relationship of instance hb interval to
+	// server hb interval.
+	minInstanceHeartbeatInterval = svrKeepAliveTTL * 3
 }
 
 func ServerKeepAliveTTL() time.Duration {
 	moduleLock.RLock()
 	defer moduleLock.RUnlock()
 	return serverKeepAliveTTL
+}
+
+func MinInstanceHeartbeatInterval() time.Duration {
+	moduleLock.RLock()
+	defer moduleLock.RUnlock()
+	return minInstanceHeartbeatInterval
 }
 
 func KeepAliveInterval() time.Duration {
@@ -103,6 +150,9 @@ const (
 	// run behind an environment/firewall which only allows outgoing connections)
 	SSHProxyTunnelListenPort = 3024
 
+	// SSHProxyListenPort is the default Teleport SSH proxy listen port.
+	SSHProxyListenPort = 3023
+
 	// ProxyWebListenPort is the default Teleport Proxy WebPort address.
 	ProxyWebListenPort = 3080
 
@@ -113,4 +163,30 @@ const (
 const (
 	// TunnelPublicAddrEnvar optionally specifies the alternative reverse tunnel address.
 	TunnelPublicAddrEnvar = "TELEPORT_TUNNEL_PUBLIC_ADDR"
+
+	// TLSRoutingConnUpgradeEnvVar overwrites the test result for deciding if
+	// ALPN connection upgrade is required.
+	//
+	// Sample values:
+	// true
+	// <some.cluster.com>=yes,<another.cluster.com>=no
+	// 0,<some.cluster.com>=1
+	//
+	// TODO(greedy52) DELETE in ??. Note that this toggle was planned to be
+	// deleted in 15.0 when the feature exits preview. However, many users
+	// still rely on this manual toggle as IsALPNConnUpgradeRequired cannot
+	// detect many situations where connection upgrade is required. This can be
+	// deleted once IsALPNConnUpgradeRequired is improved.
+	TLSRoutingConnUpgradeEnvVar = "TELEPORT_TLS_ROUTING_CONN_UPGRADE"
+
+	// TLSRoutingConnUpgradeModeEnvVar overwrites the upgrade mode used when
+	// performing connection upgrades by the clients:
+	// - "websocket": client only requests "websocket" in the "Upgrade" header.
+	// - "legacy": client only requests legacy "alpn"/"alpn-ping" in the
+	//   "Upgrade" header.
+	// - "", "default", or any other value than above: client sends both
+	//   WebSocket and legacy in the "Upgrade" header.
+	//
+	// TODO(greedy52) DELETE in 17.0
+	TLSRoutingConnUpgradeModeEnvVar = "TELEPORT_TLS_ROUTING_CONN_UPGRADE_MODE"
 )

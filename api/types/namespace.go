@@ -20,8 +20,9 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/defaults"
 )
 
 // NewNamespace returns new namespace
@@ -83,14 +84,14 @@ func (n *Namespace) SetSubKind(sk string) {
 	n.SubKind = sk
 }
 
-// GetResourceID returns resource ID
-func (n *Namespace) GetResourceID() int64 {
-	return n.Metadata.ID
+// GetRevision returns the revision
+func (n *Namespace) GetRevision() string {
+	return n.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (n *Namespace) SetResourceID(id int64) {
-	n.Metadata.ID = id
+// SetRevision sets the revision
+func (n *Namespace) SetRevision(rev string) {
+	n.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the cluster.
@@ -142,3 +143,17 @@ func IsValidNamespace(s string) bool {
 }
 
 var validNamespace = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
+// ValidateNamespaceDefault ensures that the namespace is the "default"
+// namespace.
+// This is a precursor to a hard-removal of namespaces.
+func ValidateNamespaceDefault(ns string) error {
+	if ns == defaults.Namespace {
+		return nil
+	}
+
+	const message = "" +
+		"namespace %q invalid, custom namespaces are deprecated; " +
+		"the namespace field should be omitted or set to %q"
+	return trace.BadParameter(message, ns, defaults.Namespace)
+}

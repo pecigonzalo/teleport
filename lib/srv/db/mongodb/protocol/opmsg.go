@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package protocol
 
@@ -20,22 +22,21 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/gravitational/trace"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
-
-	"github.com/gravitational/trace"
 )
 
 // MessageOpMsg represents parsed OP_MSG wire message.
 //
 // https://docs.mongodb.com/master/reference/mongodb-wire-protocol/#op-msg
 //
-// OP_MSG {
-//     MsgHeader header;          // standard message header
-//     uint32 flagBits;           // message flags
-//     Sections[] sections;       // data sections
-//     optional<uint32> checksum; // optional CRC-32C checksum
-// }
+//	OP_MSG {
+//	    MsgHeader header;          // standard message header
+//	    uint32 flagBits;           // message flags
+//	    Sections[] sections;       // data sections
+//	    optional<uint32> checksum; // optional CRC-32C checksum
+//	}
 type MessageOpMsg struct {
 	Header                   MessageHeader
 	Flags                    wiremessage.MsgFlag
@@ -251,6 +252,11 @@ func readOpMsg(header MessageHeader, payload []byte) (*MessageOpMsg, error) {
 		case wiremessage.DocumentSequence:
 			var id string
 			var docs []bsoncore.Document
+
+			if err := validateDocumentSize(rem); err != nil {
+				return nil, trace.BadParameter("malformed OP_MSG: %v %v", err, payload)
+			}
+
 			id, docs, rem, ok = wiremessage.ReadMsgSectionDocumentSequence(rem)
 			if !ok {
 				return nil, trace.BadParameter("malformed OP_MSG: missing document sequence section %v", payload)
@@ -272,6 +278,22 @@ func readOpMsg(header MessageHeader, payload []byte) (*MessageOpMsg, error) {
 		Checksum:                 checksum,
 		bytes:                    append(header.bytes[:], payload...),
 	}, nil
+}
+
+// validateDocumentSize validates document length encoded in the message.
+func validateDocumentSize(src []byte) error {
+	const headerLen = 4
+	if len(src) < headerLen {
+		return trace.BadParameter("document is too short")
+	}
+
+	// document length is encoded in the first 4 bytes
+	documentLength := int(int32(src[0]) | int32(src[1])<<8 | int32(src[2])<<16 | int32(src[3])<<24)
+	// Ensure that idx is not negative.
+	if documentLength-4 < 0 {
+		return trace.BadParameter("invalid document length")
+	}
+	return nil
 }
 
 // ToWire converts this message to wire protocol message bytes.

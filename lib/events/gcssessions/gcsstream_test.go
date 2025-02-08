@@ -1,37 +1,36 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package gcssessions
 
 import (
 	"context"
-	"fmt"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"testing"
+
+	"cloud.google.com/go/storage"
+	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/events/test"
-
-	"cloud.google.com/go/storage"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/atomic"
-
-	"github.com/gravitational/trace"
 )
 
 func TestUploadFromPath(t *testing.T) {
@@ -73,12 +72,11 @@ func TestStreams(t *testing.T) {
 	ctx := context.Background()
 	uri := os.Getenv(teleport.GCSTestURI)
 	if uri == "" {
-		t.Skip(
-			fmt.Sprintf("Skipping GCS tests, set env var %q, details here: https://goteleport.com/teleport/docs/gcp-guide/",
-				teleport.GCSTestURI))
+		t.Skipf("Skipping GCS tests, set env var %q, details here: https://goteleport.com/teleport/docs/gcp-guide/",
+			teleport.GCSTestURI)
 	}
 	u, err := url.Parse(uri)
-	require.Nil(t, err)
+	require.NoError(t, err)
 
 	config := Config{}
 	err = config.SetFromURL(u)
@@ -105,10 +103,10 @@ func TestStreams(t *testing.T) {
 		err = config.SetFromURL(u)
 		require.NoError(t, err)
 
-		composeCount := atomic.NewUint64(0)
+		var composeCount atomic.Uint64
 
 		config.OnComposerRun = func(ctx context.Context, composer *storage.Composer) (*storage.ObjectAttrs, error) {
-			if composeCount.Inc() <= 1 {
+			if composeCount.Add(1) <= 1 {
 				return nil, trace.ConnectionProblem(nil, "simulate timeout %v", composeCount.Load())
 			}
 			return composer.Run(ctx)
@@ -127,14 +125,14 @@ func TestStreams(t *testing.T) {
 		err = config.SetFromURL(u)
 		require.NoError(t, err)
 
-		deleteFailed := atomic.NewUint64(0)
+		var deleteFailed atomic.Uint64
 
 		config.AfterObjectDelete = func(ctx context.Context, object *storage.ObjectHandle, err error) error {
 			if err != nil {
 				return err
 			}
 			// delete the object, but still simulate failure
-			if deleteFailed.CAS(0, 1) == true {
+			if deleteFailed.CompareAndSwap(0, 1) == true {
 				return trace.ConnectionProblem(nil, "simulate delete failure %v", deleteFailed.Load())
 			}
 			return nil

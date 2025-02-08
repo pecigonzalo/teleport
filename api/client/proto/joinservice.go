@@ -16,11 +16,38 @@ limitations under the License.
 
 package proto
 
-import "github.com/gravitational/trace"
+import (
+	"github.com/gravitational/trace"
+)
 
 func (r *RegisterUsingIAMMethodRequest) CheckAndSetDefaults() error {
 	if len(r.StsIdentityRequest) == 0 {
 		return trace.BadParameter("missing parameter StsIdentityRequest")
 	}
 	return trace.Wrap(r.RegisterUsingTokenRequest.CheckAndSetDefaults())
+}
+
+func (r *RegisterUsingAzureMethodRequest) CheckAndSetDefaults() error {
+	if len(r.AttestedData) == 0 {
+		return trace.BadParameter("missing parameter AttestedData")
+	}
+	if len(r.AccessToken) == 0 {
+		return trace.BadParameter("missing parameter AccessToken")
+	}
+	return trace.Wrap(r.RegisterUsingTokenRequest.CheckAndSetDefaults())
+}
+
+func (r *RegisterUsingOracleMethodRequest) CheckAndSetDefaults() error {
+	switch req := r.Request.(type) {
+	case *RegisterUsingOracleMethodRequest_RegisterUsingTokenRequest:
+		return trace.Wrap(req.RegisterUsingTokenRequest.CheckAndSetDefaults())
+	case *RegisterUsingOracleMethodRequest_OracleRequest:
+		if len(req.OracleRequest.Headers) == 0 {
+			return trace.BadParameter("missing parameter Headers")
+		}
+		if len(req.OracleRequest.PayloadHeaders) == 0 {
+			return trace.BadParameter("missing parameter PayloadHeaders")
+		}
+	}
+	return trace.BadParameter("invalid request type: %T", r.Request)
 }

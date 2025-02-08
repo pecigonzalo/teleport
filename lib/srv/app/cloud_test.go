@@ -1,21 +1,25 @@
 /*
-Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package app
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -27,11 +31,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	awssession "github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/jonboulle/clockwork"
-
-	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/lib/tlsca"
+	awsutils "github.com/gravitational/teleport/lib/utils/aws"
 )
 
 func TestIsSessionUsingTemporaryCredentials(t *testing.T) {
@@ -148,13 +154,12 @@ func TestCloudGetFederationDuration(t *testing.T) {
 		test := test // capture range variable
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
+			awsSession := &awssession.Session{Config: &aws.Config{
+				Credentials: credentials.NewCredentials(&mockCredentialsProvider{}),
+			}}
 			c, err := NewCloud(CloudConfig{
-				Session: &awssession.Session{
-					Config: &aws.Config{
-						Credentials: credentials.NewCredentials(&mockCredentialsProvider{}),
-					},
-				},
-				Clock: clockwork.NewFakeClockAt(now),
+				SessionGetter: awsutils.StaticAWSSessionProvider(awsSession),
+				Clock:         clockwork.NewFakeClockAt(now),
 			})
 			require.NoError(t, err)
 
@@ -164,7 +169,7 @@ func TestCloudGetFederationDuration(t *testing.T) {
 			req := &AWSSigninRequest{
 				Identity: &tlsca.Identity{
 					RouteToApp: tlsca.RouteToApp{
-						AWSRoleARN: "arn:aws:iam::123456789:role/test",
+						AWSRoleARN: "arn:aws:iam::123456789012:role/test",
 					},
 					Expires: test.expiresAt,
 				},
@@ -182,7 +187,16 @@ func TestCloudGetFederationDuration(t *testing.T) {
 	}
 }
 
+func TestCheckAndSetDefaults(t *testing.T) {
+	t.Run("session getter is required", func(t *testing.T) {
+		err := (&CloudConfig{}).CheckAndSetDefaults()
+		require.True(t, trace.IsBadParameter(err))
+	})
+}
+
 func TestCloudGetAWSSigninToken(t *testing.T) {
+	ctx := context.Background()
+
 	tests := []struct {
 		name                    string
 		sessionCredentials      *credentials.Credentials
@@ -220,7 +234,7 @@ func TestCloudGetAWSSigninToken(t *testing.T) {
 			expectedToken: "generated-token",
 		},
 		{
-			name:               "validate URL parameters termporary session",
+			name:               "validate URL parameters temporary session",
 			sessionCredentials: credentials.NewStaticCredentials("id", "secret", "sessiontoken"),
 			federationServerHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				values := r.URL.Query()
@@ -252,13 +266,14 @@ func TestCloudGetAWSSigninToken(t *testing.T) {
 			mockFedurationServer := httptest.NewServer(test.federationServerHandler)
 			t.Cleanup(mockFedurationServer.Close)
 
-			c, err := NewCloud(CloudConfig{
-				Session: &awssession.Session{
-					Config: &aws.Config{
-						Credentials: test.sessionCredentials,
-						Endpoint:    aws.String("http://localhost"),
-					},
+			awsSession := &awssession.Session{
+				Config: &aws.Config{
+					Credentials: test.sessionCredentials,
+					Endpoint:    aws.String("http://localhost"),
 				},
+			}
+			c, err := NewCloud(CloudConfig{
+				SessionGetter: awsutils.StaticAWSSessionProvider(awsSession),
 			})
 			require.NoError(t, err)
 
@@ -268,14 +283,14 @@ func TestCloudGetAWSSigninToken(t *testing.T) {
 			req := &AWSSigninRequest{
 				Identity: &tlsca.Identity{
 					RouteToApp: tlsca.RouteToApp{
-						AWSRoleARN: "arn:aws:iam::123456789:role/test",
+						AWSRoleARN: "arn:aws:iam::123456789012:role/test",
 					},
 					Expires: time.Now().Add(24 * time.Hour),
 				},
 				Issuer: "test",
 			}
 
-			actualToken, err := cloud.getAWSSigninToken(req, mockFedurationServer.URL, mockProviderClient)
+			actualToken, err := cloud.getAWSSigninToken(ctx, req, mockFedurationServer.URL, mockProviderClient)
 			if test.expectedErrorIs != nil {
 				require.True(t, test.expectedErrorIs(err))
 			} else if test.expectedError {
@@ -284,6 +299,36 @@ func TestCloudGetAWSSigninToken(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, test.expectedToken, actualToken)
 			}
+		})
+	}
+}
+
+func TestCloudGetFederationURL(t *testing.T) {
+	tests := []struct {
+		name                  string
+		inputTargetURL        string
+		expectedFederationURL string
+	}{
+		{
+			name:                  "AWS GovCloud (US)",
+			inputTargetURL:        constants.AWSUSGovConsoleURL,
+			expectedFederationURL: "https://signin.amazonaws-us-gov.com/federation",
+		},
+		{
+			name:                  "AWS China",
+			inputTargetURL:        constants.AWSCNConsoleURL,
+			expectedFederationURL: "https://signin.amazonaws.cn/federation",
+		},
+		{
+			name:                  "AWS Standard",
+			inputTargetURL:        constants.AWSConsoleURL,
+			expectedFederationURL: "https://signin.aws.amazon.com/federation",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.expectedFederationURL, getFederationURL(test.inputTargetURL))
 		})
 	}
 }

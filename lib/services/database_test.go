@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -22,36 +24,56 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/gravitational/trace"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/aws/aws-sdk-go/service/redshift"
-	"github.com/stretchr/testify/require"
 )
 
 // TestDatabaseUnmarshal verifies a database resource can be unmarshaled.
 func TestDatabaseUnmarshal(t *testing.T) {
-	expected, err := types.NewDatabaseV3(types.Metadata{
-		Name:        "test-database",
-		Description: "Test description",
-		Labels:      map[string]string{"env": "dev"},
-	}, types.DatabaseSpecV3{
-		Protocol: defaults.ProtocolPostgres,
-		URI:      "localhost:5432",
-		CACert:   fixtures.TLSCACertPEM,
-	})
-	require.NoError(t, err)
-	data, err := utils.ToJSON([]byte(fmt.Sprintf(databaseYAML, indent(fixtures.TLSCACertPEM, 4))))
-	require.NoError(t, err)
-	actual, err := UnmarshalDatabase(data)
-	require.NoError(t, err)
-	require.Equal(t, expected, actual)
+	t.Parallel()
+	tlsModes := map[string]types.DatabaseTLSMode{
+		"":            types.DatabaseTLSMode_VERIFY_FULL,
+		"verify-full": types.DatabaseTLSMode_VERIFY_FULL,
+		"verify-ca":   types.DatabaseTLSMode_VERIFY_CA,
+		"insecure":    types.DatabaseTLSMode_INSECURE,
+	}
+	for tlsModeName, tlsModeValue := range tlsModes {
+		t.Run("tls mode "+tlsModeName, func(t *testing.T) {
+			expected, err := types.NewDatabaseV3(types.Metadata{
+				Name:        "test-database",
+				Description: "Test description",
+				Labels:      map[string]string{"env": "dev"},
+			}, types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolPostgres,
+				URI:      "localhost:5432",
+				CACert:   fixtures.TLSCACertPEM,
+				TLS: types.DatabaseTLS{
+					Mode: tlsModeValue,
+				},
+			})
+			require.NoError(t, err)
+			caCert := indent(fixtures.TLSCACertPEM, 4)
+
+			// verify it works with string tls mode.
+			data, err := utils.ToJSON([]byte(fmt.Sprintf(databaseYAML, tlsModeName, caCert)))
+			require.NoError(t, err)
+			actual, err := UnmarshalDatabase(data)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(expected, actual))
+
+			// verify it works with integer tls mode.
+			data, err = utils.ToJSON([]byte(fmt.Sprintf(databaseYAML, int32(tlsModeValue), caCert)))
+			require.NoError(t, err)
+			actual, err = UnmarshalDatabase(data)
+			require.NoError(t, err)
+			require.Empty(t, cmp.Diff(expected, actual))
+		})
+	}
 }
 
 // TestDatabaseMarshal verifies a marshaled database resource can be unmarshaled back.
@@ -70,7 +92,445 @@ func TestDatabaseMarshal(t *testing.T) {
 	require.NoError(t, err)
 	actual, err := UnmarshalDatabase(data)
 	require.NoError(t, err)
-	require.Equal(t, expected, actual)
+	require.Empty(t, cmp.Diff(expected, actual))
+}
+
+func TestValidateDatabase(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		inputName   string
+		inputSpec   types.DatabaseSpecV3
+		expectError bool
+	}{
+		{
+			inputName: "invalid-database-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: "unknown",
+				URI:      "localhost:5432",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-database-uri",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolPostgres,
+				URI:      "missing-port",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-database-assume-role-arn",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolDynamoDB,
+				AWS: types.AWS{
+					Region:        "us-east-1",
+					AccountID:     "123456789012",
+					AssumeRoleARN: "foobar",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-database-assume-role-arn-resource-type",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolDynamoDB,
+				AWS: types.AWS{
+					Region:        "us-east-1",
+					AccountID:     "123456789012",
+					AssumeRoleARN: "arn:aws:sts::123456789012:federated-user/Alice",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-database-assume-role-arn-account-id-mismatch",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolDynamoDB,
+				AWS: types.AWS{
+					Region:        "us-east-1",
+					AccountID:     "123456789012",
+					AssumeRoleARN: "arn:aws:iam::111222333444:federated-user/Alice",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-database-CA-cert",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolPostgres,
+				URI:      "localhost:5432",
+				TLS: types.DatabaseTLS{
+					CACert: "bad-cert",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-mongodb",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolMongoDB,
+				URI:      "mongodb://mongo-1:27017,mongo-2:27018/?replicaSet=rs0",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-mongodb-srv",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolMongoDB,
+				URI:      "mongodb+srv://valid.but.cannot.be.resolved.com",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-mongodb-srv",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolMongoDB,
+				URI:      "mongodb+srv://valid.but.cannot.be.resolved.com/?readpreference=unknown",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-mongodb-missing-username",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolMongoDB,
+				URI:      "mongodb://mongo-1:27017/?authmechanism=plain",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-redis",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolRedis,
+				URI:      "rediss://redis.example.com:6379",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-redis-incorrect-mode",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolRedis,
+				URI:      "rediss://redis.example.com:6379?mode=unknown",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-snowflake",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSnowflake,
+				URI:      "test.snowflakecomputing.com",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-snowflake",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSnowflake,
+				URI:      "not.snow.flake.com",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-cassandra-without-uri",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolCassandra,
+				AWS: types.AWS{
+					Region:    "us-east-1",
+					AccountID: "123456789012",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-dynamodb-without-uri",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolDynamoDB,
+				AWS: types.AWS{
+					Region:    "us-east-1",
+					AccountID: "123456789012",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-spanner-without-uri",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSpanner,
+				GCP: types.GCPCloudSQL{
+					ProjectID:  "project-id",
+					InstanceID: "instance-id",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-spanner-with-uri",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSpanner,
+				URI:      "spanner.googleapis.com:443",
+				GCP: types.GCPCloudSQL{
+					ProjectID:  "project-id",
+					InstanceID: "instance-id",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-spanner-uri-host",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSpanner,
+				URI:      "foo.googleapis.com:443",
+				GCP: types.GCPCloudSQL{
+					ProjectID:  "project-id",
+					InstanceID: "instance-id",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-spanner-uri-missing-port",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSpanner,
+				URI:      "spanner.googleapis.com",
+				GCP: types.GCPCloudSQL{
+					ProjectID:  "project-id",
+					InstanceID: "instance-id",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-mssql-without-ad",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.goteleport.com:1433",
+				AD:       types.AD{},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-mssql-kerberos-keytabfile",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.goteleport.com:1433",
+				AD: types.AD{
+					KeytabFile: "path-to.keytab",
+					Krb5File:   "path-to.krb5",
+					Domain:     "domain.goteleport.com",
+					SPN:        "MSSQLSvc/sqlserver.goteleport.com:1433",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-mssql-kerberos-kdchostname",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.goteleport.com:1433",
+				AD: types.AD{
+					KDCHostName: "DOMAIN-CONTROLLER.domain.goteleport.com",
+					Krb5File:    "path-to.krb5",
+					Domain:      "domain.goteleport.com",
+					SPN:         "MSSQLSvc/sqlserver.goteleport.com:1433",
+					LDAPCert:    "-----BEGIN CERTIFICATE-----",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-mssql-kerberos-kdchostname-without-ldapcert",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.goteleport.com:1433",
+				AD: types.AD{
+					KDCHostName: "DOMAIN-CONTROLLER.domain.goteleport.com",
+					Krb5File:    "path-to.krb5",
+					Domain:      "domain.goteleport.com",
+					SPN:         "MSSQLSvc/sqlserver.goteleport.com:1433",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-mssql-azure-kerberos",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.database.windows.net:1433",
+				AD: types.AD{
+					KeytabFile: "path-to.keytab",
+					Krb5File:   "path-to.krb5",
+					Domain:     "domain.goteleport.com",
+					SPN:        "MSSQLSvc/sqlserver.database.windows.net:1433",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-mssql-azure-ad",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.database.windows.net:1433",
+				AD:       types.AD{},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-mssql-rds-kerberos-keytab",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.rds.amazonaws.com:1433",
+				AD: types.AD{
+					KeytabFile: "path-to.keytab",
+					Krb5File:   "path-to.krb5",
+					Domain:     "domain.goteleport.com",
+					SPN:        "MSSQLSvc/sqlserver.rds.amazonaws.com:1433",
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "valid-mssql-aws-rds-proxy",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.rds.amazonaws.com:1433",
+				AWS: types.AWS{
+					RDSProxy: types.RDSProxy{
+						Name: "sqlserver-proxy",
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-mssql-rds-kerberos-without-ad",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.rds.amazonaws.com:1433",
+				AD:       types.AD{},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-mssql-aws-rds-proxy-kerberos-without-spn",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "sqlserver.rds.amazonaws.com:1433",
+				AWS: types.AWS{
+					RDSProxy: types.RDSProxy{
+						Name: "sqlserver-proxy",
+					},
+				},
+				AD: types.AD{
+					KeytabFile: "path-to.keytab",
+					Krb5File:   "path-to.krb5",
+					Domain:     "domain.goteleport.com",
+				},
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-clickhouse-uri-http-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouseHTTP,
+				URI:      "https://localhost:1234",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "clickhouse-uri-without-schema-http-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouseHTTP,
+				URI:      "localhost:1234",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "clickhouse-uri-without-schema-native-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouse,
+				URI:      "localhost:1234",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "invalid-schema-for-native-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouse,
+				URI:      "https://localhost:1234",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "invalid-schema-for-http-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouseHTTP,
+				URI:      "clickhouse://localhost:1234",
+			},
+			expectError: true,
+		},
+		{
+			inputName: "valid-clickhouse-uri-native-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouse,
+				URI:      "clickhouse://localhost:1234",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "uri-without-schema-native-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouse,
+				URI:      "localhost:1234",
+			},
+			expectError: false,
+		},
+		{
+			inputName: "uri-without-schema-http-protocol",
+			inputSpec: types.DatabaseSpecV3{
+				Protocol: defaults.ProtocolClickHouseHTTP,
+				URI:      "localhost:1234",
+			},
+			expectError: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.inputName, func(t *testing.T) {
+			database, err := types.NewDatabaseV3(types.Metadata{
+				Name: test.inputName,
+			}, test.inputSpec)
+			require.NoError(t, err)
+
+			err = ValidateDatabase(database)
+			if test.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateSQLServerDatabaseURI(t *testing.T) {
+	for _, test := range []struct {
+		uri       string
+		assertErr require.ErrorAssertionFunc
+	}{
+		{"mssql://computer.domain.com:1433", require.NoError},
+		{"computer.domain.com:1433", require.NoError},
+		{"computer.ad.domain.com:1433", require.NoError},
+		{"computer.ad.domain.com:1433/hello", require.Error},
+		{"mssql://computer.domain.com:1433/hello", require.Error},
+		{"computer.domain.com", require.Error},
+		{"computer.com:1433", require.Error},
+		{"0.0.0.0:1433", require.Error},
+		{"mssql://", require.Error},
+		{"http://computer.domain.com:1433", require.Error},
+	} {
+		t.Run(test.uri, func(t *testing.T) {
+			test.assertErr(t, ValidateSQLServerURI(test.uri))
+		})
+	}
 }
 
 // indent returns the string where each line is indented by the specified
@@ -84,7 +544,8 @@ func indent(s string, spaces int) string {
 	return strings.Join(lines, "\n")
 }
 
-var databaseYAML = `kind: db
+var databaseYAML = `---
+kind: db
 version: v3
 metadata:
   name: test-database
@@ -94,398 +555,7 @@ metadata:
 spec:
   protocol: "postgres"
   uri: "localhost:5432"
-  ca_cert: |
+  tls:
+    mode: %v
+  ca_cert: |-
 %v`
-
-// TestDatabaseFromRDSInstance tests converting an RDS instance to a database resource.
-func TestDatabaseFromRDSInstance(t *testing.T) {
-	instance := &rds.DBInstance{
-		DBInstanceArn:                    aws.String("arn:aws:rds:us-west-1:1234567890:db:instance-1"),
-		DBInstanceIdentifier:             aws.String("instance-1"),
-		DBClusterIdentifier:              aws.String("cluster-1"),
-		DbiResourceId:                    aws.String("resource-1"),
-		IAMDatabaseAuthenticationEnabled: aws.Bool(true),
-		Engine:                           aws.String(RDSEnginePostgres),
-		EngineVersion:                    aws.String("13.0"),
-		Endpoint: &rds.Endpoint{
-			Address: aws.String("localhost"),
-			Port:    aws.Int64(5432),
-		},
-		TagList: []*rds.Tag{{
-			Key:   aws.String("key"),
-			Value: aws.String("val"),
-		}},
-	}
-	expected, err := types.NewDatabaseV3(types.Metadata{
-		Name:        "instance-1",
-		Description: "RDS instance in us-west-1",
-		Labels: map[string]string{
-			types.OriginLabel:  types.OriginCloud,
-			labelAccountID:     "1234567890",
-			labelRegion:        "us-west-1",
-			labelEngine:        RDSEnginePostgres,
-			labelEngineVersion: "13.0",
-			labelEndpointType:  "instance",
-			"key":              "val",
-		},
-	}, types.DatabaseSpecV3{
-		Protocol: defaults.ProtocolPostgres,
-		URI:      "localhost:5432",
-		AWS: types.AWS{
-			AccountID: "1234567890",
-			Region:    "us-west-1",
-			RDS: types.RDS{
-				InstanceID: "instance-1",
-				ClusterID:  "cluster-1",
-				ResourceID: "resource-1",
-				IAMAuth:    true,
-			},
-		},
-	})
-	require.NoError(t, err)
-	actual, err := NewDatabaseFromRDSInstance(instance)
-	require.NoError(t, err)
-	require.Equal(t, expected, actual)
-}
-
-// TestDatabaseFromRDSCluster tests converting an RDS cluster to a database resource.
-func TestDatabaseFromRDSCluster(t *testing.T) {
-	cluster := &rds.DBCluster{
-		DBClusterArn:                     aws.String("arn:aws:rds:us-east-1:1234567890:cluster:cluster-1"),
-		DBClusterIdentifier:              aws.String("cluster-1"),
-		DbClusterResourceId:              aws.String("resource-1"),
-		IAMDatabaseAuthenticationEnabled: aws.Bool(true),
-		Engine:                           aws.String(RDSEngineAuroraMySQL),
-		EngineVersion:                    aws.String("8.0.0"),
-		Endpoint:                         aws.String("localhost"),
-		ReaderEndpoint:                   aws.String("reader.host"),
-		Port:                             aws.Int64(3306),
-		CustomEndpoints: []*string{
-			aws.String("myendpoint1.cluster-custom-example.us-east-1.rds.amazonaws.com"),
-			aws.String("myendpoint2.cluster-custom-example.us-east-1.rds.amazonaws.com"),
-		},
-		TagList: []*rds.Tag{{
-			Key:   aws.String("key"),
-			Value: aws.String("val"),
-		}},
-	}
-
-	expectedAWS := types.AWS{
-		AccountID: "1234567890",
-		Region:    "us-east-1",
-		RDS: types.RDS{
-			ClusterID:  "cluster-1",
-			ResourceID: "resource-1",
-			IAMAuth:    true,
-		},
-	}
-
-	t.Run("primary", func(t *testing.T) {
-		expected, err := types.NewDatabaseV3(types.Metadata{
-			Name:        "cluster-1",
-			Description: "Aurora cluster in us-east-1",
-			Labels: map[string]string{
-				types.OriginLabel:  types.OriginCloud,
-				labelAccountID:     "1234567890",
-				labelRegion:        "us-east-1",
-				labelEngine:        RDSEngineAuroraMySQL,
-				labelEngineVersion: "8.0.0",
-				labelEndpointType:  "primary",
-				"key":              "val",
-			},
-		}, types.DatabaseSpecV3{
-			Protocol: defaults.ProtocolMySQL,
-			URI:      "localhost:3306",
-			AWS:      expectedAWS,
-		})
-		require.NoError(t, err)
-		actual, err := NewDatabaseFromRDSCluster(cluster)
-		require.NoError(t, err)
-		require.Equal(t, expected, actual)
-	})
-
-	t.Run("reader", func(t *testing.T) {
-		expected, err := types.NewDatabaseV3(types.Metadata{
-			Name:        "cluster-1-reader",
-			Description: "Aurora cluster in us-east-1 (reader endpoint)",
-			Labels: map[string]string{
-				types.OriginLabel:  types.OriginCloud,
-				labelAccountID:     "1234567890",
-				labelRegion:        "us-east-1",
-				labelEngine:        RDSEngineAuroraMySQL,
-				labelEngineVersion: "8.0.0",
-				labelEndpointType:  "reader",
-				"key":              "val",
-			},
-		}, types.DatabaseSpecV3{
-			Protocol: defaults.ProtocolMySQL,
-			URI:      "reader.host:3306",
-			AWS:      expectedAWS,
-		})
-		require.NoError(t, err)
-		actual, err := NewDatabaseFromRDSClusterReaderEndpoint(cluster)
-		require.NoError(t, err)
-		require.Equal(t, expected, actual)
-	})
-
-	t.Run("custom endpoints", func(t *testing.T) {
-		expectedLabels := map[string]string{
-			types.OriginLabel:  types.OriginCloud,
-			labelAccountID:     "1234567890",
-			labelRegion:        "us-east-1",
-			labelEngine:        RDSEngineAuroraMySQL,
-			labelEngineVersion: "8.0.0",
-			labelEndpointType:  "custom",
-			"key":              "val",
-		}
-
-		expectedMyEndpoint1, err := types.NewDatabaseV3(types.Metadata{
-			Name:        "cluster-1-custom-myendpoint1",
-			Description: "Aurora cluster in us-east-1 (custom endpoint)",
-			Labels:      expectedLabels,
-		}, types.DatabaseSpecV3{
-			Protocol: defaults.ProtocolMySQL,
-			URI:      "myendpoint1.cluster-custom-example.us-east-1.rds.amazonaws.com:3306",
-			AWS:      expectedAWS,
-			TLS: types.DatabaseTLS{
-				ServerName: "localhost",
-			},
-		})
-		require.NoError(t, err)
-
-		expectedMyEndpoint2, err := types.NewDatabaseV3(types.Metadata{
-			Name:        "cluster-1-custom-myendpoint2",
-			Description: "Aurora cluster in us-east-1 (custom endpoint)",
-			Labels:      expectedLabels,
-		}, types.DatabaseSpecV3{
-			Protocol: defaults.ProtocolMySQL,
-			URI:      "myendpoint2.cluster-custom-example.us-east-1.rds.amazonaws.com:3306",
-			AWS:      expectedAWS,
-			TLS: types.DatabaseTLS{
-				ServerName: "localhost",
-			},
-		})
-		require.NoError(t, err)
-
-		databases, err := NewDatabasesFromRDSClusterCustomEndpoints(cluster)
-		require.NoError(t, err)
-		require.Equal(t, types.Databases{expectedMyEndpoint1, expectedMyEndpoint2}, databases)
-	})
-
-	t.Run("bad custom endpoints ", func(t *testing.T) {
-		badCluster := *cluster
-		badCluster.CustomEndpoints = []*string{
-			aws.String("badendpoint1"),
-			aws.String("badendpoint2"),
-		}
-		_, err := NewDatabasesFromRDSClusterCustomEndpoints(&badCluster)
-		require.Error(t, err)
-	})
-}
-
-func TestParseRDSCustomEndpoint(t *testing.T) {
-	name, err := parseRDSCustomEndpoint("custom-endpoint.cluster-custom-example.ca-central-1.rds.amazonaws.com")
-	require.NoError(t, err)
-	require.Equal(t, "custom-endpoint", name)
-}
-
-func TestAuroraMySQLVersion(t *testing.T) {
-	tests := []struct {
-		engineVersion        string
-		expectedMySQLVersion string
-	}{
-		{
-			engineVersion:        "5.6.10a",
-			expectedMySQLVersion: "5.6.10a",
-		},
-		{
-			engineVersion:        "5.6.mysql_aurora.1.22.1",
-			expectedMySQLVersion: "1.22.1",
-		},
-		{
-			engineVersion:        "5.6.mysql_aurora.1.22.1.3",
-			expectedMySQLVersion: "1.22.1.3",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.engineVersion, func(t *testing.T) {
-			require.Equal(t, test.expectedMySQLVersion, auroraMySQLVersion(&rds.DBCluster{EngineVersion: aws.String(test.engineVersion)}))
-		})
-	}
-}
-
-func TestIsRDSClusterSupported(t *testing.T) {
-	tests := []struct {
-		name          string
-		engineMode    string
-		engineVersion string
-		isSupported   bool
-	}{
-		{
-			name:          "provisioned",
-			engineMode:    RDSEngineModeProvisioned,
-			engineVersion: "5.6.mysql_aurora.1.22.0",
-			isSupported:   true,
-		},
-		{
-			name:          "serverless",
-			engineMode:    RDSEngineModeServerless,
-			engineVersion: "5.6.mysql_aurora.1.22.0",
-			isSupported:   false,
-		},
-		{
-			name:          "parallel query supported",
-			engineMode:    RDSEngineModeParallelQuery,
-			engineVersion: "5.6.mysql_aurora.1.22.0",
-			isSupported:   true,
-		},
-		{
-			name:          "parallel query unsupported",
-			engineMode:    RDSEngineModeParallelQuery,
-			engineVersion: "5.6.mysql_aurora.1.19.6",
-			isSupported:   false,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			cluster := &rds.DBCluster{
-				DBClusterArn:        aws.String("arn:aws:rds:us-east-1:1234567890:cluster:test"),
-				DBClusterIdentifier: aws.String(test.name),
-				DbClusterResourceId: aws.String(uuid.New().String()),
-				Engine:              aws.String(RDSEngineAuroraMySQL),
-				EngineMode:          aws.String(test.engineMode),
-				EngineVersion:       aws.String(test.engineVersion),
-			}
-
-			got, want := IsRDSClusterSupported(cluster), test.isSupported
-			require.Equal(t, want, got, "IsRDSClusterSupported = %v, want = %v", got, want)
-		})
-	}
-}
-
-func TestIsRDSInstanceSupported(t *testing.T) {
-	tests := []struct {
-		name          string
-		engine        string
-		engineVersion string
-		isSupported   bool
-	}{
-		{
-			name:          "non-MariaDB engine",
-			engine:        RDSEnginePostgres,
-			engineVersion: "13.3",
-			isSupported:   true,
-		},
-		{
-			name:          "unsupported MariaDB",
-			engine:        RDSEngineMariaDB,
-			engineVersion: "10.3.28",
-			isSupported:   false,
-		},
-		{
-			name:          "min supported version",
-			engine:        RDSEngineMariaDB,
-			engineVersion: "10.6.2",
-			isSupported:   true,
-		},
-		{
-			name:          "supported version",
-			engine:        RDSEngineMariaDB,
-			engineVersion: "10.8.0",
-			isSupported:   true,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			cluster := &rds.DBInstance{
-				DBInstanceArn:       aws.String("arn:aws:rds:us-east-1:1234567890:instance:test"),
-				DBClusterIdentifier: aws.String(test.name),
-				DbiResourceId:       aws.String(uuid.New().String()),
-				Engine:              aws.String(test.engine),
-				EngineVersion:       aws.String(test.engineVersion),
-			}
-
-			got, want := IsRDSInstanceSupported(cluster), test.isSupported
-			require.Equal(t, want, got, "IsRDSInstanceSupported = %v, want = %v", got, want)
-		})
-	}
-}
-
-func TestRDSTagsToLabels(t *testing.T) {
-	rdsTags := []*rds.Tag{
-		&rds.Tag{
-			Key:   aws.String("Env"),
-			Value: aws.String("dev"),
-		},
-		&rds.Tag{
-			Key:   aws.String("aws:cloudformation:stack-id"),
-			Value: aws.String("some-id"),
-		},
-		&rds.Tag{
-			Key:   aws.String("Name"),
-			Value: aws.String("test"),
-		},
-	}
-	labels := rdsTagsToLabels(rdsTags)
-	require.Equal(t, map[string]string{"Name": "test", "Env": "dev"}, labels)
-}
-
-// TestDatabaseFromRedshiftCluster tests converting an Redshift cluster to a database resource.
-func TestDatabaseFromRedshiftCluster(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		cluster := &redshift.Cluster{
-			ClusterIdentifier:   aws.String("mycluster"),
-			ClusterNamespaceArn: aws.String("arn:aws:redshift:us-east-1:1234567890:namespace:u-u-i-d"),
-			Endpoint: &redshift.Endpoint{
-				Address: aws.String("localhost"),
-				Port:    aws.Int64(5439),
-			},
-			Tags: []*redshift.Tag{
-				{
-					Key:   aws.String("key"),
-					Value: aws.String("val"),
-				},
-				{
-					Key:   aws.String("elasticbeanstalk:environment-id"),
-					Value: aws.String("id"),
-				},
-			},
-		}
-		expected, err := types.NewDatabaseV3(types.Metadata{
-			Name:        "mycluster",
-			Description: "Redshift cluster in us-east-1",
-			Labels: map[string]string{
-				types.OriginLabel: types.OriginCloud,
-				labelAccountID:    "1234567890",
-				labelRegion:       "us-east-1",
-				"key":             "val",
-			},
-		}, types.DatabaseSpecV3{
-			Protocol: defaults.ProtocolPostgres,
-			URI:      "localhost:5439",
-			AWS: types.AWS{
-				AccountID: "1234567890",
-				Region:    "us-east-1",
-				Redshift: types.Redshift{
-					ClusterID: "mycluster",
-				},
-			},
-		})
-
-		require.NoError(t, err)
-
-		actual, err := NewDatabaseFromRedshiftCluster(cluster)
-		require.NoError(t, err)
-		require.Equal(t, expected, actual)
-	})
-
-	t.Run("missing endpoint", func(t *testing.T) {
-		_, err := NewDatabaseFromRedshiftCluster(&redshift.Cluster{
-			ClusterIdentifier: aws.String("still-creating"),
-		})
-		require.Error(t, err)
-		require.True(t, trace.IsBadParameter(err), "Expected trace.BadParameter, got %v", err)
-	})
-}

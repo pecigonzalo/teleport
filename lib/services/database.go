@@ -1,39 +1,46 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"log/slog"
+	"net"
+	"net/netip"
+	"net/url"
+	"slices"
 	"strings"
 
-	"github.com/gravitational/teleport/api/types"
-	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/aws-sdk-go/service/rds"
-	"github.com/aws/aws-sdk-go/service/redshift"
-
-	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+
+	"github.com/gravitational/teleport/api/types"
+	azureutils "github.com/gravitational/teleport/api/utils/azure"
+	gcputils "github.com/gravitational/teleport/api/utils/gcp"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/srv/db/common/enterprise"
+	"github.com/gravitational/teleport/lib/srv/db/redis/connection"
+	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
+	awsutils "github.com/gravitational/teleport/lib/utils/aws"
 )
 
 // DatabaseGetter defines interface for fetching database resources.
@@ -60,23 +67,17 @@ type Databases interface {
 
 // MarshalDatabase marshals the database resource to JSON.
 func MarshalDatabase(database types.Database, opts ...MarshalOption) ([]byte, error) {
-	if err := database.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	switch database := database.(type) {
 	case *types.DatabaseV3:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *database
-			copy.SetResourceID(0)
-			database = &copy
+		if err := database.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(database)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, database))
 	default:
 		return nil, trace.BadParameter("unsupported database resource %T", database)
 	}
@@ -99,13 +100,13 @@ func UnmarshalDatabase(data []byte, opts ...MarshalOption) (types.Database, erro
 	case types.V3:
 		var database types.DatabaseV3
 		if err := utils.FastUnmarshal(data, &database); err != nil {
-			return nil, trace.BadParameter(err.Error())
+			return nil, trace.BadParameter("%s", err)
 		}
 		if err := database.CheckAndSetDefaults(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if cfg.ID != 0 {
-			database.SetResourceID(cfg.ID)
+		if cfg.Revision != "" {
+			database.SetRevision(cfg.Revision)
 		}
 		if !cfg.Expires.IsZero() {
 			database.SetExpiry(cfg.Expires)
@@ -115,442 +116,255 @@ func UnmarshalDatabase(data []byte, opts ...MarshalOption) (types.Database, erro
 	return nil, trace.BadParameter("unsupported database resource version %q", h.Version)
 }
 
-// NewDatabaseFromRDSInstance creates a database resource from an RDS instance.
-func NewDatabaseFromRDSInstance(instance *rds.DBInstance) (types.Database, error) {
-	endpoint := instance.Endpoint
-	if endpoint == nil {
-		return nil, trace.BadParameter("empty endpoint")
-	}
-	metadata, err := MetadataFromRDSInstance(instance)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return types.NewDatabaseV3(types.Metadata{
-		Name:        aws.StringValue(instance.DBInstanceIdentifier),
-		Description: fmt.Sprintf("RDS instance in %v", metadata.Region),
-		Labels:      labelsFromRDSInstance(instance, metadata),
-	}, types.DatabaseSpecV3{
-		Protocol: engineToProtocol(aws.StringValue(instance.Engine)),
-		URI:      fmt.Sprintf("%v:%v", aws.StringValue(endpoint.Address), aws.Int64Value(endpoint.Port)),
-		AWS:      *metadata,
-	})
-}
-
-// NewDatabaseFromRDSCluster creates a database resource from an RDS cluster (Aurora).
-func NewDatabaseFromRDSCluster(cluster *rds.DBCluster) (types.Database, error) {
-	metadata, err := MetadataFromRDSCluster(cluster)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return types.NewDatabaseV3(types.Metadata{
-		Name:        aws.StringValue(cluster.DBClusterIdentifier),
-		Description: fmt.Sprintf("Aurora cluster in %v", metadata.Region),
-		Labels:      labelsFromRDSCluster(cluster, metadata, RDSEndpointTypePrimary),
-	}, types.DatabaseSpecV3{
-		Protocol: engineToProtocol(aws.StringValue(cluster.Engine)),
-		URI:      fmt.Sprintf("%v:%v", aws.StringValue(cluster.Endpoint), aws.Int64Value(cluster.Port)),
-		AWS:      *metadata,
-	})
-}
-
-// NewDatabaseFromRDSClusterReaderEndpoint creates a database resource from an RDS cluster reader endpoint (Aurora).
-func NewDatabaseFromRDSClusterReaderEndpoint(cluster *rds.DBCluster) (types.Database, error) {
-	metadata, err := MetadataFromRDSCluster(cluster)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return types.NewDatabaseV3(types.Metadata{
-		Name:        fmt.Sprintf("%v-%v", aws.StringValue(cluster.DBClusterIdentifier), string(RDSEndpointTypeReader)),
-		Description: fmt.Sprintf("Aurora cluster in %v (%v endpoint)", metadata.Region, string(RDSEndpointTypeReader)),
-		Labels:      labelsFromRDSCluster(cluster, metadata, RDSEndpointTypeReader),
-	}, types.DatabaseSpecV3{
-		Protocol: engineToProtocol(aws.StringValue(cluster.Engine)),
-		URI:      fmt.Sprintf("%v:%v", aws.StringValue(cluster.ReaderEndpoint), aws.Int64Value(cluster.Port)),
-		AWS:      *metadata,
-	})
-}
-
-// NewDatabasesFromRDSClusterCustomEndpoints creates database resources from RDS cluster custom endpoints (Aurora).
-func NewDatabasesFromRDSClusterCustomEndpoints(cluster *rds.DBCluster) (types.Databases, error) {
-	metadata, err := MetadataFromRDSCluster(cluster)
-	if err != nil {
-		return nil, trace.Wrap(err)
+// ValidateDatabase validates a types.Database.
+func ValidateDatabase(db types.Database) error {
+	if err := enterprise.ProtocolValidation(db.GetProtocol()); err != nil {
+		return trace.Wrap(err)
 	}
 
-	var errors []error
-	var databases types.Databases
-	for _, endpoint := range cluster.CustomEndpoints {
-		endpointName, err := parseRDSCustomEndpoint(aws.StringValue(endpoint))
+	if err := CheckAndSetDefaults(db); err != nil {
+		return trace.Wrap(err)
+	}
+
+	if !slices.Contains(defaults.DatabaseProtocols, db.GetProtocol()) {
+		return trace.BadParameter("unsupported database %q protocol %q, supported are: %v", db.GetName(), db.GetProtocol(), defaults.DatabaseProtocols)
+	}
+
+	// For MongoDB we support specifying either server address or connection
+	// string in the URI which is useful when connecting to a replica set.
+	if db.GetProtocol() == defaults.ProtocolMongoDB &&
+		(strings.HasPrefix(db.GetURI(), connstring.SchemeMongoDB+"://") ||
+			strings.HasPrefix(db.GetURI(), connstring.SchemeMongoDBSRV+"://")) {
+		if err := validateMongoDB(db); err != nil {
+			return trace.Wrap(err)
+		}
+	} else if db.GetProtocol() == defaults.ProtocolRedis {
+		_, err := connection.ParseRedisAddress(db.GetURI())
 		if err != nil {
-			errors = append(errors, trace.Wrap(err))
-			continue
+			return trace.BadParameter("invalid Redis database %q address: %q, error: %v", db.GetName(), db.GetURI(), err)
 		}
+	} else if db.GetProtocol() == defaults.ProtocolSnowflake {
+		if !strings.Contains(db.GetURI(), defaults.SnowflakeURL) {
+			return trace.BadParameter("Snowflake address should contain " + defaults.SnowflakeURL)
+		}
+	} else if db.GetProtocol() == defaults.ProtocolClickHouse || db.GetProtocol() == defaults.ProtocolClickHouseHTTP {
+		if err := validateClickhouseURI(db); err != nil {
+			return trace.Wrap(err)
+		}
+	} else if db.GetProtocol() == defaults.ProtocolSQLServer {
+		if err := ValidateSQLServerURI(db.GetURI()); err != nil {
+			return trace.BadParameter("invalid SQL Server address: %v", err)
+		}
+	} else if db.GetProtocol() == defaults.ProtocolSpanner {
+		if !gcputils.IsSpannerEndpoint(db.GetURI()) {
+			return trace.BadParameter("GCP Spanner database %q address should be %q",
+				db.GetName(), gcputils.SpannerEndpoint)
+		}
+	} else if needsURIValidation(db) {
+		if _, _, err := net.SplitHostPort(db.GetURI()); err != nil {
+			return trace.BadParameter("invalid database %q address %q: %v", db.GetName(), db.GetURI(), err)
+		}
+	}
 
-		database, err := types.NewDatabaseV3(types.Metadata{
-			Name:        fmt.Sprintf("%v-%v-%v", aws.StringValue(cluster.DBClusterIdentifier), string(RDSEndpointTypeCustom), endpointName),
-			Description: fmt.Sprintf("Aurora cluster in %v (%v endpoint)", metadata.Region, string(RDSEndpointTypeCustom)),
-			Labels:      labelsFromRDSCluster(cluster, metadata, RDSEndpointTypeCustom),
-		}, types.DatabaseSpecV3{
-			Protocol: engineToProtocol(aws.StringValue(cluster.Engine)),
-			URI:      fmt.Sprintf("%v:%v", aws.StringValue(endpoint), aws.Int64Value(cluster.Port)),
-			AWS:      *metadata,
+	if db.GetTLS().CACert != "" {
+		if _, err := tlsca.ParseCertificatePEM([]byte(db.GetTLS().CACert)); err != nil {
+			return trace.BadParameter("provided database %q CA doesn't appear to be a valid x509 certificate: %v", db.GetName(), err)
+		}
+	}
 
-			// Aurora instances update their certificates upon restart, and thus custom endpoint SAN may not be available right
-			// away. Using primary endpoint instead as server name since it's always available.
-			TLS: types.DatabaseTLS{
-				ServerName: aws.StringValue(cluster.Endpoint),
-			},
-		})
+	// Validate Active Directory specific configuration, when Kerberos auth is required.
+	if needsADValidation(db) {
+		if db.GetAD().KeytabFile == "" && db.GetAD().KDCHostName == "" {
+			return trace.BadParameter("either keytab file path or kdc_host_name must be provided for database %q, both are missing", db.GetName())
+		}
+		if db.GetAD().Krb5File == "" {
+			return trace.BadParameter("missing Kerberos config file path for database %q", db.GetName())
+		}
+		if db.GetAD().Domain == "" {
+			return trace.BadParameter("missing Active Directory domain for database %q", db.GetName())
+		}
+		if db.GetAD().SPN == "" {
+			return trace.BadParameter("missing service principal name for database %q", db.GetName())
+		}
+		if db.GetAD().KDCHostName != "" {
+			if db.GetAD().LDAPCert == "" {
+				return trace.BadParameter("missing LDAP certificate for x509 authentication for database %q", db.GetName())
+			}
+		}
+	}
+
+	awsMeta := db.GetAWS()
+	if awsMeta.AssumeRoleARN != "" {
+		if awsMeta.AccountID == "" {
+			return trace.BadParameter("database %q missing AWS account ID", db.GetName())
+		}
+		parsed, err := awsutils.ParseRoleARN(awsMeta.AssumeRoleARN)
 		if err != nil {
-			errors = append(errors, trace.Wrap(err))
-			continue
+			return trace.BadParameter("database %q assume_role_arn %q is invalid: %v",
+				db.GetName(), awsMeta.AssumeRoleARN, err)
 		}
-
-		databases = append(databases, database)
-	}
-
-	return databases, trace.NewAggregate(errors...)
-}
-
-// NewDatabaseFromRedshiftCluster creates a database resource from a Redshift cluster.
-func NewDatabaseFromRedshiftCluster(cluster *redshift.Cluster) (types.Database, error) {
-	// Endpoint can be nil while the cluster is being created. Return an error
-	// until the Endpoint is available.
-	if cluster.Endpoint == nil {
-		return nil, trace.BadParameter("missing endpoint in Redshift cluster %v", aws.StringValue(cluster.ClusterIdentifier))
-	}
-
-	metadata, err := MetadataFromRedshiftCluster(cluster)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return types.NewDatabaseV3(types.Metadata{
-		Name:        aws.StringValue(cluster.ClusterIdentifier),
-		Description: fmt.Sprintf("Redshift cluster in %v", metadata.Region),
-		Labels:      labelsFromRedshiftCluster(cluster, metadata),
-	}, types.DatabaseSpecV3{
-		Protocol: defaults.ProtocolPostgres,
-		URI:      fmt.Sprintf("%v:%v", aws.StringValue(cluster.Endpoint.Address), aws.Int64Value(cluster.Endpoint.Port)),
-		AWS:      *metadata,
-	})
-}
-
-// MetadataFromRDSInstance creates AWS metadata from the provided RDS instance.
-func MetadataFromRDSInstance(rdsInstance *rds.DBInstance) (*types.AWS, error) {
-	parsedARN, err := arn.Parse(aws.StringValue(rdsInstance.DBInstanceArn))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &types.AWS{
-		Region:    parsedARN.Region,
-		AccountID: parsedARN.AccountID,
-		RDS: types.RDS{
-			InstanceID: aws.StringValue(rdsInstance.DBInstanceIdentifier),
-			ClusterID:  aws.StringValue(rdsInstance.DBClusterIdentifier),
-			ResourceID: aws.StringValue(rdsInstance.DbiResourceId),
-			IAMAuth:    aws.BoolValue(rdsInstance.IAMDatabaseAuthenticationEnabled),
-		},
-	}, nil
-}
-
-// MetadataFromRDSCluster creates AWS metadata from the provided RDS cluster.
-func MetadataFromRDSCluster(rdsCluster *rds.DBCluster) (*types.AWS, error) {
-	parsedARN, err := arn.Parse(aws.StringValue(rdsCluster.DBClusterArn))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &types.AWS{
-		Region:    parsedARN.Region,
-		AccountID: parsedARN.AccountID,
-		RDS: types.RDS{
-			ClusterID:  aws.StringValue(rdsCluster.DBClusterIdentifier),
-			ResourceID: aws.StringValue(rdsCluster.DbClusterResourceId),
-			IAMAuth:    aws.BoolValue(rdsCluster.IAMDatabaseAuthenticationEnabled),
-		},
-	}, nil
-}
-
-// MetadataFromRedshiftCluster creates AWS metadata from the provided Redshift cluster.
-func MetadataFromRedshiftCluster(cluster *redshift.Cluster) (*types.AWS, error) {
-	parsedARN, err := arn.Parse(aws.StringValue(cluster.ClusterNamespaceArn))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &types.AWS{
-		Region:    parsedARN.Region,
-		AccountID: parsedARN.AccountID,
-		Redshift: types.Redshift{
-			ClusterID: aws.StringValue(cluster.ClusterIdentifier),
-		},
-	}, nil
-}
-
-// engineToProtocol converts RDS instance engine to the database protocol.
-func engineToProtocol(engine string) string {
-	switch engine {
-	case RDSEnginePostgres, RDSEngineAuroraPostgres:
-		return defaults.ProtocolPostgres
-	case RDSEngineMySQL, RDSEngineAurora, RDSEngineAuroraMySQL, RDSEngineMariaDB:
-		return defaults.ProtocolMySQL
-	}
-	return ""
-}
-
-// parseRDSCustomEndpoint endpoint name from the provided RDS custom endpoint.
-func parseRDSCustomEndpoint(endpoint string) (name string, err error) {
-	// https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.Overview.Endpoints.html#Aurora.Endpoints.Custom
-	//
-	// RDS custom endpoint format:
-	// <endpointName>.cluster-custom-<customerDnsIdentifier>.<dnsSuffix>
-	//
-	// Note that endpoint name can only contain letters, numbers, and hyphens, so it's safe to to split on ".".
-	parts := strings.Split(endpoint, ".")
-	if !strings.HasSuffix(endpoint, rdsEndpointSuffix) || len(parts) != 6 {
-		return "", trace.BadParameter("failed to parse %v as RDS custom endpoint", endpoint)
-	}
-	return parts[0], nil
-}
-
-// labelsFromRDSInstance creates database labels for the provided RDS instance.
-func labelsFromRDSInstance(rdsInstance *rds.DBInstance, meta *types.AWS) map[string]string {
-	labels := rdsTagsToLabels(rdsInstance.TagList)
-	labels[types.OriginLabel] = types.OriginCloud
-	labels[labelAccountID] = meta.AccountID
-	labels[labelRegion] = meta.Region
-	labels[labelEngine] = aws.StringValue(rdsInstance.Engine)
-	labels[labelEngineVersion] = aws.StringValue(rdsInstance.EngineVersion)
-	labels[labelEndpointType] = string(RDSEndpointTypeInstance)
-	return labels
-}
-
-// labelsFromRDSCluster creates database labels for the provided RDS cluster.
-func labelsFromRDSCluster(rdsCluster *rds.DBCluster, meta *types.AWS, endpointType RDSEndpointType) map[string]string {
-	labels := rdsTagsToLabels(rdsCluster.TagList)
-	labels[types.OriginLabel] = types.OriginCloud
-	labels[labelAccountID] = meta.AccountID
-	labels[labelRegion] = meta.Region
-	labels[labelEngine] = aws.StringValue(rdsCluster.Engine)
-	labels[labelEngineVersion] = aws.StringValue(rdsCluster.EngineVersion)
-	labels[labelEndpointType] = string(endpointType)
-	return labels
-}
-
-// labelsFromRedshiftCluster creates database labels for the provided Redshift cluster.
-func labelsFromRedshiftCluster(cluster *redshift.Cluster, meta *types.AWS) map[string]string {
-	labels := make(map[string]string)
-	for _, tag := range cluster.Tags {
-		key := aws.StringValue(tag.Key)
-		if types.IsValidLabelKey(key) {
-			labels[key] = aws.StringValue(tag.Value)
+		err = awsutils.CheckARNPartitionAndAccount(parsed, awsMeta.Partition(), awsMeta.AccountID)
+		if err != nil {
+			return trace.BadParameter("database %q is incompatible with AWS assume_role_arn %q: %v",
+				db.GetName(), awsMeta.AssumeRoleARN, err)
 		}
 	}
-	labels[types.OriginLabel] = types.OriginCloud
-	labels[labelAccountID] = meta.AccountID
-	labels[labelRegion] = meta.Region
-	return labels
+
+	return nil
 }
 
-// rdsTagsToLabels converts RDS tags to a labels map.
-func rdsTagsToLabels(tags []*rds.Tag) map[string]string {
-	labels := make(map[string]string)
-	for _, tag := range tags {
-		// An AWS tag key has a pattern of "^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$",
-		// which can make invalid labels (for example "aws:cloudformation:stack-id").
-		// Omit those to avoid resource creation failures.
-		//
-		// https://docs.aws.amazon.com/directoryservice/latest/devguide/API_Tag.html
-		key := aws.StringValue(tag.Key)
-		if types.IsValidLabelKey(key) {
-			labels[key] = aws.StringValue(tag.Value)
-		} else {
-			log.Debugf("Skipping RDS tag %q, not a valid label key.", key)
-		}
+// needsADValidation returns whether a database AD configuration needs to
+// be validated.
+// We support Azure AD authentication and Kerberos auth with AD for SQL
+// Server. The first method doesn't require additional configuration since
+// it assumes the environment’s Azure credentials
+// (https://learn.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication).
+// AD configurations are only required for the second method.
+func needsADValidation(db types.Database) bool {
+	if db.GetProtocol() != defaults.ProtocolSQLServer {
+		return false
 	}
-	return labels
-}
 
-// IsRDSInstanceSupported returns true if database supports IAM authentication.
-// Currently, only MariaDB is being checked.
-func IsRDSInstanceSupported(instance *rds.DBInstance) bool {
-	// TODO(jakule): Check other engines.
-	if aws.StringValue(instance.Engine) != RDSEngineMariaDB {
+	// Domain is always required when configuring the AD section, so we assume
+	// users intend to use Kerberos authentication if the configuration has it.
+	if db.GetAD().Domain != "" {
 		return true
 	}
 
-	// MariaDB follows semver schema: https://mariadb.org/about/
-	ver, err := semver.NewVersion(aws.StringValue(instance.EngineVersion))
-	if err != nil {
-		log.Errorf("Failed to parse RDS MariaDB version: %s", aws.StringValue(instance.EngineVersion))
+	// Azure-hosted databases and RDS Proxy support other authentication
+	// methods, and do not require this section to be validated.
+	if strings.Contains(db.GetURI(), azureutils.MSSQLEndpointSuffix) || db.GetAWS().RDSProxy.Name != "" {
 		return false
-	}
-
-	// Min supported MariaDB version that supports IAM is 10.6
-	// https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html
-	minIAMSupportedVer := semver.New("10.6.0")
-	return !ver.LessThan(*minIAMSupportedVer)
-}
-
-// IsRDSClusterSupported checks whether the aurora cluster is supported and logs
-// related info if not.
-func IsRDSClusterSupported(cluster *rds.DBCluster) bool {
-	switch aws.StringValue(cluster.EngineMode) {
-	// Aurora Serverless (v1 and v2) does not support IAM authentication
-	// https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless.html#aurora-serverless.limitations
-	// https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-2.limitations.html
-	case RDSEngineModeServerless:
-		return false
-
-	// Aurora MySQL 1.22.2, 1.20.1, 1.19.6, and 5.6.10a only: Parallel query doesn't support AWS Identity and Access Management (IAM) database authentication.
-	// https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-mysql-parallel-query.html#aurora-mysql-parallel-query-limitations
-	case RDSEngineModeParallelQuery:
-		if apiutils.SliceContainsStr([]string{"1.22.2", "1.20.1", "1.19.6", "5.6.10a"}, auroraMySQLVersion(cluster)) {
-			return false
-		}
 	}
 
 	return true
 }
 
-// IsRDSInstanceAvailable checks if the RDS instance is available.
-func IsRDSInstanceAvailable(instance *rds.DBInstance) bool {
-	// For a full list of status values, see:
-	// https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/accessing-monitoring.html
-	switch aws.StringValue(instance.DBInstanceStatus) {
-	// Statuses marked as "Billed" in the above guide.
-	case "available", "backing-up", "configuring-enhanced-monitoring",
-		"configuring-iam-database-auth", "configuring-log-exports",
-		"converting-to-vpc", "incompatible-option-group",
-		"incompatible-parameters", "maintenance", "modifying", "moving-to-vpc",
-		"rebooting", "resetting-master-credentials", "renaming", "restore-error",
-		"storage-full", "storage-optimization", "upgrading":
-		return true
+func validateClickhouseURI(db types.Database) error {
+	u, err := url.Parse(db.GetURI())
+	if err != nil {
+		return trace.BadParameter("failed to parse uri: %v", err)
+	}
+	var requiredSchema string
+	if db.GetProtocol() == defaults.ProtocolClickHouse {
+		requiredSchema = "clickhouse"
+	}
+	if db.GetProtocol() == defaults.ProtocolClickHouseHTTP {
+		requiredSchema = "https"
+	}
+	if u.Scheme != requiredSchema {
+		return trace.BadParameter("invalid uri schema: %s for %v database protocol", u.Scheme, db.GetProtocol())
+	}
+	return nil
+}
 
-	// Statuses marked as "Not billed" in the above guide.
-	case "creating", "deleting", "failed",
-		"inaccessible-encryption-credentials", "incompatible-network",
-		"incompatible-restore":
-		return false
-
-	// Statuses marked as "Billed for storage" in the above guide.
-	case "inaccessible-encryption-credentials-recoverable", "starting",
-		"stopped", "stopping":
-		return false
-
-	// Statuses that have no billing information in the above guide, but
-	// believed to be unavailable.
-	case "insufficient-capacity":
-		return false
-
+// needsURIValidation returns whether a database URI needs to be validated.
+func needsURIValidation(db types.Database) bool {
+	switch db.GetProtocol() {
+	case defaults.ProtocolCassandra, defaults.ProtocolDynamoDB:
+		// cloud hosted Cassandra doesn't require URI validation.
+		return db.GetAWS().Region == "" || db.GetAWS().AccountID == ""
 	default:
-		log.Warnf("Unknown status type: %q. Assuming RDS instance %q is available.",
-			aws.StringValue(instance.DBInstanceStatus),
-			aws.StringValue(instance.DBInstanceIdentifier),
-		)
 		return true
 	}
 }
 
-// IsRDSClusterAvailable checks if the RDS cluster is available.
-func IsRDSClusterAvailable(cluster *rds.DBCluster) bool {
-	// For a full list of status values, see:
-	// https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/accessing-monitoring.html
-	switch aws.StringValue(cluster.Status) {
-	// Statuses marked as "Billed" in the above guide.
-	case "available", "backing-up", "backtracking", "failing-over",
-		"maintenance", "migrating", "modifying", "promoting", "renaming",
-		"resetting-master-credentials", "update-iam-db-auth", "upgrading":
-		return true
-
-	// Statuses marked as "Not billed" in the above guide.
-	case "cloning-failed", "creating", "deleting",
-		"inaccessible-encryption-credentials", "migration-failed":
-		return false
-
-	// Statuses marked as "Billed for storage" in the above guide.
-	case "starting", "stopped", "stopping":
-		return false
-
-	default:
-		log.Warnf("Unknown status type: %q. Assuming Aurora cluster %q is available.",
-			aws.StringValue(cluster.Status),
-			aws.StringValue(cluster.DBClusterIdentifier),
+// validateMongoDB validates MongoDB URIs with "mongodb" schemes.
+func validateMongoDB(db types.Database) error {
+	connString, err := connstring.ParseAndValidate(db.GetURI())
+	// connstring.ParseAndValidate requires DNS resolution on TXT/SRV records
+	// for a full validation for "mongodb+srv" URIs. We will try to skip the
+	// DNS errors here by replacing the scheme and then ParseAndValidate again
+	// to validate as much as we can.
+	if isDNSError(err) {
+		slog.WarnContext(context.Background(), "MongoDB database %q (connection string %q) failed validation with DNS error",
+			"database_name", db.GetName(),
+			"database_uri", db.GetURI(),
+			"error", err,
 		)
-		return true
+
+		connString, err = connstring.ParseAndValidate(strings.Replace(
+			db.GetURI(),
+			connstring.SchemeMongoDBSRV+"://",
+			connstring.SchemeMongoDB+"://",
+			1,
+		))
 	}
+	if err != nil {
+		return trace.BadParameter("invalid MongoDB database %q connection string %q: %v", db.GetName(), db.GetURI(), err)
+	}
+
+	// Validate read preference to catch typos early.
+	if connString.ReadPreference != "" {
+		if _, err := readpref.ModeFromString(connString.ReadPreference); err != nil {
+			return trace.BadParameter("invalid MongoDB database %q read preference %q", db.GetName(), connString.ReadPreference)
+		}
+	}
+	return nil
 }
 
-// IsRedshiftClusterAvailable checks if the Redshift cluster is available.
-func IsRedshiftClusterAvailable(cluster *redshift.Cluster) bool {
-	// For a full list of status values, see:
-	// https://docs.aws.amazon.com/redshift/latest/mgmt/working-with-clusters.html#rs-mgmt-cluster-status
-	//
-	// Note that the Redshift guide does not specify billing information like
-	// the RDS and Aurora guides do. Most Redshift statuses are
-	// cross-referenced with similar statuses from RDS and Aurora guides to
-	// determine the availability.
-	//
-	// For "incompatible-xxx" statuses, the cluster is assumed to be available
-	// if the status is resulted by modifying the cluster, and the cluster is
-	// assumed to be unavailable if the cluster cannot be created or restored.
-	switch aws.StringValue(cluster.ClusterStatus) {
-	case "available", "available, prep-for-resize", "available, resize-cleanup",
-		"cancelling-resize", "final-snapshot", "modifying", "rebooting",
-		"renaming", "resizing", "rotating-keys", "storage-full", "updating-hsm",
-		"incompatible-parameters", "incompatible-hsm":
-		return true
+// ValidateSQLServerURI validates SQL Server URI and returns host and
+// port.
+//
+// Since Teleport only supports SQL Server authentcation using AD (self-hosted
+// or Azure) the database URI must include: computer name, domain and port.
+//
+// A few examples of valid URIs:
+// - computer.ad.example.com:1433
+// - computer.domain.com:1433
+func ValidateSQLServerURI(uri string) error {
+	// sqlServerSchema is the SQL Server schema.
+	const sqlServerSchema = "mssql"
 
-	case "creating", "deleting", "hardware-failure", "paused",
-		"incompatible-network":
-		return false
-
-	default:
-		log.Warnf("Unknown status type: %q. Assuming Redshift cluster %q is available.",
-			aws.StringValue(cluster.ClusterStatus),
-			aws.StringValue(cluster.ClusterIdentifier),
-		)
-		return true
+	// Add a temporary schema to make a valid URL for url.Parse if schema is
+	// not found.
+	if !strings.Contains(uri, "://") {
+		uri = sqlServerSchema + "://" + uri
 	}
+
+	parsedURI, err := url.Parse(uri)
+	if err != nil {
+		return trace.BadParameter("unable to parse database address: %s", err)
+	}
+
+	if parsedURI.Scheme != sqlServerSchema {
+		return trace.BadParameter("only %q is supported as database address schema", sqlServerSchema)
+	}
+
+	if parsedURI.Port() == "" {
+		return trace.BadParameter("database address must include port")
+	}
+
+	if parsedURI.Path != "" {
+		return trace.BadParameter("database address with database name is not supported")
+	}
+
+	if _, err := netip.ParseAddr(parsedURI.Hostname()); err == nil {
+		return trace.BadParameter("database address as IP is not supported, use URI with domain and computer name instead")
+	}
+
+	parts := strings.Split(parsedURI.Hostname(), ".")
+	if len(parts) < 3 {
+		return trace.BadParameter("database address must include domain and computer name")
+	}
+
+	return nil
 }
 
-// auroraMySQLVersion extracts aurora mysql version from engine version
-func auroraMySQLVersion(cluster *rds.DBCluster) string {
-	// version guide: https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Updates.Versions.html
-	// a list of all the available versions: https://docs.aws.amazon.com/cli/latest/reference/rds/describe-db-engine-versions.html
-	//
-	// some examples of possible inputs:
-	// 5.6.10a
-	// 5.7.12
-	// 5.6.mysql_aurora.1.22.0
-	// 5.6.mysql_aurora.1.22.1
-	// 5.6.mysql_aurora.1.22.1.3
-	//
-	// general format is: <mysql-major-version>.mysql_aurora.<aurora-mysql-version>
-	// 5.6.10a and 5.7.12 are "legacy" versions and they are returned as it is
-	version := aws.StringValue(cluster.EngineVersion)
-	parts := strings.Split(version, ".mysql_aurora.")
-	if len(parts) == 2 {
-		return parts[1]
+func isDNSError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return version
+
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
 }
 
 const (
-	// labelAccountID is the label key containing AWS account ID.
-	labelAccountID = "account-id"
-	// labelRegion is the label key containing AWS region.
-	labelRegion = "region"
-	// labelEngine is the label key containing RDS database engine name.
-	labelEngine = "engine"
-	// labelEngineVersion is the label key containing RDS database engine version.
-	labelEngineVersion = "engine-version"
-	// labelEndpointType is the label key containing the RDS endpoint type.
-	labelEndpointType = "endpoint-type"
-)
-
-const (
-	// rdsEndpointSuffix is the RDS/Aurora endpoint suffix.
-	rdsEndpointSuffix = ".rds.amazonaws.com"
+	// RDSDescribeTypeInstance is used to filter for Instances type of RDS DBs when describing RDS Databases.
+	RDSDescribeTypeInstance = "instance"
+	// RDSDescribeTypeCluster is used to filter for Clusters type of RDS DBs when describing RDS Databases.
+	RDSDescribeTypeCluster = "cluster"
 )
 
 const (
@@ -561,26 +375,13 @@ const (
 	// RDSEngineMariaDB is RDS engine name for MariaDB instances.
 	RDSEngineMariaDB = "mariadb"
 	// RDSEngineAurora is RDS engine name for Aurora MySQL 5.6 compatible clusters.
+	// This reached EOF on Feb 28, 2023.
+	// https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.MySQL56.EOL.html
 	RDSEngineAurora = "aurora"
 	// RDSEngineAuroraMySQL is RDS engine name for Aurora MySQL 5.7 compatible clusters.
 	RDSEngineAuroraMySQL = "aurora-mysql"
 	// RDSEngineAuroraPostgres is RDS engine name for Aurora Postgres clusters.
 	RDSEngineAuroraPostgres = "aurora-postgresql"
-)
-
-// RDSEndpointType specifies the endpoint type
-type RDSEndpointType string
-
-const (
-	// RDSEndpointTypePrimary is the endpoint that specifies the connection for the primary instance of the RDS cluster.
-	RDSEndpointTypePrimary RDSEndpointType = "primary"
-	// RDSEndpointTypeReader is the endpoint that load-balances connections across the Aurora Replicas that are
-	// available in a RDS cluster.
-	RDSEndpointTypeReader RDSEndpointType = "reader"
-	// RDSEndpointTypeCustom is the endpoint that specifies one of the custom endpoints associated with the RDS cluster.
-	RDSEndpointTypeCustom RDSEndpointType = "custom"
-	// RDSEndpointTypeInstance is the endpoint of an RDS DB instance.
-	RDSEndpointTypeInstance RDSEndpointType = "instance"
 )
 
 const (
@@ -590,8 +391,31 @@ const (
 	RDSEngineModeServerless = "serverless"
 	// RDSEngineModeParallelQuery is the RDS engine mode for Aurora MySQL clusters with parallel query enabled
 	RDSEngineModeParallelQuery = "parallelquery"
-	// RDSEngineModeGlobal is the RDS engine mode for Aurora Global databases
-	RDSEngineModeGlobal = "global"
-	// RDSEngineModeMultiMaster is the RDS engine mode for Multi-master clusters
-	RDSEngineModeMultiMaster = "multimaster"
+)
+
+const (
+	// RDSProxyMySQLPort is the port that RDS Proxy listens on for MySQL connections.
+	RDSProxyMySQLPort = 3306
+	// RDSProxyPostgresPort is the port that RDS Proxy listens on for Postgres connections.
+	RDSProxyPostgresPort = 5432
+	// RDSProxySQLServerPort is the port that RDS Proxy listens on for SQL Server connections.
+	RDSProxySQLServerPort = 1433
+)
+
+const (
+	// AzureEngineMySQL is the Azure engine name for MySQL single-server instances.
+	AzureEngineMySQL = "Microsoft.DBforMySQL/servers"
+	// AzureEngineMySQLFlex is the Azure engine name for MySQL flexible-server instances.
+	AzureEngineMySQLFlex = "Microsoft.DBforMySQL/flexibleServers"
+	// AzureEnginePostgres is the Azure engine name for PostgreSQL single-server instances.
+	AzureEnginePostgres = "Microsoft.DBforPostgreSQL/servers"
+	// AzureEnginePostgresFlex is the Azure engine name for PostgreSQL flexible-server instances.
+	AzureEnginePostgresFlex = "Microsoft.DBforPostgreSQL/flexibleServers"
+)
+
+const (
+	// RedshiftServerlessWorkgroupEndpoint is the endpoint type for workgroups.
+	RedshiftServerlessWorkgroupEndpoint = "workgroup"
+	// RedshiftServerlessVPCEndpoint is the endpoint type for VCP endpoints.
+	RedshiftServerlessVPCEndpoint = "vpc-endpoint"
 )

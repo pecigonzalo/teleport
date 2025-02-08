@@ -3,7 +3,7 @@
 // are relying on systemd
 data "aws_ami" "base" {
   most_recent = true
-  owners      = [126027368216]
+  owners      = [146628656107]
 
   filter {
     name   = "name"
@@ -34,3 +34,4 @@ data "aws_kms_alias" "ssm" {
   name = var.kms_alias_name
 }
 
+data "aws_default_tags" "this" {}

@@ -19,8 +19,9 @@ package types
 import (
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // ClusterAuditConfig defines cluster-wide audit log configuration. This is
@@ -51,6 +52,11 @@ type ClusterAuditConfig interface {
 	AuditEventsURIs() []string
 	// SetAuditEventsURIs sets the audit events URIs.
 	SetAuditEventsURIs([]string)
+
+	// SetUseFIPSEndpoint sets the FIPS endpoint state for S3/Dynamo backends.
+	SetUseFIPSEndpoint(state ClusterAuditConfigSpecV2_FIPSEndpointState)
+	// GetUseFIPSEndpoint gets the current FIPS endpoint setting
+	GetUseFIPSEndpoint() ClusterAuditConfigSpecV2_FIPSEndpointState
 
 	// EnableContinuousBackups is used to enable (or disable) PITR (Point-In-Time Recovery).
 	EnableContinuousBackups() bool
@@ -119,14 +125,14 @@ func (c *ClusterAuditConfigV2) GetMetadata() Metadata {
 	return c.Metadata
 }
 
-// GetResourceID returns resource ID.
-func (c *ClusterAuditConfigV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *ClusterAuditConfigV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID.
-func (c *ClusterAuditConfigV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *ClusterAuditConfigV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetKind returns resource kind.
@@ -190,6 +196,16 @@ func (c *ClusterAuditConfigV2) SetAuditEventsURIs(uris []string) {
 	c.Spec.AuditEventsURI = uris
 }
 
+// SetUseFIPSEndpoint sets the FIPS endpoint state for S3/Dynamo backends.
+func (c *ClusterAuditConfigV2) SetUseFIPSEndpoint(state ClusterAuditConfigSpecV2_FIPSEndpointState) {
+	c.Spec.UseFIPSEndpoint = state
+}
+
+// GetUseFIPSEndpoint gets the current FIPS endpoint setting
+func (c *ClusterAuditConfigV2) GetUseFIPSEndpoint() ClusterAuditConfigSpecV2_FIPSEndpointState {
+	return c.Spec.UseFIPSEndpoint
+}
+
 // EnableContinuousBackups is used to enable (or disable) PITR (Point-In-Time Recovery).
 func (c *ClusterAuditConfigV2) EnableContinuousBackups() bool {
 	return c.Spec.EnableContinuousBackups
@@ -238,7 +254,7 @@ func (c *ClusterAuditConfigV2) RetentionPeriod() *Duration {
 
 // Clone performs a deep copy.
 func (c *ClusterAuditConfigV2) Clone() ClusterAuditConfig {
-	return proto.Clone(c).(*ClusterAuditConfigV2)
+	return utils.CloneProtoMsg(c)
 }
 
 // setStaticFields sets static resource header and metadata fields.

@@ -1,28 +1,31 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Command query-latest returns the highest semver release for a versionSpec
 // query-latest ignores drafts and pre-releases.
 //
 // For example:
-//  query-latest v8.1.5     -> v8.1.5
-//  query-latest v8.1.3     -> error, no matching release (this is a tag, but not a release)
-//  query-latest v8.0.0-rc3 -> error, no matching release (this is a pre-release, in github and in semver)
-//  query-latest v7.0       -> v7.0.2
-//  query-latest v5         -> v5.2.4
+//
+//	query-latest v8.1.5     -> v8.1.5
+//	query-latest v8.1.3     -> error, no matching release (this is a tag, but not a release)
+//	query-latest v8.0.0-rc3 -> error, no matching release (this is a pre-release, in github and in semver)
+//	query-latest v7.0       -> v7.0.2
+//	query-latest v5         -> v5.2.4
 package main
 
 import (
@@ -33,9 +36,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gravitational/teleport/build.assets/tooling/lib/github"
 	"github.com/gravitational/trace"
 	"golang.org/x/mod/semver"
+
+	"github.com/gravitational/teleport/build.assets/tooling/lib/github"
 )
 
 func main() {
@@ -102,5 +106,5 @@ func getLatest(ctx context.Context, versionSpec string, gh github.GitHub) (strin
 		}
 	}
 
-	return "", trace.NotFound("no releases matched " + versionSpec)
+	return "", trace.NotFound("no releases matched %q", versionSpec)
 }

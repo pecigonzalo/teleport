@@ -2,32 +2,34 @@
 // +build linux
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cgroup
 
 import (
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 
-	"github.com/gravitational/teleport/lib/utils"
-
 	"github.com/google/uuid"
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestMain(m *testing.M) {
@@ -35,99 +37,164 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-type Suite struct{}
-
-var _ = check.Suite(&Suite{})
-
-func TestControlGroups(t *testing.T) { check.TestingT(t) }
-
-// TestCreate tests creating and removing cgroups as well as shutting down
+// TestRootCreate tests creating and removing cgroups as well as shutting down
 // the service and unmounting the cgroup hierarchy.
-func (s *Suite) TestCreate(c *check.C) {
+func TestRootCreate(t *testing.T) {
 	// This test must be run as root. Only root can create cgroups.
 	if !isRoot() {
-		c.Skip("Tests for package cgroup can only be run as root.")
+		t.Skip("Tests for package cgroup can only be run as root.")
 	}
 
+	t.Parallel()
+
 	// Create temporary directory where cgroup2 hierarchy will be mounted.
-	dir, err := os.MkdirTemp("", "cgroup-test")
-	c.Assert(err, check.IsNil)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Start cgroup service.
 	service, err := New(&Config{
 		MountPath: dir,
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Create fake session ID and cgroup.
 	sessionID := uuid.New().String()
 	err = service.Create(sessionID)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Make sure that it exists.
-	cgroupPath := path.Join(service.teleportRoot, sessionID)
-	_, err = os.Stat(cgroupPath)
-	if os.IsNotExist(err) {
-		c.Fatalf("Could not find cgroup file %v: %v.", cgroupPath, err)
-	}
+	cgroupPath := filepath.Join(service.teleportRoot, sessionID)
+	require.DirExists(t, cgroupPath)
 
 	// Remove cgroup.
 	err = service.Remove(sessionID)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Make sure cgroup is gone.
-	_, err = os.Stat(cgroupPath)
-	if !os.IsNotExist(err) {
-		c.Fatalf("Failed to remove cgroup at %v: %v.", cgroupPath, err)
-	}
+	require.NoDirExists(t, cgroupPath)
 
 	// Close the cgroup service, this should unmound the cgroup filesystem.
-	err = service.Close()
-	c.Assert(err, check.IsNil)
+	const skipUnmount = false
+	err = service.Close(skipUnmount)
+	require.NoError(t, err)
 
 	// Make sure the cgroup filesystem has been unmounted.
-	_, err = os.Stat(cgroupPath)
-	if !os.IsNotExist(err) {
-		c.Fatalf("Failed to unmound cgroup filesystem from %v: %v.", dir, err)
+	require.NoDirExists(t, service.teleportRoot)
+}
+
+// TestRootCreateCustomRootPath given a service configured with a custom root
+// path, cgroups must be placed on the correct path.
+func TestRootCreateCustomRootPath(t *testing.T) {
+	// This test must be run as root. Only root can create cgroups.
+	if !isRoot() {
+		t.Skip("Tests for package cgroup can only be run as root.")
+	}
+
+	t.Parallel()
+
+	for _, rootPath := range []string{
+		"custom",
+		"/custom",
+		"nested/custom",
+		"/deep/nested/custom",
+	} {
+		rootPath := rootPath
+		t.Run(rootPath, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			service, err := New(&Config{
+				MountPath: dir,
+				RootPath:  rootPath,
+			})
+			require.NoError(t, err)
+			defer service.Close(false)
+
+			sessionID := uuid.New().String()
+			err = service.Create(sessionID)
+			require.NoError(t, err)
+
+			cgroupPath := filepath.Join(service.teleportRoot, sessionID)
+			require.DirExists(t, cgroupPath)
+			require.Contains(t, cgroupPath, rootPath)
+
+			err = service.Remove(sessionID)
+			require.NoError(t, err)
+			require.NoDirExists(t, cgroupPath)
+
+			// Teardown
+			err = service.Close(false)
+			require.NoError(t, err)
+			require.NoDirExists(t, service.teleportRoot)
+		})
 	}
 }
 
-// TestCleanup tests the ability for Teleport to remove and cleanup all
+// TestRootCleanup tests the ability for Teleport to remove and cleanup all
 // cgroups which is performed upon startup.
-func (s *Suite) TestCleanup(c *check.C) {
+func TestRootCleanup(t *testing.T) {
 	// This test must be run as root. Only root can create cgroups.
 	if !isRoot() {
-		c.Skip("Tests for package cgroup can only be run as root.")
+		t.Skip("Tests for package cgroup can only be run as root.")
 	}
 
+	t.Parallel()
+
 	// Create temporary directory where cgroup2 hierarchy will be mounted.
-	dir, err := os.MkdirTemp("", "cgroup-test")
-	c.Assert(err, check.IsNil)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// Start cgroup service.
 	service, err := New(&Config{
 		MountPath: dir,
 	})
-	c.Assert(err, check.IsNil)
-	defer service.Close()
+	require.NoError(t, err)
+	const skipUnmount = false
+	defer service.Close(skipUnmount)
 
 	// Create fake session ID and cgroup.
 	sessionID := uuid.New().String()
 	err = service.Create(sessionID)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Cleanup hierarchy to remove all cgroups.
 	err = service.cleanupHierarchy()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Make sure the cgroup no longer exists.
-	cgroupPath := path.Join(service.teleportRoot, sessionID)
-	_, err = os.Stat(cgroupPath)
-	if os.IsNotExist(err) {
-		c.Fatalf("Could not find cgroup file %v: %v.", cgroupPath, err)
+	cgroupPath := filepath.Join(service.teleportRoot, sessionID)
+	require.NoDirExists(t, cgroupPath)
+}
+
+// TestRootSkipUnmount checks that closing the service with skipUnmount set to
+// true works correctly; i.e. it cleans up the cgroups we're responsible for but
+// doesn't unmount the cgroup2 file system.
+func TestRootSkipUnmount(t *testing.T) {
+	// This test must be run as root. Only root can create cgroups.
+	if !isRoot() {
+		t.Skip("Tests for package cgroup can only be run as root.")
 	}
+
+	t.Parallel()
+
+	// Start a cgroup service with a temporary directory as the mount path.
+	service, err := New(&Config{
+		MountPath: t.TempDir(),
+	})
+	require.NoError(t, err)
+
+	sessionID := uuid.NewString()
+	sessionPath := filepath.Join(service.teleportRoot, sessionID)
+	require.NoError(t, service.Create(sessionID))
+
+	require.DirExists(t, sessionPath)
+
+	const skipUnmount = true
+	require.NoError(t, service.Close(skipUnmount))
+
+	require.DirExists(t, service.teleportRoot)
+	require.NoDirExists(t, filepath.Join(service.teleportRoot, sessionID))
+
+	require.NoError(t, service.unmount())
+
+	require.NoDirExists(t, service.teleportRoot)
 }
 
 // isRoot returns a boolean if the test is being run as root or not. Tests
