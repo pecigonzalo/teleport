@@ -1,34 +1,39 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package labels provides a way to get dynamic labels. Used by SSH, App,
 // and Kubernetes servers.
 package labels
 
 import (
+	"cmp"
 	"context"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 )
 
 // DynamicConfig is the configuration for dynamic labels.
@@ -37,15 +42,13 @@ type DynamicConfig struct {
 	Labels services.CommandLabels
 
 	// Log is a component logger.
-	Log *logrus.Entry
+	Log *slog.Logger
 }
 
 // CheckAndSetDefaults makes sure valid values were passed in to create
 // dynamic labels.
 func (c *DynamicConfig) CheckAndSetDefaults() error {
-	if c.Log == nil {
-		c.Log = logrus.NewEntry(logrus.StandardLogger())
-	}
+	c.Log = cmp.Or(c.Log, slog.With(teleport.ComponentKey, "dynamiclabels"))
 
 	// Loop over all labels and make sure the key name is valid and the interval
 	// is valid as well. If the interval is not valid, update the value.
@@ -62,11 +65,11 @@ func (c *DynamicConfig) CheckAndSetDefaults() error {
 		if label.GetPeriod() < time.Second {
 			label.SetPeriod(time.Second)
 			labels[name] = label
-			c.Log.Warnf("Label period can't be less than 1 second. Period for label %q was set to 1 second.", name)
+			c.Log.WarnContext(context.Background(), "Label period cannot be less than 1 second. Defaulting to 1 second.", "label", name)
 		}
 	}
-	c.Labels = labels
 
+	c.Labels = labels
 	return nil
 }
 
@@ -149,7 +152,7 @@ func (l *Dynamic) periodicUpdateLabel(name string, label types.CommandLabel) {
 func (l *Dynamic) updateLabel(name string, label types.CommandLabel) {
 	out, err := exec.Command(label.GetCommand()[0], label.GetCommand()[1:]...).Output()
 	if err != nil {
-		l.c.Log.Errorf("Failed to run command and update label: %v.", err)
+		l.c.Log.ErrorContext(context.Background(), "Failed to run command and update label", "error", err)
 		label.SetResult(err.Error() + " output: " + string(out))
 	} else {
 		label.SetResult(strings.TrimSpace(string(out)))
@@ -165,4 +168,17 @@ func (l *Dynamic) setLabel(name string, value types.CommandLabel) {
 	defer l.mu.Unlock()
 
 	l.c.Labels[name] = value
+}
+
+// Importer is an interface for labels imported from an external source,
+// such as a cloud provider.
+type Importer interface {
+	// Get returns the current labels.
+	Get() map[string]string
+	// Apply adds the current labels to the provided resource's static labels.
+	Apply(r types.ResourceWithLabels)
+	// Sync blocks and synchronously updates the labels.
+	Sync(context.Context) error
+	// Start starts a loop that continually keeps the labels updated.
+	Start(context.Context)
 }

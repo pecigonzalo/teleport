@@ -1,21 +1,26 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package sshutils
 
 import (
 	"context"
+	"errors"
 
 	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
@@ -24,12 +29,12 @@ import (
 // RequestForwarder represents a resource capable of sending
 // an ssh request such as an ssh.Channel or ssh.Session.
 type RequestForwarder interface {
-	SendRequest(name string, wantReply bool, payload []byte) (bool, error)
+	SendRequest(ctx context.Context, name string, wantReply bool, payload []byte) (bool, error)
 }
 
 // ForwardRequest is a helper for forwarding a request across a session or channel.
-func ForwardRequest(sender RequestForwarder, req *ssh.Request) (bool, error) {
-	reply, err := sender.SendRequest(req.Type, req.WantReply, req.Payload)
+func ForwardRequest(ctx context.Context, sender RequestForwarder, req *ssh.Request) (bool, error) {
+	reply, err := sender.SendRequest(ctx, req.Type, req.WantReply, req.Payload)
 	if err != nil || !req.WantReply {
 		return reply, trace.Wrap(err)
 	}
@@ -48,7 +53,7 @@ func ForwardRequests(ctx context.Context, sin <-chan *ssh.Request, sender Reques
 			}
 			switch sreq.Type {
 			case WindowChangeRequest:
-				if _, err := ForwardRequest(sender, sreq); err != nil {
+				if _, err := ForwardRequest(ctx, sender, sreq); err != nil {
 					return trace.Wrap(err)
 				}
 			default:
@@ -58,7 +63,7 @@ func ForwardRequests(ctx context.Context, sin <-chan *ssh.Request, sender Reques
 				continue
 			}
 		case <-ctx.Done():
-			if ctx.Err() != context.Canceled {
+			if !errors.Is(ctx.Err(), context.Canceled) {
 				return trace.Wrap(ctx.Err())
 			}
 			return nil

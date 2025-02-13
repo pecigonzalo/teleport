@@ -9,11 +9,11 @@ TELEPORT_DOMAIN_ADMIN_EMAIL=test@email.com
 TELEPORT_DOMAIN_NAME=gus-tftestkube4.gravitational.io
 TELEPORT_DYNAMO_TABLE_NAME=gus-tftestkube4
 TELEPORT_DYNAMO_EVENTS_TABLE_NAME=gus-tftestkube4-events
-TELEPORT_INFLUXDB_ADDRESS=http://gus-tftestkube4-monitor-ae7983980c3419ab.elb.us-east-1.amazonaws.com:8086
 TELEPORT_LICENSE_PATH=/home/gus/downloads/teleport/license-gus.pem
 TELEPORT_LOCKS_TABLE_NAME=gus-tftestkube4-locks
 TELEPORT_S3_BUCKET=gus-tftestkube4.gravitational.io
 USE_ACM=false
+USE_TLS_ROUTING=false
 EOF
 }
 
@@ -51,25 +51,25 @@ load fixtures/common
 @test "[${TEST_SUITE?}] auth_service.public_addr is set correctly" {
     load ${TELEPORT_CONFD_DIR?}/conf
     echo "${AUTH_BLOCK?}"
-    echo "${AUTH_BLOCK?}" | grep -E "^  public_addr:" | grep -q "${TELEPORT_AUTH_SERVER_LB?}:3025"
+    echo "${AUTH_BLOCK?}" | grep -E "^  public_addr: ${TELEPORT_AUTH_SERVER_LB?}:3025"
 }
 
 @test "[${TEST_SUITE?}] auth_service.cluster_name is set correctly" {
     load ${TELEPORT_CONFD_DIR?}/conf
     echo "${AUTH_BLOCK?}"
-    echo "${AUTH_BLOCK?}" | grep -E "^  cluster_name:" | grep -q "${TELEPORT_CLUSTER_NAME?}"
+    echo "${AUTH_BLOCK?}" | grep -E "^  cluster_name: ${TELEPORT_CLUSTER_NAME?}"
 }
 
 @test "[${TEST_SUITE?}] auth_service.listen_addr is set correctly" {
     load ${TELEPORT_CONFD_DIR?}/conf
     echo "${AUTH_BLOCK?}"
-    echo "${AUTH_BLOCK?}" | grep -E "^  listen_addr: " | grep -q "0.0.0.0:3025"
+    echo "${AUTH_BLOCK?}" | grep -E "^  listen_addr: 0.0.0.0:3025"
 }
 
-@test "[${TEST_SUITE?}] auth_service.second_factor config line is present in non-FIPS mode" {
+@test "[${TEST_SUITE?}] auth_service.authentication.second_factor config line is present" {
     load ${TELEPORT_CONFD_DIR?}/conf
     echo "${AUTH_BLOCK?}"
-    echo "${AUTH_BLOCK?}" | grep -E "^  authentication:" -A2 | grep -q "second_factor:"
+    echo "${AUTH_BLOCK?}" | grep -E "^  authentication:" -A3 | grep -q "second_factor:"
 }
 
 @test "[${TEST_SUITE?}] auth_service.license_file is set" {
@@ -81,5 +81,17 @@ load fixtures/common
 @test "[${TEST_SUITE?}] auth_service.authentication.type is set correctly" {
     load ${TELEPORT_CONFD_DIR?}/conf
     echo "${AUTH_BLOCK?}"
-    echo "${AUTH_BLOCK?}" | grep -E "^    type:" | grep -q "github"
+    echo "${AUTH_BLOCK?}" | grep -E "^    type: github"
+}
+
+@test "[${TEST_SUITE?}] auth_service.authentication.webauthn.rp_id is set" {
+    load ${TELEPORT_CONFD_DIR?}/conf
+    echo "${AUTH_BLOCK?}"
+    echo "${AUTH_BLOCK?}" | grep -E "^  authentication:" -A5 | grep -q "rp_id: ${TELEPORT_DOMAIN_NAME?}"
+}
+
+@test "[${TEST_SUITE?}] auth_service.proxy_protocol is on" {
+    load ${TELEPORT_CONFD_DIR?}/conf
+    echo "${AUTH_BLOCK?}"
+    echo "${AUTH_BLOCK?}" | grep -E "^  proxy_protocol: on"
 }

@@ -2,14 +2,18 @@
 gitref.go
 .data
 debug
+!/lib/srv/debug
+!/lib/client/debug
 default.etcd
-darwin
+/darwin
 
 # web asset directory
 /lib/web/build
 
 # usually release tarballs get in the way
 *.gz
+# ignore all tarballs except the alpine one
+!fixtures/alpine/alpine-minirootfs-*.tar.gz
 *.zip
 
 # editors
@@ -20,9 +24,11 @@ darwin
 # Compiled binaries, Object files, Static and Dynamic libs (Shared Objects)
 out
 build
+!/web/packages/build
 *.o
 *.a
 *.so
+*.syso
 
 # Folders
 _obj
@@ -67,5 +73,42 @@ ssh.config
 # Code signing certificate for Windows binaries
 /windows-signing-cert.pfx
 
-# build tooling
-build.assets/tooling/bin/** 
+# Build cache and tooling
+/build.assets/.cache
+/build.assets/tooling/bin/**
+
+# Teleport binaries
+/tctl
+/teleport
+/tsh
+
+# Go workspace files
+go.work
+go.work.sum
+
+# gogoproto side-effects
+/gogogen
+node_modules
+
+.air.toml
+webassets/
+
+# jest --coverage
+coverage
+
+# vite
+.swc
+web/certs/
+
+# Vagrant
+.vagrant
+
+# Files produced by tests
+*.avi
+
+# We have switched to pnpm, ignore Yarn lockfile
+yarn.lock
+
+# mockServiceWorker.js is generated on each start of Storybook instead of being vendored into the
+# repo, see web/scripts/run-storybook.sh.
+web/.storybook/public/mockServiceWorker.js

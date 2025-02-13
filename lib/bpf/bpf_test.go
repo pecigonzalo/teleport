@@ -2,120 +2,205 @@
 // +build bpf,!386
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package bpf
 
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	os_exec "os/exec"
+	osexec "os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/aquasecurity/libbpfgo"
+	"github.com/google/uuid"
+	"github.com/gravitational/trace"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/events"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
-
-	"github.com/google/uuid"
-	"gopkg.in/check.v1"
+	"github.com/gravitational/teleport/lib/cgroup"
+	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
-type Suite struct{}
+const (
+	// reexecInCGroupCmd is a cmd used to re-exec the test binary and call arbitrary program.
+	reexecInCGroupCmd = "reexecCgroup"
+	// networkInCgroupCmd is a cmd used to re-exec the test binary and make HTTP call.
+	networkInCgroupCmd = "networkCgroup"
+)
 
-var _ = check.Suite(&Suite{})
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
 
-func TestRootBPF(t *testing.T) {
+	// Check if the re-exec was requested.
+	if len(os.Args) == 3 {
+		var err error
+
+		switch os.Args[1] {
+		case reexecInCGroupCmd:
+			// Get the command to run passed as the 3rd argument.
+			cmd := os.Args[2]
+
+			err = waitAndRun(cmd)
+		case networkInCgroupCmd:
+			// Get the endpoint to call.
+			endpoint := os.Args[2]
+
+			err = callEndpoint(endpoint)
+		default:
+			os.Exit(2)
+		}
+
+		if err != nil {
+			// Something went wrong, exit with error.
+			os.Exit(1)
+		}
+
+		// The rexec was handled and nothing bad happened.
+		os.Exit(0)
+	}
+
+	os.Exit(m.Run())
+}
+
+// waitAndRun wait for continue signal to be generated an executes the
+// passed command and waits until returns.
+func waitAndRun(cmd string) error {
+	if err := waitForContinue(); err != nil {
+		return err
+	}
+
+	return osexec.Command(cmd).Run()
+}
+
+// callEndpoint wait for continue signal to be generated an executes HTTP GET
+// on provided endpoint.
+func callEndpoint(endpoint string) error {
+	if err := waitForContinue(); err != nil {
+		return err
+	}
+
+	resp, err := http.Get(endpoint)
+	if resp != nil {
+		// Close the body to make our linter happy.
+		_ = resp.Body.Close()
+	}
+
+	return err
+}
+
+// waitForContinue opens FD 3 and waits the signal from parent process that
+// the cgroup is being observed and the even can be generated.
+func waitForContinue() error {
+	waitFD := os.NewFile(3, "/proc/self/fd/3")
+	defer waitFD.Close()
+
+	buff := make([]byte, 1)
+	if _, err := waitFD.Read(buff); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+
+	return nil
+}
+
+func TestRootWatch(t *testing.T) {
+	// TODO(jakule): Find a way to run this test in CI. Disable for now to not block all BPF tests.
+	t.Skip("this test always fails when running inside a CGroup/Docker")
+
+	// This test must be run as root and the host has to be capable of running
+	// BPF programs.
 	if !bpfTestEnabled() {
 		t.Skip("BPF testing is disabled")
 	}
-
-	check.TestingT(t)
-}
-
-func (s *Suite) TestWatch(c *check.C) {
-	// This test must be run as root and the host has to be capable of running
-	// BPF programs.
 	if !isRoot() {
-		c.Skip("Tests for package bpf can only be run as root.")
-	}
-	err := IsHostCompatible()
-	if err != nil {
-		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
+		t.Skip("Tests for package bpf can only be run as root.")
 	}
 
 	// Create temporary directory where cgroup2 hierarchy will be mounted.
-	dir, err := os.MkdirTemp("", "cgroup-test")
-	c.Assert(err, check.IsNil)
-	defer os.RemoveAll(dir)
+	cgroupPath := t.TempDir()
 
 	// Create BPF service.
-	service, err := New(&Config{
+	service, err := New(&servicecfg.BPFConfig{
 		Enabled:    true,
-		CgroupPath: dir,
+		CgroupPath: cgroupPath,
 	})
-	defer service.Close()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		const restarting = false
+		require.NoError(t, service.Close(restarting))
+	})
 
 	// Create a fake audit log that can be used to capture the events emitted.
-	emitter := &events.MockEmitter{}
+	emitter := &eventstest.MockRecorderEmitter{}
 
 	// Create and start a program that does nothing. Since sleep will run longer
-	// than we wait below, nothing should be emit to the Audit Log.
-	cmd := os_exec.Command("sleep", "10")
+	// than we wait below, nothing should be emitted to the Audit Log.
+	cmd := osexec.Command("sleep", "10")
 	err = cmd.Start()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Create a monitoring session for init. The events we execute should not
 	// have PID 1, so nothing should be captured in the Audit Log.
 	cgroupID, err := service.OpenSession(&SessionContext{
-		Namespace: apidefaults.Namespace,
-		SessionID: uuid.New().String(),
-		ServerID:  uuid.New().String(),
-		Login:     "foo",
-		User:      "foo@example.com",
-		PID:       cmd.Process.Pid,
-		Emitter:   emitter,
+		Namespace:      apidefaults.Namespace,
+		SessionID:      uuid.New().String(),
+		ServerID:       uuid.New().String(),
+		ServerHostname: "ip-172-31-11-148",
+		Login:          "foo",
+		User:           "foo@example.com",
+		PID:            cmd.Process.Pid,
+		Emitter:        emitter,
 		Events: map[string]bool{
 			constants.EnhancedRecordingCommand: true,
 			constants.EnhancedRecordingDisk:    true,
 			constants.EnhancedRecordingNetwork: true,
 		},
 	})
-	c.Assert(err, check.IsNil)
-	c.Assert(cgroupID > 0, check.Equals, true)
+	require.NoError(t, err)
+	require.Greater(t, cgroupID, uint64(0))
 
 	// Find "ls" binary.
-	lsPath, err := os_exec.LookPath("ls")
-	c.Assert(err, check.IsNil)
+	lsPath, err := osexec.LookPath("ls")
+	require.NoError(t, err)
 
 	// Execute "ls" a few times
 	for i := 0; i < 5; i++ {
 		// Run "ls".
-		err = os_exec.Command(lsPath).Run()
-		c.Assert(err, check.IsNil)
+		err = osexec.Command(lsPath).Run()
+		require.NoError(t, err)
 
 		// Delay.
 		time.Sleep(25 * time.Millisecond)
@@ -133,180 +218,153 @@ func (s *Suite) TestWatch(c *check.C) {
 		case *apievents.SessionNetwork:
 			pid = ev.BPFMetadata.PID
 		}
-		c.Assert(int(pid), check.Equals, cmd.Process.Pid)
+		require.Equal(t, int(pid), cmd.Process.Pid)
 	}
 }
 
-// TestObfuscate checks if execsnoop can capture Obfuscated commands.
-func (s *Suite) TestObfuscate(c *check.C) {
+// TestRootObfuscate checks if execsnoop can capture Obfuscated commands.
+func TestRootObfuscate(t *testing.T) {
+	t.Skip("flaky test, disable now")
 	// This test must be run as root and the host has to be capable of running
 	// BPF programs.
-	if !isRoot() {
-		c.Skip("Tests for package bpf can only be run as root.")
-		return
+	if !bpfTestEnabled() {
+		t.Skip("BPF testing is disabled")
 	}
-	err := IsHostCompatible()
-	if err != nil {
-		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
-		return
+	if !isRoot() {
+		t.Skip("Tests for package bpf can only be run as root.")
 	}
 
 	// Find the programs needed to run these tests on the host.
-	decoderPath, err := os_exec.LookPath("base64")
-	c.Assert(err, check.IsNil)
-	shellPath, err := os_exec.LookPath("sh")
-	c.Assert(err, check.IsNil)
+	decoderPath, err := osexec.LookPath("base64")
+	require.NoError(t, err)
+	shellPath, err := osexec.LookPath("sh")
+	require.NoError(t, err)
 
 	// Start execsnoop.
 	execsnoop, err := startExec(8192)
 	defer execsnoop.close()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	// Create a context that will be used to signal that an event has been recieved.
-	doneContext, doneFunc := context.WithCancel(context.Background())
+	// Create obfuscated script.
+	shellContents := fmt.Sprintf("#!%v\necho bHM= | %v --decode | %v",
+		shellPath, decoderPath, shellPath)
 
-	// Start two goroutines. The first writes a script which will execute "ls"
-	// in a loop. The second waits for an exec event to show up the reports "ls"
+	// Write script to a temporary folder.
+	fileName := filepath.Join(t.TempDir(), "test-script")
+	err = os.WriteFile(fileName, []byte(shellContents), 0700)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	// Start a goroutine that writes a script which will execute "ls"
+	// in a loop. Then waits for an exec event to show up the reports "ls"
 	// has been executed.
 	go func() {
-		// Create temporary file.
-		file, err := os.CreateTemp("", "test-script")
-		c.Assert(err, check.IsNil)
-		defer os.Remove(file.Name())
-
-		// Write script to file.
-		shellContents := fmt.Sprintf("#!%v\necho bHM= | %v --decode | %v",
-			shellPath, decoderPath, shellPath)
-		_, err = file.Write([]byte(shellContents))
-		c.Assert(err, check.IsNil)
-		err = file.Close()
-		c.Assert(err, check.IsNil)
-
-		// Make script executable.
-		err = os.Chmod(file.Name(), 0700)
-		c.Assert(err, check.IsNil)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
 
 		for {
-			// Run script.
-			err = os_exec.Command(file.Name()).Run()
-			c.Assert(err, check.IsNil)
-
-			// Delay.
-			time.Sleep(250 * time.Millisecond)
-		}
-	}()
-	go func() {
-		for {
-			eventBytes := <-execsnoop.events()
-			// Unmarshal the event.
-			var event rawExecEvent
-			err := unmarshalEvent(eventBytes, &event)
-			c.Assert(err, check.IsNil)
-
-			// Check the event is what we expect, in this case "ls".
-			if ConvertString(unsafe.Pointer(&event.Command)) == "ls" {
-				doneFunc()
-				break
+			select {
+			case <-ticker.C:
+				runCmd(t, reexecInCGroupCmd, fileName, execsnoop, require.NoError)
+			case <-done:
+				return
 			}
 		}
-
 	}()
 
 	// Wait for an event to arrive from execsnoop. If an event does not arrive
 	// within 10 seconds, timeout.
-	select {
-	case <-doneContext.Done():
-	case <-time.After(10 * time.Second):
-		c.Fatalf("Timed out waiting for an event.")
-	}
+	for {
+		select {
+		case eventBytes := <-execsnoop.events():
+			var event rawExecEvent
+			err := unmarshalEvent(eventBytes, &event)
+			require.NoError(t, err)
 
+			// Check the event is what we expect, in this case "ls".
+			if ConvertString(unsafe.Pointer(&event.Command)) == "ls" {
+				return
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("Timed out waiting for an event.")
+		}
+	}
 }
 
-// TestScript checks if execsnoop can capture what a script executes.
-func (s *Suite) TestScript(c *check.C) {
+// TestRootScript checks if execsnoop can capture what a script executes.
+func TestRootScript(t *testing.T) {
+	t.Skip("flaky test, disable now")
 	// This test must be run as root and the host has to be capable of running
 	// BPF programs.
+	if !bpfTestEnabled() {
+		t.Skip("BPF testing is disabled")
+	}
 	if !isRoot() {
-		c.Skip("Tests for package bpf can only be run as root.")
+		t.Skip("Tests for package bpf can only be run as root.")
 	}
-	err := IsHostCompatible()
-	if err != nil {
-		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
-	}
+
+	// Write script to a temporary folder.
+	fileName := filepath.Join(t.TempDir(), "test-script")
+	err := os.WriteFile(fileName, []byte("#!/bin/sh\nls"), 0700)
+	require.NoError(t, err)
 
 	// Start execsnoop.
 	execsnoop, err := startExec(8192)
 	defer execsnoop.close()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	// Create a context that will be used to signal that an event has been recieved.
-	doneContext, doneFunc := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	defer close(done)
 
-	// Start two goroutines. The first writes a script which will execute "ls"
-	// in a loop. The second waits for an exec event to show up the reports "ls"
+	// Start a goroutine that writes a script which will execute "ls"
+	// in a loop. Then waits for an exec event to show up the reports "ls"
 	// has been executed.
 	go func() {
-		// Create temporary file.
-		file, err := os.CreateTemp("", "test-script")
-		c.Assert(err, check.IsNil)
-		defer os.Remove(file.Name())
-
-		// Write script to file.
-		_, err = file.Write([]byte("#!/bin/sh\nls"))
-		c.Assert(err, check.IsNil)
-		err = file.Close()
-		c.Assert(err, check.IsNil)
-
-		// Make script executable.
-		err = os.Chmod(file.Name(), 0700)
-		c.Assert(err, check.IsNil)
-
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
 		for {
-			// Run script.
-			err = os_exec.Command(file.Name()).Run()
-			c.Assert(err, check.IsNil)
-			// Delay.
-			time.Sleep(250 * time.Millisecond)
-		}
-	}()
-	go func() {
-		for {
-			eventBytes := <-execsnoop.events()
-			// Unmarshal the event.
-			var event rawExecEvent
-			err := unmarshalEvent(eventBytes, &event)
-			c.Assert(err, check.IsNil)
-
-			// Check the event is what we expect, in this case "ls".
-			if ConvertString(unsafe.Pointer(&event.Command)) == "ls" {
-				doneFunc()
-				break
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				// Run script in a cgroup.
+				runCmd(t, reexecInCGroupCmd, fileName, execsnoop, require.NoError)
 			}
 		}
-
 	}()
 
 	// Wait for an event to arrive from execsnoop. If an event does not arrive
 	// within 10 seconds, timeout.
-	select {
-	case <-doneContext.Done():
-	case <-time.After(10 * time.Second):
-		c.Fatalf("Timed out waiting for an event.")
+	for {
+		select {
+		case eventBytes := <-execsnoop.events():
+			var event rawExecEvent
+			err := unmarshalEvent(eventBytes, &event)
+			require.NoError(t, err)
+
+			// Check the event is what we expect, in this case "ls".
+			if ConvertString(unsafe.Pointer(&event.Command)) == "ls" {
+				return
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("Timed out waiting for an event.")
+			return
+		}
 	}
 }
 
-// TestPrograms tests execsnoop, opensnoop, and tcpconnect to make sure they
+// TestRootPrograms tests execsnoop, opensnoop, and tcpconnect to make sure they
 // run and receive events.
-func (s *Suite) TestPrograms(c *check.C) {
+func TestRootPrograms(t *testing.T) {
+	t.Skip("flaky test, disable now")
 	// This test must be run as root. Only root can create cgroups.
-	if !isRoot() {
-		c.Skip("Tests for package bpf can only be run as root.")
+	if !bpfTestEnabled() {
+		t.Skip("BPF testing is disabled")
 	}
-
-	// Check that the host is capable of running BPF programs.
-	err := IsHostCompatible()
-	if err != nil {
-		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
+	if !isRoot() {
+		t.Skip("Tests for package bpf can only be run as root.")
 	}
 
 	// Start a debug server that tcpconnect will connect to.
@@ -317,50 +375,66 @@ func (s *Suite) TestPrograms(c *check.C) {
 
 	// Start execsnoop.
 	execsnoop, err := startExec(8192)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	defer execsnoop.close()
 
 	// Start opensnoop.
 	opensnoop, err := startOpen(8192)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	defer opensnoop.close()
 
 	// Start tcpconnect.
 	tcpconnect, err := startConn(8192)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	defer tcpconnect.close()
 
 	// Loop over all three programs and make sure events are received off the
 	// perf buffer.
-	var tests = []struct {
-		inName        string
-		inCommand     string
-		inCommandArgs []string
-		inEventCh     <-chan []byte
-		inHTTP        bool
+	tests := []struct {
+		inName    string
+		inEventCh <-chan []byte
+		genEvents func(t *testing.T, ctx context.Context)
+		verifyFn  func(event []byte) bool
 	}{
 		// Run execsnoop with "ls".
 		{
-			inName:        "execsnoop",
-			inCommand:     "ls",
-			inCommandArgs: []string{},
-			inEventCh:     execsnoop.events(),
-			inHTTP:        false,
+			inName:    "execsnoop",
+			inEventCh: execsnoop.events(),
+			genEvents: func(t *testing.T, ctx context.Context) {
+				executeCommand(t, ctx, "ls", execsnoop)
+			},
+			verifyFn: func(event []byte) bool {
+				var e rawExecEvent
+				err := unmarshalEvent(event, &e)
+				return err == nil && ConvertString(unsafe.Pointer(&e.Command)) == "ls"
+			},
 		},
 		// Run opensnoop with "ls". This is fine because "ls" will open some
 		// shared library.
 		{
-			inName:        "opensnoop",
-			inCommand:     "ls",
-			inCommandArgs: []string{},
-			inEventCh:     opensnoop.events(),
-			inHTTP:        false,
+			inName:    "opensnoop",
+			inEventCh: opensnoop.events(),
+			genEvents: func(t *testing.T, ctx context.Context) {
+				executeCommand(t, ctx, "ls", opensnoop)
+			},
+			verifyFn: func(event []byte) bool {
+				var e rawOpenEvent
+				err := unmarshalEvent(event, &e)
+				return err == nil
+			},
 		},
 		// Run tcpconnect with netcat.
 		{
 			inName:    "tcpconnect",
 			inEventCh: tcpconnect.v4Events(),
-			inHTTP:    true,
+			genEvents: func(t *testing.T, ctx context.Context) {
+				executeHTTP(t, ctx, ts.URL, tcpconnect)
+			},
+			verifyFn: func(event []byte) bool {
+				var e rawConn4Event
+				err := unmarshalEvent(event, &e)
+				return err == nil
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -369,60 +443,55 @@ func (s *Suite) TestPrograms(c *check.C) {
 
 		// Start two goroutines. The first will wait for the BPF program event to
 		// arrive, and once it has, signal over the context that it's complete. The
-		// second will continue to execute or a HTTP GET in a in a loop attempting to
+		// second will continue to execute or an HTTP GET in a processAccessEvents attempting to
 		// trigger an event.
-		go waitForEvent(doneContext, doneFunc, tt.inEventCh)
-		if tt.inHTTP {
-			go executeHTTP(c, doneContext, ts.URL)
-		} else {
-			go executeCommand(c, doneContext, tt.inCommand)
-		}
+		go waitForEvent(doneContext, doneFunc, tt.inEventCh, tt.verifyFn)
+
+		go tt.genEvents(t, doneContext)
 
 		// Wait for an event to arrive from execsnoop. If an event does not arrive
 		// within 10 seconds, timeout.
 		select {
 		case <-doneContext.Done():
 		case <-time.After(10 * time.Second):
-			c.Fatalf("Timed out waiting for an %v event.", tt.inName)
+			t.Fatalf("Timed out waiting for an %v event.", tt.inName)
 		}
 	}
 }
 
-// TestBPFCounter tests that BPF-to-Prometheus counter works ok
-func (s *Suite) TestBPFCounter(c *check.C) {
+// TestRootBPFCounter tests that BPF-to-Prometheus counter works ok
+func TestRootBPFCounter(t *testing.T) {
+	t.Skip("flaky test, disable now")
 	// This test must be run as root. Only root can create cgroups.
-	if !isRoot() {
-		c.Skip("Tests for package bpf can only be run as root.")
+	if !bpfTestEnabled() {
+		t.Skip("BPF testing is disabled")
 	}
-
-	// Check that the host is capable of running BPF programs.
-	err := IsHostCompatible()
-	if err != nil {
-		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
+	if !isRoot() {
+		t.Skip("Tests for package bpf can only be run as root.")
 	}
 
 	counterTestBPF, err := embedFS.ReadFile("bytecode/counter_test.bpf.o")
 	if err != nil {
-		c.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
+		t.Skip(fmt.Sprintf("Tests for package bpf can not be run: %v.", err))
 	}
 
 	module, err := libbpfgo.NewModuleFromBuffer(counterTestBPF, "counter_test")
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Load into the kernel
 	err = module.BPFLoadObject()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = AttachSyscallTracepoint(module, "close")
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	promCounter := prometheus.NewCounter(prometheus.CounterOpts{Name: "test"})
 
 	counter, err := NewCounter(module, "test_counter", promCounter)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Make sure the counter starts with 0
-	c.Assert(testutil.ToFloat64(promCounter), check.Equals, float64(0))
+	require.Zero(t, testutil.ToFloat64(promCounter))
 
 	// close(1234) will cause the counter to get incremented.
 	magicFD := 1234
@@ -437,9 +506,9 @@ func (s *Suite) TestBPFCounter(c *check.C) {
 	time.Sleep(time.Second)
 
 	// Make sure all are accounted for
-	c.Assert(testutil.ToFloat64(promCounter), check.Equals, float64(gentleBumps))
+	require.Equal(t, float64(gentleBumps), testutil.ToFloat64(promCounter))
 
-	// Next, pound the counter to heopfully overflow the doorbell.
+	// Next, pound the counter to hopefully overflow the doorbell.
 	poundingBumps := 100000
 	for i := 0; i < poundingBumps; i++ {
 		syscall.Close(magicFD)
@@ -449,59 +518,244 @@ func (s *Suite) TestBPFCounter(c *check.C) {
 	time.Sleep(time.Second)
 
 	// Make sure all are accounted for
-	c.Assert(testutil.ToFloat64(promCounter), check.Equals, float64(gentleBumps+poundingBumps))
+	require.Equal(t, float64(gentleBumps+poundingBumps), testutil.ToFloat64(promCounter))
 
 	counter.Close()
 }
 
+// TestRootLargeCommands given commands with higher amount of characters
+// (length), ensure the command events are generated correctly.
+func TestRootLargeCommands(t *testing.T) {
+	t.Skip("flaky test, disable now")
+	// This test must be run as root and the host has to be capable of running
+	// BPF programs.
+	if !bpfTestEnabled() {
+		t.Skip("BPF testing is disabled")
+	}
+	if !isRoot() {
+		t.Skip("Tests for package bpf can only be run as root.")
+	}
+
+	for name, test := range map[string]struct {
+		cmd               string
+		expectPartialPath bool
+	}{
+		"large command": {
+			cmd: "/random" + strings.Repeat("random", 128/len("random")),
+		},
+		"command exceed max size": {
+			cmd:               "/random" + strings.Repeat("random", ArgvMax/len("random")),
+			expectPartialPath: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Start execsnoop.
+			execsnoop, err := startExec(8)
+			defer execsnoop.close()
+			require.NoError(t, err)
+
+			// Since we're using a random command, we should expect its
+			// execution will fail.
+			runCmd(t, reexecInCGroupCmd, test.cmd, execsnoop, require.Error)
+
+			for {
+				select {
+				case eventBytes := <-execsnoop.events():
+					var event rawExecEvent
+					err := unmarshalEvent(eventBytes, &event)
+					require.NoError(t, err)
+
+					// Since we're executing the command using the test binary,
+					// the arguments return on a single event, and the path of
+					// or command will come on the argv part.
+					argv := ConvertString(unsafe.Pointer(&event.Argv))
+					if event.Type == eventArg {
+						if test.expectPartialPath {
+							require.Len(t, argv, ArgvMax)
+							require.True(t, strings.HasPrefix(test.cmd, argv), "expected command to have same content until cap")
+							return
+						} else {
+							require.Equal(t, test.cmd, argv)
+							return
+						}
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("Timed out waiting for an event.")
+					return
+				}
+			}
+		})
+	}
+
+}
+
 // waitForEvent will wait for an event to arrive over the perf buffer and
 // signal when it has.
-func waitForEvent(ctx context.Context, cancel context.CancelFunc, eventCh <-chan []byte) {
+func waitForEvent(ctx context.Context, cancel context.CancelFunc, eventCh <-chan []byte, verifyFn func(event []byte) bool) {
 	for {
 		select {
-		case <-eventCh:
-			cancel()
+		case e := <-eventCh:
+			if verifyFn(e) {
+				cancel()
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// executeCommand will execute some command in a loop.
-func executeCommand(c *check.C, doneContext context.Context, file string) {
-	for {
-		// Lookup and run the requested command.
-		path, err := os_exec.LookPath(file)
-		if err != nil {
-			c.Fatalf("Failed to find execute %q: %v.", file, err)
-		}
-		err = os_exec.Command(path).Run()
-		if err != nil {
-			c.Fatalf("Failed to run command %q: %v.", file, err)
-		}
+// Moves the passed pid into a new cgroup.
+func moveIntoCgroup(t *testing.T, pid int) (uint64, error) {
+	t.Helper()
 
-		time.Sleep(250 * time.Millisecond)
+	cgroupPath := t.TempDir()
+
+	cgroupSrv, err := cgroup.New(&cgroup.Config{
+		MountPath: cgroupPath,
+	})
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+	t.Cleanup(func() {
+		const skipUnmount = false
+		require.NoError(t, cgroupSrv.Close(skipUnmount))
+	})
+
+	sessionID := uuid.New().String()
+	// Put the cmd in a new cgroup.
+	cgroupID, err := createCgroup(t, cgroupSrv, sessionID)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+
+	// Place requested PID into cgroup.
+	err = cgroupSrv.Place(sessionID, pid)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+
+	t.Cleanup(func() {
+		err := cgroupSrv.Remove(sessionID)
+		require.NoError(t, err)
+	})
+
+	return cgroupID, nil
+}
+
+// createCgroup is a helper function to create Cgroup.
+func createCgroup(t *testing.T, cgroup *cgroup.Service, sessionID string,
+) (uint64, error) {
+	t.Helper()
+
+	err := cgroup.Create(sessionID)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+
+	cgroupID, err := cgroup.ID(sessionID)
+	if err != nil {
+		return 0, trace.Wrap(err)
+	}
+
+	return cgroupID, nil
+}
+
+// executeCommand will execute some command in a loop.
+func executeCommand(t *testing.T, doneContext context.Context, file string,
+	traceCgroup cgroupRegister,
+) {
+	t.Helper()
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Lookup and run the requested command.
+			path, err := osexec.LookPath(file)
+			if err != nil {
+				t.Logf("Failed to find executable %q: %v.", file, err)
+			}
+
+			fullPath, err := osexec.LookPath(path)
+			require.NoError(t, err)
+
+			runCmd(t, reexecInCGroupCmd, fullPath, traceCgroup, require.NoError)
+		case <-doneContext.Done():
+			return
+		}
 	}
 }
 
-// executeHTTP will perform a HTTP GET to some endpoint in a loop.
-func executeHTTP(c *check.C, doneContext context.Context, endpoint string) {
-	for {
-		// Perform HTTP GET to the requested endpoint.
-		_, err := http.Get(endpoint)
-		c.Assert(err, check.IsNil)
+func runCmd(t *testing.T, reexecCmd string, arg string, traceCgroup cgroupRegister, cmdReturnAssertion require.ErrorAssertionFunc) {
+	t.Helper()
 
-		time.Sleep(250 * time.Millisecond)
+	// Create a pipe to communicate with the child process after re-exec.
+	readP, writeP, err := os.Pipe()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		readP.Close()
+		writeP.Close()
+	})
+
+	// Re-exec the test binary. We can then move the binary to a new cgroup.
+	cmd := osexec.Command(os.Args[0], reexecCmd, arg)
+
+	cmd.ExtraFiles = append(cmd.ExtraFiles, readP)
+
+	// Start the re-exec
+	err = cmd.Start()
+	require.NoError(t, err)
+
+	cgroupID, err := moveIntoCgroup(t, cmd.Process.Pid)
+	require.NoError(t, err)
+
+	// Register the process in the BPF module
+	err = traceCgroup.startSession(cgroupID)
+	require.NoError(t, err)
+
+	// Send one byte to continue the subprocess execution.
+	_, err = writeP.Write([]byte{1})
+	require.NoError(t, err)
+
+	// Wait for the command to exit. Otherwise, we cannot clean up the cgroup.
+	cmdReturnAssertion(t, cmd.Wait())
+
+	// Remove the registered cgroup from the BPF module. Do not call it after
+	// BPF module is deregistered.
+	err = traceCgroup.endSession(cgroupID)
+	require.NoError(t, err)
+}
+
+// executeHTTP will perform a HTTP GET to some endpoint in a loop.
+func executeHTTP(t *testing.T, doneContext context.Context, endpoint string, traceCgroup cgroupRegister) {
+	t.Helper()
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Perform HTTP GET to the requested endpoint.
+			if _, err := http.Get(endpoint); err != nil {
+				t.Logf("HTTP request failed: %v.", err)
+			}
+
+			runCmd(t, networkInCgroupCmd, endpoint, traceCgroup, require.NoError)
+
+		case <-doneContext.Done():
+			return
+		}
 	}
 }
 
 // isRoot returns a boolean if the test is being run as root or not. Tests
 // for this package must be run as root.
 func isRoot() bool {
-	if os.Geteuid() != 0 {
-		return false
-	}
-	return true
+	return os.Geteuid() == 0
 }
 
 // bpfTestEnabled returns true if BPF tests should run. Tests can be enabled by

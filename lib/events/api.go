@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -23,12 +25,14 @@ import (
 	"math"
 	"time"
 
+	"github.com/gravitational/trace"
+
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
 )
 
 const (
@@ -67,7 +71,7 @@ const (
 	EventNamespace = "namespace"
 
 	// SessionPrintEvent event happens every time a write occurs to
-	// temirnal I/O during a session
+	// terminal I/O during a session
 	SessionPrintEvent = "print"
 
 	// SessionPrintEventBytes says how many bytes have been written into the session
@@ -78,7 +82,7 @@ const (
 	// session when the terminal IO event happened
 	SessionEventTimestamp = "ms"
 
-	// SessionEvent indicates that session has been initiated
+	// SessionStartEvent indicates that session has been initiated
 	// or updated by a joining party on the server
 	SessionStartEvent = "session.start"
 
@@ -167,6 +171,8 @@ const (
 	LoginMethodSAML = "saml"
 	// LoginMethodGithub represents login with Github
 	LoginMethodGithub = "github"
+	// LoginMethodHeadless represents headless login request
+	LoginMethodHeadless = "headless"
 
 	// UserUpdatedEvent is emitted when the user is updated.
 	UserUpdatedEvent = "user.update"
@@ -199,8 +205,13 @@ const (
 	AccessRequestUpdateEvent = "access_request.update"
 	// AccessRequestReviewEvent is emitted when a review is applied to a request.
 	AccessRequestReviewEvent = "access_request.review"
+	// AccessRequestExpirEvent is emitted when an access request expires.
+	AccessRequestExpireEvent = "access_request.expire"
 	// AccessRequestDeleteEvent is emitted when a new access request is deleted.
 	AccessRequestDeleteEvent = "access_request.delete"
+	// AccessRequestResourceSearch is emitted when a user searches for
+	// resources as part of a search-based access request.
+	AccessRequestResourceSearch = "access_request.search"
 	// AccessRequestDelegator is used by teleport plugins to indicate the identity
 	// which caused them to update state.
 	AccessRequestDelegator = "delegator"
@@ -227,8 +238,6 @@ const (
 	RecoveryTokenCreateEvent = "recovery_token.create"
 	// ResetPasswordTokenCreateEvent is emitted when a new reset password token is created.
 	ResetPasswordTokenCreateEvent = "reset_password_token.create"
-	// BotTokenCreateEvent is emitted when a new bot join user token is created
-	BotTokenCreateEvent = "bot_token.create"
 	// ResetPasswordTokenTTL is TTL of reset password token.
 	ResetPasswordTokenTTL = "ttl"
 	// PrivilegeTokenCreateEvent is emitted when a new user privilege token is created.
@@ -255,10 +264,13 @@ const (
 	X11ForwardErr     = "error"
 
 	// Port forwarding event
-	PortForwardEvent   = "port"
-	PortForwardAddr    = "addr"
-	PortForwardSuccess = "success"
-	PortForwardErr     = "error"
+	PortForwardEvent           = "port"
+	PortForwardLocalEvent      = "port.local"
+	PortForwardRemoteEvent     = "port.remote"
+	PortForwardRemoteConnEvent = "port.remote_conn"
+	PortForwardAddr            = "addr"
+	PortForwardSuccess         = "success"
+	PortForwardErr             = "error"
 
 	// AuthAttemptEvent is authentication attempt that either
 	// succeeded or failed based on event status
@@ -274,6 +286,12 @@ const (
 	SCPAction         = "action"
 	SCPActionUpload   = "upload"
 	SCPActionDownload = "download"
+
+	// SFTPEvent means a user attempted a file operation
+	SFTPEvent = "sftp"
+	SFTPPath  = "path"
+	// SFTPSummaryEvent is emitted at the end of an SFTP transfer.
+	SFTPSummaryEvent = "sftp_summary"
 
 	// ResizeEvent means that some user resized PTY on the client
 	ResizeEvent  = "resize"
@@ -335,8 +353,10 @@ const (
 	// TCPVersion is the version of TCP (4 or 6).
 	TCPVersion = "version"
 
-	// RoleCreatedEvent fires when role is created/updated.
+	// RoleCreatedEvent fires when role is created or upserted.
 	RoleCreatedEvent = "role.created"
+	// RoleUpdatedEvent fires when role is updated.
+	RoleUpdatedEvent = "role.updated"
 	// RoleDeletedEvent fires when role is deleted.
 	RoleDeletedEvent = "role.deleted"
 
@@ -344,28 +364,39 @@ const (
 	TrustedClusterCreateEvent = "trusted_cluster.create"
 	// TrustedClusterDeleteEvent is the event for removing a trusted cluster.
 	TrustedClusterDeleteEvent = "trusted_cluster.delete"
-	// TrustedClusterTokenCreateEvent is the event for
-	// creating new join token for a trusted cluster.
+	// TrustedClusterTokenCreateEvent is the event for creating new provisioning
+	// token for a trusted cluster. Deprecated in favor of
+	// [ProvisionTokenCreateEvent].
 	TrustedClusterTokenCreateEvent = "trusted_cluster_token.create"
 
-	// GithubConnectorCreatedEvent fires when a Github connector is created/updated.
+	// ProvisionTokenCreateEvent is the event for creating a provisioning token,
+	// also known as Join Token. See [types.ProvisionToken].
+	ProvisionTokenCreateEvent = "join_token.create"
+
+	// GithubConnectorCreatedEvent fires when a Github connector is created.
 	GithubConnectorCreatedEvent = "github.created"
+	// GithubConnectorUpdatedEvent fires when a Github connector is updated.
+	GithubConnectorUpdatedEvent = "github.updated"
 	// GithubConnectorDeletedEvent fires when a Github connector is deleted.
 	GithubConnectorDeletedEvent = "github.deleted"
-	// OIDCConnectorCreatedEvent fires when OIDC connector is created/updated.
+	// OIDCConnectorCreatedEvent fires when OIDC connector is created.
 	OIDCConnectorCreatedEvent = "oidc.created"
+	// OIDCConnectorUpdatedEvent fires when OIDC connector is updated.
+	OIDCConnectorUpdatedEvent = "oidc.updated"
 	// OIDCConnectorDeletedEvent fires when OIDC connector is deleted.
 	OIDCConnectorDeletedEvent = "oidc.deleted"
-	// SAMLConnectorCreatedEvent fires when SAML connector is created/updated.
+	// SAMLConnectorCreatedEvent fires when SAML connector is created.
 	SAMLConnectorCreatedEvent = "saml.created"
+	// SAMLConnectorUpdatedEvent fires when SAML connector is updated.
+	SAMLConnectorUpdatedEvent = "saml.updated"
 	// SAMLConnectorDeletedEvent fires when SAML connector is deleted.
 	SAMLConnectorDeletedEvent = "saml.deleted"
 
-	// SessionRejected fires when a user's attempt to create an authenticated
+	// SessionRejectedEvent fires when a user's attempt to create an authenticated
 	// session has been rejected due to exceeding a session control limit.
 	SessionRejectedEvent = "session.rejected"
 
-	// SessionConnect is emitted when any ssh connection is made
+	// SessionConnectEvent is emitted when any ssh connection is made
 	SessionConnectEvent = "session.connect"
 
 	// AppCreateEvent is emitted when an application resource is created.
@@ -377,6 +408,8 @@ const (
 
 	// AppSessionStartEvent is emitted when a user is issued an application certificate.
 	AppSessionStartEvent = "app.session.start"
+	// AppSessionEndEvent is emitted when a user connects to a TCP application.
+	AppSessionEndEvent = "app.session.end"
 
 	// AppSessionChunkEvent is emitted at the start of a 5 minute chunk on each
 	// proxy. This chunk is used to buffer 5 minutes of audit events at a time
@@ -385,6 +418,10 @@ const (
 
 	// AppSessionRequestEvent is an HTTP request and response.
 	AppSessionRequestEvent = "app.session.request"
+
+	// AppSessionDynamoDBRequestEvent is emitted when DynamoDB client sends
+	// a request via app access session.
+	AppSessionDynamoDBRequestEvent = "app.session.dynamodb.request"
 
 	// DatabaseCreateEvent is emitted when a database resource is created.
 	DatabaseCreateEvent = "db.create"
@@ -396,6 +433,13 @@ const (
 	// DatabaseSessionStartEvent is emitted when a database client attempts
 	// to connect to a database.
 	DatabaseSessionStartEvent = "db.session.start"
+	// DatabaseSessionUserCreateEvent is emitted after provisioning new database user.
+	DatabaseSessionUserCreateEvent = "db.session.user.create"
+	// DatabaseSessionUserDeactivateEvent is emitted after disabling/deleting the auto-provisioned database user.
+	DatabaseSessionUserDeactivateEvent = "db.session.user.deactivate"
+	// DatabaseSessionPermissionsUpdateEvent is emitted after assigning
+	// the auto-provisioned database user permissions.
+	DatabaseSessionPermissionsUpdateEvent = "db.session.permissions.update"
 	// DatabaseSessionEndEvent is emitted when a database client disconnects
 	// from a database.
 	DatabaseSessionEndEvent = "db.session.end"
@@ -405,6 +449,9 @@ const (
 	// DatabaseSessionQueryFailedEvent is emitted when database client's request
 	// to execute a database query/command was unsuccessful.
 	DatabaseSessionQueryFailedEvent = "db.session.query.failed"
+	// DatabaseSessionCommandResult is emitted when a database returns a
+	// query/command result.
+	DatabaseSessionCommandResultEvent = "db.session.result"
 
 	// DatabaseSessionPostgresParseEvent is emitted when a Postgres client
 	// creates a prepared statement using extended query protocol.
@@ -447,6 +494,60 @@ const (
 	// statement protocol.
 	DatabaseSessionMySQLStatementBulkExecuteEvent = "db.session.mysql.statements.bulk_execute"
 
+	// DatabaseSessionMySQLInitDBEvent is emitted when a MySQL client changes
+	// the default schema for the connection.
+	DatabaseSessionMySQLInitDBEvent = "db.session.mysql.init_db"
+	// DatabaseSessionMySQLCreateDBEvent is emitted when a MySQL client creates
+	// a schema.
+	DatabaseSessionMySQLCreateDBEvent = "db.session.mysql.create_db"
+	// DatabaseSessionMySQLDropDBEvent is emitted when a MySQL client drops a
+	// schema.
+	DatabaseSessionMySQLDropDBEvent = "db.session.mysql.drop_db"
+	// DatabaseSessionMySQLShutDownEvent is emitted when a MySQL client asks
+	// the server to shut down.
+	DatabaseSessionMySQLShutDownEvent = "db.session.mysql.shut_down"
+	// DatabaseSessionMySQLProcessKillEvent is emitted when a MySQL client asks
+	// the server to terminate a connection.
+	DatabaseSessionMySQLProcessKillEvent = "db.session.mysql.process_kill"
+	// DatabaseSessionMySQLDebugEvent is emitted when a MySQL client asks the
+	// server to dump internal debug info to stdout.
+	DatabaseSessionMySQLDebugEvent = "db.session.mysql.debug"
+	// DatabaseSessionMySQLRefreshEvent is emitted when a MySQL client sends
+	// refresh commands.
+	DatabaseSessionMySQLRefreshEvent = "db.session.mysql.refresh"
+
+	// DatabaseSessionSQLServerRPCRequestEvent is emitted when MSServer client sends
+	// RPC request command.
+	DatabaseSessionSQLServerRPCRequestEvent = "db.session.sqlserver.rpc_request"
+
+	// DatabaseSessionElasticsearchRequestEvent is emitted when Elasticsearch client sends
+	// a generic request.
+	DatabaseSessionElasticsearchRequestEvent = "db.session.elasticsearch.request"
+
+	// DatabaseSessionOpenSearchRequestEvent is emitted when OpenSearch client sends
+	// a request.
+	DatabaseSessionOpenSearchRequestEvent = "db.session.opensearch.request"
+
+	// DatabaseSessionDynamoDBRequestEvent is emitted when DynamoDB client sends
+	// a request via database-access.
+	DatabaseSessionDynamoDBRequestEvent = "db.session.dynamodb.request"
+
+	// DatabaseSessionMalformedPacketEvent is emitted when SQL packet is malformed.
+	DatabaseSessionMalformedPacketEvent = "db.session.malformed_packet"
+
+	// DatabaseSessionCassandraBatchEvent is emitted when a Cassandra client executes a batch of queries.
+	DatabaseSessionCassandraBatchEvent = "db.session.cassandra.batch"
+	// DatabaseSessionCassandraPrepareEvent is emitted when a Cassandra client sends prepare packet.
+	DatabaseSessionCassandraPrepareEvent = "db.session.cassandra.prepare"
+	// DatabaseSessionCassandraExecuteEvent is emitted when a Cassandra client sends executed packet.
+	DatabaseSessionCassandraExecuteEvent = "db.session.cassandra.execute"
+	// DatabaseSessionCassandraRegisterEvent is emitted when a Cassandra client sends the register packet.
+	DatabaseSessionCassandraRegisterEvent = "db.session.cassandra.register"
+
+	// DatabaseSessionSpannerRPCEvent is emitted when a Spanner client
+	// calls a Spanner RPC.
+	DatabaseSessionSpannerRPCEvent = "db.session.spanner.rpc"
+
 	// SessionRejectedReasonMaxConnections indicates that a session.rejected event
 	// corresponds to enforcement of the max_connections control.
 	SessionRejectedReasonMaxConnections = "max_connections limit reached"
@@ -461,6 +562,13 @@ const (
 	// KubeRequestEvent fires when a proxy handles a generic kubernetes
 	// request.
 	KubeRequestEvent = "kube.request"
+
+	// KubernetesClusterCreateEvent is emitted when a kubernetes cluster resource is created.
+	KubernetesClusterCreateEvent = "kube.create"
+	// KubernetesClusterUpdateEvent is emitted when a kubernetes cluster resource is updated.
+	KubernetesClusterUpdateEvent = "kube.update"
+	// KubernetesClusterDeleteEvent is emitted when a kubernetes cluster resource is deleted.
+	KubernetesClusterDeleteEvent = "kube.delete"
 
 	// MFADeviceAddEvent is an event type for users adding MFA devices.
 	MFADeviceAddEvent = "mfa.add"
@@ -502,16 +610,274 @@ const (
 	// DesktopClipboardSendEvent is emitted when local clipboard data
 	// is sent to Teleport.
 	DesktopClipboardSendEvent = "desktop.clipboard.send"
+	// DesktopSharedDirectoryStartEvent is emitted when when Teleport
+	// successfully begins sharing a new directory to a remote desktop.
+	DesktopSharedDirectoryStartEvent = "desktop.directory.share"
+	// DesktopSharedDirectoryReadEvent is emitted when data is read from a shared directory.
+	DesktopSharedDirectoryReadEvent = "desktop.directory.read"
+	// DesktopSharedDirectoryWriteEvent is emitted when data is written to a shared directory.
+	DesktopSharedDirectoryWriteEvent = "desktop.directory.write"
+	// UpgradeWindowStartUpdateEvent is emitted when the upgrade window start time
+	// is updated. Used only for teleport cloud.
+	UpgradeWindowStartUpdateEvent = "upgradewindowstart.update"
+
+	// SessionRecordingAccessEvent is emitted when a session recording is accessed
+	SessionRecordingAccessEvent = "session.recording.access"
+
+	// SSMRunEvent is emitted when a run of an install script
+	// completes on a discovered EC2 node
+	SSMRunEvent = "ssm.run"
+
+	// DeviceEvent is the catch-all event for Device Trust events.
+	// Deprecated: Use one of the more specific event codes below.
+	DeviceEvent = "device"
+	// DeviceCreateEvent is emitted on device registration.
+	// This is an inventory management event.
+	DeviceCreateEvent = "device.create"
+	// DeviceDeleteEvent is emitted on device deletion.
+	// This is an inventory management event.
+	DeviceDeleteEvent = "device.delete"
+	// DeviceUpdateEvent is emitted on device updates.
+	// This is an inventory management event.
+	DeviceUpdateEvent = "device.update"
+	// DeviceEnrollEvent is emitted when a device is enrolled.
+	// Enrollment events are issued due to end-user action, using the trusted
+	// device itself.
+	DeviceEnrollEvent = "device.enroll"
+	// DeviceAuthenticateEvent is emitted when a device is authenticated.
+	// Authentication events are issued due to end-user action, using the trusted
+	// device itself.
+	DeviceAuthenticateEvent = "device.authenticate"
+	// DeviceEnrollTokenCreateEvent is emitted when a new enrollment token is
+	// issued for a device.
+	// Device enroll tokens are issued by either a device admin or during
+	// client-side auto-enrollment.
+	DeviceEnrollTokenCreateEvent = "device.token.create"
+	// DeviceWebTokenCreateEvent is emitted when a new device web token is issued.
+	// Device web tokens are issued during Web login for users that own a suitable
+	// trusted device.
+	// Tokens are spent in exchange for a single on-behalf-of device
+	// authentication attempt.
+	DeviceWebTokenCreateEvent = "device.webtoken.create"
+	// DeviceAuthenticateConfirmEvent is emitted when a device web authentication
+	// attempt is confirmed (via the ConfirmDeviceWebAuthentication RPC).
+	// A confirmed web authentication means the WebSession itself now holds
+	// augmented TLS and SSH certificates.
+	DeviceAuthenticateConfirmEvent = "device.authenticate.confirm"
+
+	// BotJoinEvent is emitted when a bot joins
+	BotJoinEvent = "bot.join"
+	// BotCreateEvent is emitted when a bot is created
+	BotCreateEvent = "bot.create"
+	// BotUpdateEvent is emitted when a bot is updated
+	BotUpdateEvent = "bot.update"
+	// BotDeleteEvent is emitted when a bot is deleted
+	BotDeleteEvent = "bot.delete"
+
+	// InstanceJoinEvent is emitted when an instance joins
+	InstanceJoinEvent = "instance.join"
+
+	// LoginRuleCreateEvent is emitted when a login rule is created or updated.
+	LoginRuleCreateEvent = "login_rule.create"
+	// LoginRuleDeleteEvent is emitted when a login rule is deleted.
+	LoginRuleDeleteEvent = "login_rule.delete"
+
+	// SAMLIdPAuthAttemptEvent is emitted when a user has attempted to authorize against the SAML IdP.
+	SAMLIdPAuthAttemptEvent = "saml.idp.auth"
+
+	// SAMLIdPServiceProviderCreateEvent is emitted when a service provider has been created.
+	SAMLIdPServiceProviderCreateEvent = "saml.idp.service.provider.create"
+
+	// SAMLIdPServiceProviderUpdateEvent is emitted when a service provider has been updated.
+	SAMLIdPServiceProviderUpdateEvent = "saml.idp.service.provider.update"
+
+	// SAMLIdPServiceProviderDeleteEvent is emitted when a service provider has been deleted.
+	SAMLIdPServiceProviderDeleteEvent = "saml.idp.service.provider.delete"
+
+	// SAMLIdPServiceProviderDeleteAllEvent is emitted when all service providers have been deleted.
+	SAMLIdPServiceProviderDeleteAllEvent = "saml.idp.service.provider.delete_all"
+
+	// OktaGroupsUpdate event is emitted when the groups synced from Okta have been updated.
+	OktaGroupsUpdateEvent = "okta.groups.update"
+
+	// OktaApplicationsUpdateEvent is emitted when the applications synced from Okta have been updated.
+	OktaApplicationsUpdateEvent = "okta.applications.update"
+
+	// OktaSyncFailureEvent is emitted when the Okta synchronization fails.
+	OktaSyncFailureEvent = "okta.sync.failure"
+
+	// OktaAssignmentProcessEvent is emitted when an assignment is processed.
+	OktaAssignmentProcessEvent = "okta.assignment.process"
+
+	// OktaAssignmentCleanupEvent is emitted when an assignment is cleaned up.
+	OktaAssignmentCleanupEvent = "okta.assignment.cleanup"
+
+	// OktaAccessListSyncEvent is emitted when an access list synchronization has completed.
+	OktaAccessListSyncEvent = "okta.access_list.sync"
+
+	// OktaUserSyncEvent is emitted when an access list synchronization has completed.
+	OktaUserSyncEvent = "okta.user.sync"
+
+	// AccessListCreateEvent is emitted when an access list is created.
+	AccessListCreateEvent = "access_list.create"
+
+	// AccessListUpdateEvent is emitted when an access list is updated.
+	AccessListUpdateEvent = "access_list.update"
+
+	// AccessListDeleteEvent is emitted when an access list is deleted.
+	AccessListDeleteEvent = "access_list.delete"
+
+	// AccessListReviewEvent is emitted when an access list is reviewed.
+	AccessListReviewEvent = "access_list.review"
+
+	// AccessListMemberCreateEvent is emitted when a member is added to an access list.
+	AccessListMemberCreateEvent = "access_list.member.create"
+
+	// AccessListMemberUpdateEvent is emitted when a member is updated in an access list.
+	AccessListMemberUpdateEvent = "access_list.member.update"
+
+	// AccessListMemberDeleteEvent is emitted when a member is deleted from an access list.
+	AccessListMemberDeleteEvent = "access_list.member.delete"
+
+	// AccessListMemberDeleteAllForAccessListEvent is emitted when all members are deleted from an access list.
+	AccessListMemberDeleteAllForAccessListEvent = "access_list.member.delete_all_for_access_list"
+
+	// UserLoginAccessListInvalidEvent is emitted when a user logs in as a member of an invalid access list, causing the access list to be skipped.
+	UserLoginAccessListInvalidEvent = "user_login.invalid_access_list"
 
 	// UnknownEvent is any event received that isn't recognized as any other event type.
 	UnknownEvent = apievents.UnknownEvent
+
+	// SecReportsAuditQueryRunEvent is emitted when a security report query is run.
+	SecReportsAuditQueryRunEvent = "secreports.audit.query.run"
+
+	// SecReportsReportRunEvent is emitted when a security report is run.
+	SecReportsReportRunEvent = "secreports.report.run"
+
+	// ExternalAuditStorageEnableEvent is emitted when External Audit Storage is
+	// enabled.
+	ExternalAuditStorageEnableEvent = "external_audit_storage.enable"
+	// ExternalAuditStorageDisableEvent is emitted when External Audit Storage is
+	// disabled.
+	ExternalAuditStorageDisableEvent = "external_audit_storage.disable"
+
+	// CreateMFAAuthChallengeEvent is emitted when an MFA auth challenge is created.
+	CreateMFAAuthChallengeEvent = "mfa_auth_challenge.create"
+
+	// ValidateMFAAuthResponseEvent is emitted when an MFA auth challenge is validated.
+	ValidateMFAAuthResponseEvent = "mfa_auth_challenge.validate"
+
+	// SPIFFESVIDIssuedEvent is emitted when a SPIFFE SVID is issued.
+	SPIFFESVIDIssuedEvent = "spiffe.svid.issued"
+	// SPIFFEFederationCreateEvent is emitted when a SPIFFE federation is created.
+	SPIFFEFederationCreateEvent = "spiffe.federation.create"
+	// SPIFFEFederationDeleteEvent is emitted when a SPIFFE federation is deleted.
+	SPIFFEFederationDeleteEvent = "spiffe.federation.delete"
+
+	// AuthPreferenceUpdateEvent is emitted when a user updates the cluster authentication preferences.
+	AuthPreferenceUpdateEvent = "auth_preference.update"
+	// ClusterNetworkingConfigUpdateEvent is emitted when a user updates the cluster networking configuration.
+	ClusterNetworkingConfigUpdateEvent = "cluster_networking_config.update"
+	// SessionRecordingConfigUpdateEvent is emitted when a user updates the cluster session recording configuration.
+	SessionRecordingConfigUpdateEvent = "session_recording_config.update"
+	// AccessGraphSettingsUpdateEvent is emitted when a user updates the access graph settings configuration.
+	AccessGraphSettingsUpdateEvent = "access_graph_settings.update"
+
+	// AccessGraphAccessPathChangedEvent is emitted when an access path is changed in the access graph
+	// and an identity/resource is affected.
+	AccessGraphAccessPathChangedEvent = "access_graph.access_path_changed"
+	// TODO(jakule): Remove once e is updated to the new name.
+	AccessGraphAccessPathChanged = AccessGraphAccessPathChangedEvent
+
+	// DiscoveryConfigCreatedEvent is emitted when a discovery config is created.
+	DiscoveryConfigCreateEvent = "discovery_config.create"
+	// DiscoveryConfigUpdatedEvent is emitted when a discovery config is updated.
+	DiscoveryConfigUpdateEvent = "discovery_config.update"
+	// DiscoveryConfigDeletedEvent is emitted when a discovery config is deleted.
+	DiscoveryConfigDeleteEvent = "discovery_config.delete"
+	// DiscoveryConfigDeletedAllEvent is emitted when all discovery configs are deleted.
+	DiscoveryConfigDeleteAllEvent = "discovery_config.delete_all"
+
+	// IntegrationCreateEvent is emitted when an integration resource is created.
+	IntegrationCreateEvent = "integration.create"
+	// IntegrationUpdateEvent is emitted when an integration resource is updated.
+	IntegrationUpdateEvent = "integration.update"
+	// IntegrationDeleteEvent is emitted when an integration resource is deleted.
+	IntegrationDeleteEvent = "integration.delete"
+
+	// PluginCreateEvent is emitted when a plugin resource is created.
+	PluginCreateEvent = "plugin.create"
+	// PluginUpdateEvent is emitted when a plugin resource is updated.
+	PluginUpdateEvent = "plugin.update"
+	// PluginDeleteEvent is emitted when a plugin resource is deleted.
+	PluginDeleteEvent = "plugin.delete"
+
+	// StaticHostUserCreateEvent is emitted when a static host user resource is created.
+	StaticHostUserCreateEvent = "static_host_user.create"
+	// StaticHostUserUpdateEvent is emitted when a static host user resource is updated.
+	StaticHostUserUpdateEvent = "static_host_user.update"
+	// StaticHostUserDeleteEvent is emitted when a static host user resource is deleted.
+	StaticHostUserDeleteEvent = "static_host_user.delete"
+
+	// CrownJewelCreateEvent is emitted when a crown jewel resource is created.
+	CrownJewelCreateEvent = "access_graph.crown_jewel.create"
+	// CrownJewelUpdateEvent is emitted when a crown jewel resource is updated.
+	CrownJewelUpdateEvent = "access_graph.crown_jewel.update"
+	// CrownJewelDeleteEvent is emitted when a crown jewel resource is deleted.
+	CrownJewelDeleteEvent = "access_graph.crown_jewel.delete"
+
+	// UserTaskCreateEvent is emitted when a user task resource is created.
+	UserTaskCreateEvent = "user_task.create"
+	// UserTaskUpdateEvent is emitted when a user task resource is updated.
+	UserTaskUpdateEvent = "user_task.update"
+	// UserTaskDeleteEvent is emitted when a user task resource is deleted.
+	UserTaskDeleteEvent = "user_task.delete"
+
+	// AutoUpdateConfigCreateEvent is emitted when a AutoUpdateConfig resource is created.
+	AutoUpdateConfigCreateEvent = "auto_update_config.create"
+	// AutoUpdateConfigUpdateEvent is emitted when a AutoUpdateConfig resource is updated.
+	AutoUpdateConfigUpdateEvent = "auto_update_config.update"
+	// AutoUpdateConfigDeleteEvent is emitted when a AutoUpdateConfig resource is deleted.
+	AutoUpdateConfigDeleteEvent = "auto_update_config.delete"
+
+	// AutoUpdateVersionCreateEvent is emitted when a AutoUpdateVersion resource is created.
+	AutoUpdateVersionCreateEvent = "auto_update_version.create"
+	// AutoUpdateVersionUpdateEvent is emitted when a AutoUpdateVersion resource is updated.
+	AutoUpdateVersionUpdateEvent = "auto_update_version.update"
+	// AutoUpdateVersionDeleteEvent is emitted when a AutoUpdateVersion resource is deleted.
+	AutoUpdateVersionDeleteEvent = "auto_update_version.delete"
+
+	// ContactCreateEvent is emitted when a Contact resource is created.
+	ContactCreateEvent = "contact.create"
+	// ContactDeleteEvent is emitted when a Contact resource is deleted.
+	ContactDeleteEvent = "contact.delete"
+
+	// WorkloadIdentityCreateEvent is emitted when a WorkloadIdentity resource is created.
+	WorkloadIdentityCreateEvent = "workload_identity.create"
+	// WorkloadIdentityUpdateEvent is emitted when a WorkloadIdentity resource is updated.
+	WorkloadIdentityUpdateEvent = "workload_identity.update"
+	// WorkloadIdentityDeleteEvent is emitted when a WorkloadIdentity resource is deleted.
+	WorkloadIdentityDeleteEvent = "workload_identity.delete"
+
+	// WorkloadIdentityX509RevocationCreateEvent is emitted when a
+	// WorkloadIdentityX509Revocation resource is created.
+	WorkloadIdentityX509RevocationCreateEvent = "workload_identity_x509_revocation.create"
+	// WorkloadIdentityX509RevocationUpdateEvent is emitted when a
+	// WorkloadIdentityX509Revocation resource is updated.
+	WorkloadIdentityX509RevocationUpdateEvent = "workload_identity_x509_revocation.update"
+	// WorkloadIdentityX509RevocationDeleteEvent is emitted when a
+	// WorkloadIdentityX509Revocation resource is deleted.
+	WorkloadIdentityX509RevocationDeleteEvent = "workload_identity_x509_revocation.delete"
+
+	// GitCommandEvent is emitted when a Git command is executed.
+	GitCommandEvent = "git.command"
+
+	// StableUNIXUserCreateEvent is emitted when a stable UNIX user is created.
+	StableUNIXUserCreateEvent = "stable_unix_user.create"
 )
 
-const (
-	// MaxChunkBytes defines the maximum size of a session stream chunk that
-	// can be requested via AuditLog.GetSessionChunk(). Set to 5MB
-	MaxChunkBytes = 1024 * 1024 * 5
-)
+// Add an entry to eventsMap in lib/events/events_test.go when you add
+// a new event name here.
 
 const (
 	// V1 is the V1 version of slice chunks API,
@@ -526,6 +892,14 @@ const (
 	V3 = 3
 )
 
+// SessionRecordingEvents is a list of events that are related to session
+// recorings.
+var SessionRecordingEvents = []string{
+	SessionEndEvent,
+	WindowsDesktopSessionEndEvent,
+	DatabaseSessionEndEvent,
+}
+
 // ServerMetadataGetter represents interface
 // that provides information about its server id
 type ServerMetadataGetter interface {
@@ -537,6 +911,9 @@ type ServerMetadataGetter interface {
 
 	// GetClusterName returns the originating teleport cluster name
 	GetClusterName() string
+
+	// GetForwardedBy returns the ID of the server that forwarded this event.
+	GetForwardedBy() string
 }
 
 // ServerMetadataSetter represents interface
@@ -566,12 +943,6 @@ type SessionMetadataSetter interface {
 	SetClusterName(string)
 }
 
-// SetCode is a shortcut that sets code for the audit event
-func SetCode(event apievents.AuditEvent, code string) apievents.AuditEvent {
-	event.SetCode(code)
-	return event
-}
-
 // Streamer creates and resumes event streams for session IDs
 type Streamer interface {
 	// CreateAuditStream creates event stream
@@ -587,6 +958,9 @@ type StreamPart struct {
 	Number int64
 	// ETag is a part e-tag
 	ETag string
+	// LastModified is the time of last modification of this part (if
+	// available).
+	LastModified time.Time
 }
 
 // StreamUpload represents stream multipart upload
@@ -622,6 +996,9 @@ type MultipartUploader interface {
 	CreateUpload(ctx context.Context, sessionID session.ID) (*StreamUpload, error)
 	// CompleteUpload completes the upload
 	CompleteUpload(ctx context.Context, upload StreamUpload, parts []StreamPart) error
+	// ReserveUploadPart reserves an upload part. Reserve is used to identify
+	// upload errors beforehand.
+	ReserveUploadPart(ctx context.Context, upload StreamUpload, partNumber int64) error
 	// UploadPart uploads part and returns the part
 	UploadPart(ctx context.Context, upload StreamUpload, partNumber int64, partBody io.ReadSeeker) (*StreamPart, error)
 	// ListParts returns all uploaded parts for the completed upload in sorted order
@@ -647,58 +1024,96 @@ type UploadMetadataGetter interface {
 	GetUploadMetadata(sid session.ID) UploadMetadata
 }
 
-// StreamWriter implements io.Writer to be plugged into the multi-writer
-// associated with every session. It forwards session stream to the audit log
-type StreamWriter interface {
+// SessionEventPreparer will set necessary event fields for session-related
+// events and must be called before the event is used, regardless
+// of whether the event will be recorded, emitted, or both.
+type SessionEventPreparer interface {
+	PrepareSessionEvent(event apievents.AuditEvent) (apievents.PreparedSessionEvent, error)
+}
+
+// SessionRecorder records session events. It can be used both as a
+// [io.Writer] when recording raw session data and as a [apievents.Recorder]
+// when recording session events.
+type SessionRecorder interface {
 	io.Writer
 	apievents.Stream
 }
 
-// StreamEmitter supports submitting single events and streaming
-// session events
+// SessionPreparerRecorder sets necessary session event fields and records them.
+type SessionPreparerRecorder interface {
+	SessionEventPreparer
+	SessionRecorder
+}
+
+// StreamEmitter supports emitting single events to the audit log
+// and streaming events to a session recording.
 type StreamEmitter interface {
 	apievents.Emitter
 	Streamer
 }
 
-// IAuditLog is the primary (and the only external-facing) interface for AuditLogger.
-// If you wish to implement a different kind of logger (not filesystem-based), you
-// have to implement this interface
-type IAuditLog interface {
+// AuditLogSessionStreamer is the primary (and the only external-facing)
+// interface for AuditLogger and SessionStreamer.
+type AuditLogSessionStreamer interface {
+	AuditLogger
+	SessionStreamer
+}
+
+// SessionStreamer supports streaming session chunks or events.
+type SessionStreamer interface {
+	// StreamSessionEvents streams all events from a given session recording. An
+	// error is returned on the first channel if one is encountered. Otherwise
+	// the event channel is closed when the stream ends. The event channel is
+	// not closed on error to prevent race conditions in downstream select
+	// statements. Both returned channels must be driven until the event channel
+	// is exhausted or the error channel reports an error, or until the context
+	// is canceled.
+	StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error)
+}
+
+type SearchEventsRequest struct {
+	// From is oldest date of returned events, can be zero.
+	From time.Time
+	// To is the newest date of returned events.
+	To time.Time
+	// EventTypes is optional, if not set, returns all events.
+	EventTypes []string
+	// Limit is the maximum amount of events returned.
+	Limit int
+	// Order specifies an ascending or descending order of events.
+	Order types.EventOrder
+	// StartKey is used to resume a query in order to enable pagination.
+	// If the previous response had LastKey set then this should be
+	// set to its value. Otherwise leave empty.
+	StartKey string
+}
+
+type SearchSessionEventsRequest struct {
+	// From is oldest date of returned events, can be zero.
+	From time.Time
+	// To is the newest date of returned events.
+	To time.Time
+	// Limit is the maximum amount of events returned.
+	Limit int
+	// Order specifies an ascending or descending order of events.
+	Order types.EventOrder
+	// StartKey is used to resume a query in order to enable pagination.
+	// If the previous response had LastKey set then this should be
+	// set to its value. Otherwise leave empty.
+	StartKey string
+	// Cond can be used to pass additional expression to query, can be empty.
+	Cond *types.WhereExpr
+	// SessionID is optional parameter to return session events only to given session.
+	SessionID string
+}
+
+// AuditLogger defines which methods need to implemented by audit loggers.
+type AuditLogger interface {
 	// Closer releases connection and resources associated with log if any
 	io.Closer
 
-	// EmitAuditEventLegacy emits audit in legacy format
-	// DELETE IN: 5.0.0
-	EmitAuditEventLegacy(Event, EventFields) error
-
-	// EmitAuditEvent emits audit event
-	EmitAuditEvent(context.Context, apievents.AuditEvent) error
-
-	// DELETE IN: 2.7.0
-	// This method is no longer necessary as nodes and proxies >= 2.7.0
-	// use UploadSessionRecording method.
-	// PostSessionSlice sends chunks of recorded session to the event log
-	PostSessionSlice(SessionSlice) error
-
-	// UploadSessionRecording uploads session recording to the audit server
-	UploadSessionRecording(r SessionRecording) error
-
-	// GetSessionChunk returns a reader which can be used to read a byte stream
-	// of a recorded session starting from 'offsetBytes' (pass 0 to start from the
-	// beginning) up to maxBytes bytes.
-	//
-	// If maxBytes > MaxChunkBytes, it gets rounded down to MaxChunkBytes
-	GetSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) ([]byte, error)
-
-	// Returns all events that happen during a session sorted by time
-	// (oldest first).
-	//
-	// after tells to use only return events after a specified cursor Id
-	//
-	// This function is usually used in conjunction with GetSessionReader to
-	// replay recorded session streams.
-	GetSessionEvents(namespace string, sid session.ID, after int, includePrintEvents bool) ([]EventFields, error)
+	// Emitter emits an audit event
+	apievents.Emitter
 
 	// SearchEvents is a flexible way to find events.
 	//
@@ -708,7 +1123,7 @@ type IAuditLog interface {
 	// The only mandatory requirement is a date range (UTC).
 	//
 	// This function may never return more than 1 MiB of event data.
-	SearchEvents(fromUTC, toUTC time.Time, namespace string, eventTypes []string, limit int, order types.EventOrder, startKey string) ([]apievents.AuditEvent, string, error)
+	SearchEvents(ctx context.Context, req SearchEventsRequest) ([]apievents.AuditEvent, string, error)
 
 	// SearchSessionEvents is a flexible way to find session events.
 	// Only session.end events are returned by this function.
@@ -718,16 +1133,15 @@ type IAuditLog interface {
 	// a query to be resumed.
 	//
 	// This function may never return more than 1 MiB of event data.
-	SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startKey string, cond *types.WhereExpr) ([]apievents.AuditEvent, string, error)
+	SearchSessionEvents(ctx context.Context, req SearchSessionEventsRequest) ([]apievents.AuditEvent, string, error)
 
-	// WaitForDelivery waits for resources to be released and outstanding requests to
-	// complete after calling Close method
-	WaitForDelivery(context.Context) error
+	// ExportUnstructuredEvents exports events from a given event chunk returned by GetEventExportChunks. This API prioritizes
+	// performance over ordering and filtering, and is intended for bulk export of events.
+	ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured]
 
-	// StreamSessionEvents streams all events from a given session recording. An error is returned on the first
-	// channel if one is encountered. Otherwise the event channel is closed when the stream ends.
-	// The event channel is not closed on error to prevent race conditions in downstream select statements.
-	StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error)
+	// GetEventExportChunks returns a stream of event chunks that can be exported via ExportUnstructuredEvents. The returned
+	// list isn't ordered and polling for new chunks requires re-consuming the entire stream from the beginning.
+	GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk]
 }
 
 // EventFields instance is attached to every logged event
@@ -740,7 +1154,6 @@ func (f EventFields) AsString() string {
 		f.GetString(EventLogin),
 		f.GetInt(EventCursor),
 		f.GetInt(SessionPrintEventBytes))
-
 }
 
 // GetType returns the type (string) of the event

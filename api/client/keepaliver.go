@@ -20,11 +20,11 @@ import (
 	"context"
 	"sync"
 
+	"github.com/gravitational/trace"
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-
-	"github.com/golang/protobuf/ptypes/empty"
-	"github.com/gravitational/trace/trail"
 )
 
 // NewKeepAliver returns a new instance of keep aliver.
@@ -32,10 +32,10 @@ import (
 // returned value to release the keepAliver resources.
 func (c *Client) NewKeepAliver(ctx context.Context) (types.KeepAliver, error) {
 	cancelCtx, cancel := context.WithCancel(ctx)
-	stream, err := c.grpc.SendKeepAlives(cancelCtx, c.callOpts...)
+	stream, err := c.grpc.SendKeepAlives(cancelCtx)
 	if err != nil {
 		cancel()
-		return nil, trail.FromGRPC(err)
+		return nil, trace.Wrap(err)
 	}
 	k := &streamKeepAliver{
 		stream:      stream,
@@ -70,7 +70,7 @@ func (k *streamKeepAliver) forwardKeepAlives() {
 		case keepAlive := <-k.keepAlivesC:
 			err := k.stream.Send(&keepAlive)
 			if err != nil {
-				k.closeWithError(trail.FromGRPC(err))
+				k.closeWithError(trace.Wrap(err))
 				return
 			}
 		}
@@ -92,8 +92,8 @@ func (k *streamKeepAliver) Done() <-chan struct{} {
 // recv is necessary to receive errors from the
 // server, otherwise no errors will be propagated
 func (k *streamKeepAliver) recv() {
-	err := k.stream.RecvMsg(&empty.Empty{})
-	k.closeWithError(trail.FromGRPC(err))
+	err := k.stream.RecvMsg(&emptypb.Empty{})
+	k.closeWithError(trace.Wrap(err))
 }
 
 func (k *streamKeepAliver) closeWithError(err error) {

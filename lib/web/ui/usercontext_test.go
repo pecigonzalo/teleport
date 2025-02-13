@@ -1,189 +1,114 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package ui
 
 import (
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/services"
-	"gopkg.in/check.v1"
 )
 
-type UserContextSuite struct{}
+func TestNewUserContext(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&UserContextSuite{})
-
-func TestUserContext(t *testing.T) { check.TestingT(t) }
-
-func (s *UserContextSuite) TestNewUserContext(c *check.C) {
 	user := &types.UserV2{
 		Metadata: types.Metadata{
 			Name: "root",
+		},
+		Status: types.UserStatusV2{
+			PasswordState: types.PasswordState_PASSWORD_STATE_SET,
 		},
 	}
 
 	// set some rules
-	role1 := &types.RoleV5{}
+	role1 := &types.RoleV6{}
 	role1.SetNamespaces(types.Allow, []string{apidefaults.Namespace})
-	role1.SetRules(types.Allow, []types.Rule{
-		{
-			Resources: []string{types.KindAuthConnector},
-			Verbs:     services.RW(),
-		},
-		{
-			Resources: []string{types.KindWindowsDesktop},
-			Verbs:     services.RW(),
-		},
-	})
 
-	// not setting the rule, or explicitly denying, both denies access
-	role1.SetRules(types.Deny, []types.Rule{
-		{
-			Resources: []string{types.KindEvent},
-			Verbs:     services.RW(),
-		},
-	})
-
-	role2 := &types.RoleV5{}
+	role2 := &types.RoleV6{}
 	role2.SetNamespaces(types.Allow, []string{apidefaults.Namespace})
-	role2.SetRules(types.Allow, []types.Rule{
-		{
-			Resources: []string{types.KindTrustedCluster},
-			Verbs:     services.RW(),
-		},
-		{
-			Resources: []string{types.KindBilling},
-			Verbs:     services.RO(),
-		},
-	})
-
-	// set some logins
-	role1.SetLogins(types.Allow, []string{"a", "b"})
-	role1.SetLogins(types.Deny, []string{"c"})
-	role2.SetLogins(types.Allow, []string{"d"})
-
-	// set some windows desktop logins
-	role1.SetWindowsLogins(types.Allow, []string{"a", "b"})
-	role1.SetWindowsLogins(types.Deny, []string{"c"})
-	role2.SetWindowsLogins(types.Allow, []string{"d"})
 
 	roleSet := []types.Role{role1, role2}
-	userContext, err := NewUserContext(user, roleSet, proto.Features{}, true)
-	c.Assert(err, check.IsNil)
+	userContext, err := NewUserContext(user, roleSet, proto.Features{}, true, false)
+	require.NoError(t, err)
 
-	allowed := access{true, true, true, true, true}
-	denied := access{false, false, false, false, false}
-
-	// test user name and acl
-	c.Assert(userContext.Name, check.Equals, "root")
-	c.Assert(userContext.ACL.AuthConnectors, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.TrustedClusters, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.AppServers, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.DBServers, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.KubeServers, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Events, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Sessions, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Roles, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Users, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Tokens, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Nodes, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.AccessRequests, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Desktops, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.SSHLogins, check.DeepEquals, []string{"a", "b", "d"})
-	c.Assert(userContext.ACL.WindowsLogins, check.DeepEquals, []string{"a", "b", "d"})
-	c.Assert(userContext.AccessStrategy, check.DeepEquals, accessStrategy{
+	// test user name
+	require.Equal(t, "root", userContext.Name)
+	require.Empty(t, cmp.Diff(userContext.AccessStrategy, accessStrategy{
 		Type:   types.RequestStrategyOptional,
 		Prompt: "",
-	})
-	c.Assert(userContext.ACL.Billing, check.DeepEquals, denied)
-	c.Assert(userContext.ACL.Clipboard, check.Equals, true)
-	c.Assert(userContext.ACL.DesktopSessionRecording, check.Equals, true)
+	}))
+	require.Equal(t, types.PasswordState_PASSWORD_STATE_SET, userContext.PasswordSate)
 
 	// test local auth type
-	c.Assert(userContext.AuthType, check.Equals, authLocal)
+	require.Equal(t, authLocal, userContext.AuthType)
 
 	// test sso auth type
 	user.Spec.GithubIdentities = []types.ExternalIdentity{{ConnectorID: "foo", Username: "bar"}}
-	userContext, err = NewUserContext(user, roleSet, proto.Features{}, true)
-	c.Assert(err, check.IsNil)
-	c.Assert(userContext.AuthType, check.Equals, authSSO)
+	userContext, err = NewUserContext(user, roleSet, proto.Features{}, true, false)
+	require.NoError(t, err)
+	require.Equal(t, authSSO, userContext.AuthType)
 
-	userContext, err = NewUserContext(user, roleSet, proto.Features{Cloud: true}, true)
-	c.Assert(err, check.IsNil)
-	c.Assert(userContext.ACL.Billing, check.DeepEquals, access{true, true, false, false, false})
-
-	// test that desktopRecordingEnabled being false overrides the roleSet.RecordDesktopSession() returning true
-	userContext, err = NewUserContext(user, roleSet, proto.Features{}, false)
-	c.Assert(err, check.IsNil)
-	c.Assert(userContext.ACL.DesktopSessionRecording, check.Equals, false)
+	// test sso auth type for users with the CreatedBy.Connector field set.
+	// Eg users import from okta do not have any <IdP>Identities, so the CreatedBy.Connector must be checked.
+	userCreatedExternally := &types.UserV2{
+		Metadata: types.Metadata{
+			Name: "root",
+		},
+		Status: types.UserStatusV2{
+			PasswordState: types.PasswordState_PASSWORD_STATE_SET,
+		},
+		Spec: types.UserSpecV2{
+			CreatedBy: types.CreatedBy{
+				Connector: &types.ConnectorRef{},
+			},
+		},
+	}
+	userContext, err = NewUserContext(userCreatedExternally, roleSet, proto.Features{}, true, false)
+	require.NoError(t, err)
+	require.Equal(t, authSSO, userContext.AuthType)
 }
 
-func (s *UserContextSuite) TestNewUserContextCloud(c *check.C) {
+func TestNewUserContextCloud(t *testing.T) {
+	t.Parallel()
+
 	user := &types.UserV2{
 		Metadata: types.Metadata{
 			Name: "root",
 		},
 	}
 
-	role := &types.RoleV5{}
+	role := &types.RoleV6{}
 	role.SetNamespaces(types.Allow, []string{"*"})
-	role.SetRules(types.Allow, []types.Rule{
-		{
-			Resources: []string{"*"},
-			Verbs:     services.RW(),
-		},
-	})
-
-	role.SetLogins(types.Allow, []string{"a", "b"})
-	role.SetLogins(types.Deny, []string{"c"})
-	role.SetWindowsLogins(types.Allow, []string{"a", "b"})
-	role.SetWindowsLogins(types.Deny, []string{"c"})
 
 	roleSet := []types.Role{role}
 
-	allowed := access{true, true, true, true, true}
+	userContext, err := NewUserContext(user, roleSet, proto.Features{Cloud: true}, true, false)
+	require.NoError(t, err)
 
-	userContext, err := NewUserContext(user, roleSet, proto.Features{Cloud: true}, true)
-	c.Assert(err, check.IsNil)
-
-	c.Assert(userContext.Name, check.Equals, "root")
-	c.Assert(userContext.ACL.AuthConnectors, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.TrustedClusters, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.AppServers, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.DBServers, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.KubeServers, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Events, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Sessions, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Roles, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Users, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Tokens, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Nodes, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.AccessRequests, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.SSHLogins, check.DeepEquals, []string{"a", "b"})
-	c.Assert(userContext.ACL.WindowsLogins, check.DeepEquals, []string{"a", "b"})
-	c.Assert(userContext.AccessStrategy, check.DeepEquals, accessStrategy{
+	require.Equal(t, "root", userContext.Name)
+	require.Empty(t, cmp.Diff(userContext.AccessStrategy, accessStrategy{
 		Type:   types.RequestStrategyOptional,
 		Prompt: "",
-	})
-	c.Assert(userContext.ACL.Clipboard, check.Equals, true)
-	c.Assert(userContext.ACL.DesktopSessionRecording, check.Equals, true)
-
-	// cloud-specific asserts
-	c.Assert(userContext.ACL.Billing, check.DeepEquals, allowed)
-	c.Assert(userContext.ACL.Desktops, check.DeepEquals, allowed)
+	}))
 }

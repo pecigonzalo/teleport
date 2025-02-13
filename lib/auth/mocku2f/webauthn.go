@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mocku2f
 
@@ -23,18 +25,19 @@ import (
 	"encoding/binary"
 	"encoding/json"
 
-	"github.com/duo-labs/webauthn/protocol"
-	"github.com/duo-labs/webauthn/protocol/webauthncose"
 	"github.com/fxamacker/cbor/v2"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/gravitational/trace"
 
 	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
 	wancli "github.com/gravitational/teleport/lib/auth/webauthncli"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 )
 
 // SignAssertion signs a WebAuthn assertion following the
 // U2F-compat-getAssertion algorithm.
-func (muk *Key) SignAssertion(origin string, assertion *wanlib.CredentialAssertion) (*wanlib.CredentialAssertionResponse, error) {
+func (muk *Key) SignAssertion(origin string, assertion *wantypes.CredentialAssertion) (*wantypes.CredentialAssertionResponse, error) {
 	// Reference:
 	// https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#u2f-authenticatorGetAssertion-interoperability
 
@@ -52,7 +55,7 @@ func (muk *Key) SignAssertion(origin string, assertion *wanlib.CredentialAsserti
 
 	// Use RPID or App ID?
 	appID := assertion.Response.RelyingPartyID
-	if value, ok := assertion.Response.Extensions[wanlib.AppIDExtension]; !muk.PreferRPID && ok {
+	if value, ok := assertion.Response.Extensions[wantypes.AppIDExtension]; !muk.PreferRPID && ok {
 		if appID, ok = value.(string); !ok {
 			return nil, trace.BadParameter("u2f app ID has unexpected type: %T", value)
 		}
@@ -76,9 +79,15 @@ func (muk *Key) SignAssertion(origin string, assertion *wanlib.CredentialAsserti
 		return nil, trace.Wrap(err)
 	}
 
-	return &wanlib.CredentialAssertionResponse{
-		PublicKeyCredential: wanlib.PublicKeyCredential{
-			Credential: wanlib.Credential{
+	// If passwordless, then relay our WebAuthn UserHandle.
+	var userHandle []byte
+	if len(assertion.Response.AllowedCredentials) == 0 && len(muk.UserHandle) > 0 {
+		userHandle = muk.UserHandle
+	}
+
+	return &wantypes.CredentialAssertionResponse{
+		PublicKeyCredential: wantypes.PublicKeyCredential{
+			Credential: wantypes.Credential{
 				ID:   base64.RawURLEncoding.EncodeToString(muk.KeyHandle),
 				Type: string(protocol.PublicKeyCredentialType),
 			},
@@ -86,20 +95,21 @@ func (muk *Key) SignAssertion(origin string, assertion *wanlib.CredentialAsserti
 			// Mimic browsers and don't set the output AppID extension, even if we
 			// used it.
 		},
-		AssertionResponse: wanlib.AuthenticatorAssertionResponse{
-			AuthenticatorResponse: wanlib.AuthenticatorResponse{
+		AssertionResponse: wantypes.AuthenticatorAssertionResponse{
+			AuthenticatorResponse: wantypes.AuthenticatorResponse{
 				ClientDataJSON: ccd,
 			},
 			AuthenticatorData: res.AuthData,
 			// Signature starts after user presence (1byte) and counter (4 bytes).
-			Signature: res.SignData[5:],
+			Signature:  res.SignData[5:],
+			UserHandle: userHandle,
 		},
 	}, nil
 }
 
 // SignCredentialCreation signs a WebAuthn credential creation request following
 // the U2F-compat-makeCredential algorithm.
-func (muk *Key) SignCredentialCreation(origin string, cc *wanlib.CredentialCreation) (*wanlib.CredentialCreationResponse, error) {
+func (muk *Key) SignCredentialCreation(origin string, cc *wantypes.CredentialCreation) (*wantypes.CredentialCreationResponse, error) {
 	// Reference:
 	// https: // fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#fig-u2f-compat-makeCredential
 
@@ -125,7 +135,11 @@ func (muk *Key) SignCredentialCreation(origin string, cc *wanlib.CredentialCreat
 	if aa := cc.Response.AuthenticatorSelection.AuthenticatorAttachment; aa == protocol.Platform {
 		return nil, trace.BadParameter("platform attachment required by authenticator selection")
 	}
-	if rrk := cc.Response.AuthenticatorSelection.RequireResidentKey; rrk != nil && *rrk && !muk.AllowResidentKey {
+	rrk, err := cc.RequireResidentKey()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if rrk && !muk.AllowResidentKey {
 		return nil, trace.BadParameter("resident key required by authenticator selection")
 	}
 	if uv := cc.Response.AuthenticatorSelection.UserVerification; uv == protocol.VerificationRequired && !muk.SetUV {
@@ -181,16 +195,31 @@ func (muk *Key) SignCredentialCreation(origin string, cc *wanlib.CredentialCreat
 		return nil, trace.Wrap(err)
 	}
 
-	return &wanlib.CredentialCreationResponse{
-		PublicKeyCredential: wanlib.PublicKeyCredential{
-			Credential: wanlib.Credential{
+	// Save the WebAuthn UserHandle if this is a resident key creation.
+	if rrk && len(cc.Response.User.ID) > 0 && len(muk.UserHandle) == 0 {
+		muk.UserHandle = cc.Response.User.ID
+	}
+
+	var exts *wantypes.AuthenticationExtensionsClientOutputs
+	if muk.ReplyWithCredProps {
+		exts = &wantypes.AuthenticationExtensionsClientOutputs{
+			CredProps: &wantypes.CredentialPropertiesOutput{
+				RK: true,
+			},
+		}
+	}
+
+	return &wantypes.CredentialCreationResponse{
+		PublicKeyCredential: wantypes.PublicKeyCredential{
+			Credential: wantypes.Credential{
 				ID:   base64.RawURLEncoding.EncodeToString(muk.KeyHandle),
 				Type: string(protocol.PublicKeyCredentialType),
 			},
-			RawID: muk.KeyHandle,
+			RawID:      muk.KeyHandle,
+			Extensions: exts,
 		},
-		AttestationResponse: wanlib.AuthenticatorAttestationResponse{
-			AuthenticatorResponse: wanlib.AuthenticatorResponse{
+		AttestationResponse: wantypes.AuthenticatorAttestationResponse{
+			AuthenticatorResponse: wantypes.AuthenticatorResponse{
 				ClientDataJSON: ccd,
 			},
 			AttestationObject: attObj,

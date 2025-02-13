@@ -1,34 +1,37 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"errors"
 	"fmt"
+
+	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
 )
 
 // ValidateTrustedCluster checks and sets Trusted Cluster defaults
 func ValidateTrustedCluster(tc types.TrustedCluster, allowEmptyRolesOpts ...bool) error {
-	if err := tc.CheckAndSetDefaults(); err != nil {
+	if err := CheckAndSetDefaults(tc); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -102,6 +105,7 @@ func MapRoles(r types.RoleMap, remoteRoles []string) ([]string, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
+	seen := make(map[string]struct{})
 	var outRoles []string
 	// when no remote roles are specified, assume that
 	// there is a single empty remote role (that should match wildcards)
@@ -122,10 +126,15 @@ func MapRoles(r types.RoleMap, remoteRoles []string) ([]string, error) {
 				case err == nil:
 					// empty replacement can occur when $2 expand refers
 					// to non-existing capture group in match expression
-					if replacement != "" {
-						outRoles = append(outRoles, replacement)
+					if replacement == "" {
+						continue
 					}
-				case trace.IsNotFound(err):
+					if _, ok := seen[replacement]; ok {
+						continue
+					}
+					seen[replacement] = struct{}{}
+					outRoles = append(outRoles, replacement)
+				case errors.Is(err, utils.ErrReplaceRegexNotFound):
 					continue
 				default:
 					return nil, trace.Wrap(err)
@@ -149,7 +158,7 @@ func UnmarshalTrustedCluster(bytes []byte, opts ...MarshalOption) (types.Trusted
 	}
 
 	if err := utils.FastUnmarshal(bytes, &trustedCluster); err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 	// DELETE IN(7.0)
 	// temporarily allow to read trusted cluster with no role map
@@ -158,8 +167,8 @@ func UnmarshalTrustedCluster(bytes []byte, opts ...MarshalOption) (types.Trusted
 	if err = ValidateTrustedCluster(&trustedCluster, allowEmptyRoleMap); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if cfg.ID != 0 {
-		trustedCluster.SetResourceID(cfg.ID)
+	if cfg.Revision != "" {
+		trustedCluster.SetRevision(cfg.Revision)
 	}
 	if !cfg.Expires.IsZero() {
 		trustedCluster.SetExpiry(cfg.Expires)
@@ -184,14 +193,7 @@ func MarshalTrustedCluster(trustedCluster types.TrustedCluster, opts ...MarshalO
 
 	switch trustedCluster := trustedCluster.(type) {
 	case *types.TrustedClusterV2:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *trustedCluster
-			copy.SetResourceID(0)
-			trustedCluster = &copy
-		}
-		return utils.FastMarshal(trustedCluster)
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, trustedCluster))
 	default:
 		return nil, trace.BadParameter("unrecognized trusted cluster version %T", trustedCluster)
 	}

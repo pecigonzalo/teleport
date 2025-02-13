@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mfajson
 
@@ -22,31 +24,38 @@ import (
 	"github.com/gravitational/trace"
 
 	authproto "github.com/gravitational/teleport/api/client/proto"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
-	"github.com/gravitational/teleport/lib/defaults"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
+	"github.com/gravitational/teleport/lib/client"
 )
+
+// TODO(Joerger): DELETE IN v19.0.0 and use client.MFAChallengeResponse instead.
+// Before v17, the WebUI sends a flattened webauthn response instead of a full
+// MFA challenge response. Newer WebUI versions v17+ will send both for
+// backwards compatibility.
+type challengeResponse struct {
+	client.MFAChallengeResponse
+	*wantypes.CredentialAssertionResponse
+}
 
 // Decode parses a JSON-encoded MFA authentication response.
 // Only webauthn (type="n") is currently supported.
 func Decode(b []byte, typ string) (*authproto.MFAAuthenticateResponse, error) {
-	var resp *authproto.MFAAuthenticateResponse
-
-	switch typ {
-	case defaults.WebsocketWebauthnChallenge:
-		var webauthnResponse wanlib.CredentialAssertionResponse
-		if err := json.Unmarshal(b, &webauthnResponse); err != nil {
-			return nil, trace.Wrap(err)
-		}
-		resp = &authproto.MFAAuthenticateResponse{
-			Response: &authproto.MFAAuthenticateResponse_Webauthn{
-				Webauthn: wanlib.CredentialAssertionResponseToProto(&webauthnResponse),
-			},
-		}
-
-	default:
-		return nil, trace.BadParameter(
-			"received type %v, expected %v (WebAuthn)", typ, defaults.WebsocketWebauthnChallenge)
+	var resp challengeResponse
+	if err := json.Unmarshal(b, &resp); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	return resp, nil
+	// Move flattened webauthn response into resp.
+	resp.MFAChallengeResponse.WebauthnAssertionResponse = resp.CredentialAssertionResponse
+
+	protoResp, err := resp.GetOptionalMFAResponseProtoReq()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if protoResp == nil {
+		return nil, trace.BadParameter("invalid MFA response from web")
+	}
+
+	return protoResp, trace.Wrap(err)
 }

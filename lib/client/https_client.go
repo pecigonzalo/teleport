@@ -1,19 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
@@ -23,44 +24,46 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/gravitational/teleport"
+	"github.com/gravitational/roundtrip"
+	"github.com/gravitational/trace"
+	"golang.org/x/net/http/httpproxy"
+
+	tracehttp "github.com/gravitational/teleport/api/observability/tracing/http"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/httplib"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/roundtrip"
-	"github.com/gravitational/trace"
 )
 
 func NewInsecureWebClient() *http.Client {
-	// Because Teleport clients can't be configured (yet), they take the default
-	// list of cipher suites from Go.
-	tlsConfig := utils.TLSConfig(nil)
-	tlsConfig.InsecureSkipVerify = true
+	return newClient(true, nil, nil)
+}
 
+func newClient(insecure bool, pool *x509.CertPool, extraHeaders map[string]string) *http.Client {
 	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-		},
+		Transport: tracehttp.NewTransport(apiutils.NewHTTPRoundTripper(httpTransport(insecure, pool), extraHeaders)),
 	}
 }
 
-func newClientWithPool(pool *x509.CertPool) *http.Client {
+func httpTransport(insecure bool, pool *x509.CertPool) *http.Transport {
 	// Because Teleport clients can't be configured (yet), they take the default
 	// list of cipher suites from Go.
 	tlsConfig := utils.TLSConfig(nil)
+	tlsConfig.InsecureSkipVerify = insecure
 	tlsConfig.RootCAs = pool
 
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
+	return &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
 		},
 	}
 }
 
 func NewWebClient(url string, opts ...roundtrip.ClientParam) (*WebClient, error) {
 	opts = append(opts, roundtrip.SanitizerEnabled(true))
-	clt, err := roundtrip.NewClient(url, teleport.WebAPIVersion, opts...)
+	// We do not add the version prefix since web api endpoints will contain
+	// differing version prefixes.
+	clt, err := roundtrip.NewClient(url, "" /* version prefix */, opts...)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -75,19 +78,24 @@ type WebClient struct {
 
 // PostJSONWithFallback serializes an object to JSON and attempts to execute a POST
 // using HTTPS, and then fall back to plain HTTP under certain, very specific circumstances.
-//  * The caller must specifically allow it via the allowHTTPFallback parameter, and
-//  * The target host must resolve to the loopback address.
+//   - The caller must specifically allow it via the allowHTTPFallback parameter, and
+//   - The target host must resolve to the loopback address.
+//
 // If these conditions are not met, then the plain-HTTP fallback is not allowed,
 // and a the HTTPS failure will be considered final.
-//
 func (w *WebClient) PostJSONWithFallback(ctx context.Context, endpoint string, val interface{}, allowHTTPFallback bool) (*roundtrip.Response, error) {
 	// First try HTTPS and see how that goes
-	log.Debugf("Attempting %s", endpoint)
+	log.DebugContext(ctx, "Attempting request", "endpoint", endpoint)
 	resp, httpsErr := w.Client.PostJSON(ctx, endpoint, val)
 	if httpsErr == nil {
 		// If all went well, then we don't need to do anything else - just return
 		// that response
 		return httplib.ConvertResponse(resp, httpsErr)
+	}
+
+	// If we're not allowed to try plain HTTP, bail out with whatever error we have.
+	if !allowHTTPFallback {
+		return nil, trace.Wrap(httpsErr)
 	}
 
 	// Parse out the endpoint into its constituent parts. We will need the
@@ -98,17 +106,18 @@ func (w *WebClient) PostJSONWithFallback(ctx context.Context, endpoint string, v
 		return nil, trace.Wrap(err)
 	}
 
-	// If we're not allowed to try plain HTTP, bail out with whatever error we have.
+	// If we're allowed to try plain HTTP, but we're not on the loopback address,
+	// bail out with whatever error we have.
 	// Note that we're only allowed to try plain HTTP on the loopback address, even
-	// if the caller says its OK
-	if !(allowHTTPFallback && apiutils.IsLoopback(u.Host)) {
+	// if the caller says its OK.
+	if !apiutils.IsLoopback(u.Host) {
 		return nil, trace.Wrap(httpsErr)
 	}
 
 	// re-write the endpoint to try HTTP
 	u.Scheme = "http"
 	endpoint = u.String()
-	log.Warnf("Request for %s/%s falling back to PLAIN HTTP", u.Host, u.Path)
+	log.WarnContext(ctx, "Request for falling back to PLAIN HTTP", "endpoint", endpoint)
 	return httplib.ConvertResponse(w.Client.PostJSON(ctx, endpoint, val))
 }
 

@@ -1,26 +1,30 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either exptypes.WhereExprs or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
+	"github.com/vulcand/predicate"
 
 	"github.com/gravitational/teleport/api/types"
 )
@@ -154,7 +158,7 @@ func TestParserForIdentifierSubcondition(t *testing.T) {
 			}}))
 }
 
-func TestNewResourceParser(t *testing.T) {
+func TestNewResourceExpression(t *testing.T) {
 	t.Parallel()
 	resource, err := types.NewServerWithLabels("test-name", types.KindNode, types.ServerSpecV2{
 		Hostname: "test-hostname",
@@ -170,14 +174,11 @@ func TestNewResourceParser(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	parser, err := NewResourceParser(resource)
-	require.NoError(t, err)
-
 	t.Run("matching expressions", func(t *testing.T) {
 		t.Parallel()
 		exprs := []string{
 			// Test equals.
-			"equals(name, `test-name`)",
+			"equals(name, `test-hostname`)",
 			`equals(resource.metadata.name, "test-name")`,
 			`equals(labels.env, "prod")`,
 			`equals(labels["env"], "prod")`,
@@ -190,6 +191,11 @@ func TestNewResourceParser(t *testing.T) {
 			`search("os", "mac", "prod")`,
 			`search()`,
 			`!search("_")`,
+			// Test hasPrefix.
+			`hasPrefix(name, "")`,
+			`hasPrefix(name, "test-h")`,
+			`!hasPrefix(name, "foo")`,
+			`hasPrefix(resource.metadata.labels["env"], "pro")`,
 			// Test exists.
 			`exists(labels.env)`,
 			`!exists(labels.undefined)`,
@@ -199,18 +205,22 @@ func TestNewResourceParser(t *testing.T) {
 			`labels.env == "prod"`,
 			`labels["env"] == "prod"`,
 			`labels["env"] != "_"`,
-			`name == "test-name"`,
+			`name == "test-hostname"`,
 			// Test combos.
-			`labels.os == "mac" && name == "test-name" && search("v8")`,
+			`labels.os == "mac" && name == "test-hostname" && search("v8")`,
 			`exists(labels.env) && labels["env"] != "qa"`,
 			`search("does", "not", "exist") || resource.spec.addr == "_" || labels.version == "v8"`,
+			`hasPrefix(labels.os, "m") && !hasPrefix(labels.env, "dev") && name == "test-hostname"`,
 			// Test operator precedence
 			`exists(labels.env) || (exists(labels.os) && labels.os != "mac")`,
 			`exists(labels.env) || exists(labels.os) && labels.os != "mac"`,
 		}
 		for _, expr := range exprs {
 			t.Run(expr, func(t *testing.T) {
-				match, err := parser.EvalBoolPredicate(expr)
+				parser, err := NewResourceExpression(expr)
+				require.NoError(t, err)
+
+				match, err := parser.Evaluate(resource)
 				require.NoError(t, err)
 				require.True(t, match)
 			})
@@ -231,21 +241,23 @@ func TestNewResourceParser(t *testing.T) {
 			`equals(resource.metadata.labels["env"], "wrong-value")`,
 			`equals(resource.spec.hostname, "wrong-value")`,
 			`search("mac", "not-found")`,
+			`hasPrefix(name, "x")`,
 		}
 		for _, expr := range exprs {
 			t.Run(expr, func(t *testing.T) {
-				match, err := parser.EvalBoolPredicate(expr)
+				parser, err := NewResourceExpression(expr)
+				require.NoError(t, err)
+
+				match, err := parser.Evaluate(resource)
 				require.NoError(t, err)
 				require.False(t, match)
 			})
 		}
 	})
 
-	t.Run("error in expressions", func(t *testing.T) {
+	t.Run("fail to parse", func(t *testing.T) {
 		t.Parallel()
 		exprs := []string{
-			`name.toomanyfield`,
-			`labels.env.toomanyfield`,
 			`!name`,
 			`name ==`,
 			`name &`,
@@ -258,7 +270,6 @@ func TestNewResourceParser(t *testing.T) {
 			`|`,
 			`&`,
 			`.`,
-			`equals(resource.incorrect.selector, "_")`,
 			`equals(invalidIdentifier)`,
 			`equals(labels.env)`,
 			`equals(labels.env, "too", "many")`,
@@ -267,14 +278,218 @@ func TestNewResourceParser(t *testing.T) {
 			`exists(labels.env, "too", "many")`,
 			`search(1,2)`,
 			`"just-string"`,
+			`hasPrefix(1, 2)`,
+			`hasPrefix(name)`,
+			`hasPrefix(name, 1)`,
+			`hasPrefix(name, "too", "many")`,
 			"",
 		}
 		for _, expr := range exprs {
 			t.Run(expr, func(t *testing.T) {
-				match, err := parser.EvalBoolPredicate(expr)
+				expression, err := NewResourceExpression(expr)
+				require.Error(t, err)
+				require.Nil(t, expression)
+			})
+		}
+	})
+
+	t.Run("fail to evaluate", func(t *testing.T) {
+		t.Parallel()
+		exprs := []string{
+			`name.toomanyfield`,
+			`labels.env.toomanyfield`,
+			`equals(resource.incorrect.selector, "_")`,
+		}
+		for _, expr := range exprs {
+			t.Run(expr, func(t *testing.T) {
+				parser, err := NewResourceExpression(expr)
+				require.NoError(t, err)
+
+				match, err := parser.Evaluate(resource)
 				require.Error(t, err)
 				require.False(t, match)
 			})
 		}
 	})
+}
+
+func TestResourceExpression_NameIdentifier(t *testing.T) {
+	t.Parallel()
+
+	// Server resource should use hostname when using name identifier.
+	server, err := types.NewServerWithLabels("server-name", types.KindNode, types.ServerSpecV2{
+		Hostname: "server-hostname",
+	}, nil)
+	require.NoError(t, err)
+
+	parser, err := NewResourceExpression(`name == "server-hostname"`)
+	require.NoError(t, err)
+
+	match, err := parser.Evaluate(server)
+	require.NoError(t, err)
+	require.True(t, match)
+
+	// Other resource types should use the default metadata name.
+	desktop, err := types.NewWindowsDesktopV3("desktop-name", nil, types.WindowsDesktopSpecV3{
+		Addr: "some-address",
+	})
+	require.NoError(t, err)
+
+	parser, err = NewResourceExpression(`name == "desktop-name"`)
+	require.NoError(t, err)
+
+	match, err = parser.Evaluate(desktop)
+	require.NoError(t, err)
+	require.True(t, match)
+}
+
+func TestResourceParserLabelExpansion(t *testing.T) {
+	t.Parallel()
+
+	// Server resource should use hostname when using name identifier.
+	server, err := types.NewServerWithLabels("server-name", types.KindNode, types.ServerSpecV2{
+		Hostname: "server-hostname",
+	}, map[string]string{"ip": "1.2.3.11,1.2.3.101,1.2.3.1", "foo": "bar"})
+	require.NoError(t, err)
+
+	tests := []struct {
+		expression string
+		assertion  require.BoolAssertionFunc
+	}{
+		{
+			expression: `contains(split(labels["ip"], ","), "1.2.3.1")`,
+			assertion:  require.True,
+		},
+		{
+			expression: `contains(split(labels.ip, ","), "1.2.3.1",)`,
+			assertion:  require.True,
+		},
+		{
+			expression: `contains(split(labels["ip"], ","),  "1.2.3.2")`,
+			assertion:  require.False,
+		},
+		{
+			expression: `contains(split(labels.llama, ","),  "1.2.3.2")`,
+			assertion:  require.False,
+		},
+		{
+			expression: `contains(split(labels.ip, ","), "1.2.3.2")`,
+			assertion:  require.False,
+		},
+		{
+			expression: `contains(split(labels.foo, ","), "bar")`,
+			assertion:  require.True,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			expression, err := NewResourceExpression(test.expression)
+			require.NoError(t, err)
+
+			match, err := expression.Evaluate(server)
+			require.NoError(t, err)
+			test.assertion(t, match)
+		})
+	}
+}
+
+func BenchmarkContains(b *testing.B) {
+	server, err := types.NewServerWithLabels("server-name", types.KindNode, types.ServerSpecV2{
+		Hostname: "server-hostname",
+	}, map[string]string{"ip": "1.2.3.11|1.2.3.101|1.2.3.1"})
+	require.NoError(b, err)
+
+	expression, err := NewResourceExpression(`contains(split(labels["ip"], "|"), "1.2.3.1")`)
+	require.NoError(b, err)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		match, err := expression.Evaluate(server)
+		require.NoError(b, err)
+		require.True(b, match)
+	}
+}
+
+// TestParserHostCertContext tests set functions with a custom host cert
+// context.
+func TestParserHostCertContext(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		desc       string
+		principals []string
+		positive   []string
+		negative   []string
+	}{
+		{
+			desc:       "simple",
+			principals: []string{"foo.example.com"},
+			positive: []string{
+				`all_equal(host_cert.principals, "foo.example.com")`,
+				`is_subset(host_cert.principals, "a", "b", "foo.example.com")`,
+				`all_end_with(host_cert.principals, ".example.com")`,
+			},
+			negative: []string{
+				`all_equal(host_cert.principals, "foo")`,
+				`is_subset(host_cert.principals, "a", "b", "c")`,
+				`all_end_with(host_cert.principals, ".foo")`,
+			},
+		},
+		{
+			desc:       "complex",
+			principals: []string{"node.foo.example.com", "node.bar.example.com"},
+			positive: []string{
+				`all_end_with(host_cert.principals, ".example.com")`,
+				`all_end_with(host_cert.principals, ".example.com") && !all_end_with(host_cert.principals, ".baz.example.com")`,
+				`equals(host_cert.host_id, "") && is_subset(host_cert.principals, "node.bar.example.com", "node.foo.example.com", "node.baz.example.com")`,
+			},
+			negative: []string{
+				`all_equal(host_cert.principals, "node.foo.example.com")`,
+				`all_end_with(host_cert.principals, ".foo.example.com") || all_end_with(host_cert.principals, ".bar.example.com")`,
+				`is_subset(host_cert.principals, "node.bar.example.com")`,
+			},
+		},
+	} {
+		ctx := Context{
+			User: &types.UserV2{},
+			HostCert: &HostCertContext{
+				HostID:      "",
+				NodeName:    "foo",
+				Principals:  test.principals,
+				ClusterName: "example.com",
+				Role:        types.RoleNode,
+				TTL:         time.Minute * 20,
+			},
+		}
+		parser, err := NewWhereParser(&ctx)
+		require.NoError(t, err)
+
+		t.Run(test.desc, func(t *testing.T) {
+			t.Run("positive", func(t *testing.T) {
+				for _, pred := range test.positive {
+					expr, err := parser.Parse(pred)
+					require.NoError(t, err)
+
+					ret, ok := expr.(predicate.BoolPredicate)
+					require.True(t, ok)
+
+					require.True(t, ret(), pred)
+				}
+			})
+
+			t.Run("negative", func(t *testing.T) {
+				for _, pred := range test.negative {
+					expr, err := parser.Parse(pred)
+					require.NoError(t, err)
+
+					ret, ok := expr.(predicate.BoolPredicate)
+					require.True(t, ok)
+
+					require.False(t, ret(), pred)
+				}
+			})
+		})
+	}
 }

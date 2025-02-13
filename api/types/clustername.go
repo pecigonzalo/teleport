@@ -20,8 +20,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // ClusterName defines the name of the cluster. This is a configuration
@@ -73,14 +74,14 @@ func (c *ClusterNameV2) SetSubKind(sk string) {
 	c.SubKind = sk
 }
 
-// GetResourceID returns resource ID
-func (c *ClusterNameV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *ClusterNameV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *ClusterNameV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *ClusterNameV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the cluster.
@@ -130,7 +131,7 @@ func (c *ClusterNameV2) GetClusterID() string {
 
 // Clone performs a deep copy.
 func (c *ClusterNameV2) Clone() ClusterName {
-	return proto.Clone(c).(*ClusterNameV2)
+	return utils.CloneProtoMsg(c)
 }
 
 // setStaticFields sets static resource header and metadata fields.

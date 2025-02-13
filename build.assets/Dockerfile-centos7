@@ -1,39 +1,265 @@
-FROM centos:7
+# syntax=docker/dockerfile:1
+
+# Create an alias to the assets image. Ref: https://github.com/docker/for-mac/issues/2155
+ARG BUILDBOX_CENTOS7_ASSETS
+FROM ${BUILDBOX_CENTOS7_ASSETS} AS teleport-buildbox-centos7-assets
+
+## BASE ###################################################################
+
+FROM --platform=$BUILDPLATFORM centos:7 AS base
+
+# devtoolset-12 is only in CentOS buildlogs. The rpms are unsigned since they never were
+# published to the official CentOS SCL repos.
+ARG BUILDARCH
+ARG DEVTOOLSET
+ENV BUILDARCH=${BUILDARCH} \
+    DEVTOOLSET=${DEVTOOLSET}
+
+RUN if [ "${BUILDARCH}" = "arm64" ]; then export BUILDARCH="aarch64"; fi && \
+    cat <<EOF > /etc/yum.repos.d/${DEVTOOLSET}-build.repo
+[${DEVTOOLSET}-build]
+name=${DEVTOOLSET} - Build
+baseurl=https://buildlogs.centos.org/c7-${DEVTOOLSET}.${BUILDARCH}/
+gpgcheck=0
+enabled=1
+EOF
+
+# mirrorlist is no longer available since CentOS 7 EOL. The software collection
+# stuff for arm64 (aarch64) is in /altarch not /centos on vault.centos.org.
+# Make the fixup a script as it needs to be run multiple times as installing
+# and updating centos-release-scl-rh leaves the old unavailable URLs.
+# https://serverfault.com/a/1161847
+RUN cat <<EOF > /tmp/fix-yum-repo-list.sh
+#!/bin/sh
+sed -e 's/mirror.centos.org/vault.centos.org/g' \
+    -e 's/^#.*baseurl=http/baseurl=http/g' \
+    -e 's/^mirrorlist=http/#mirrorlist=http/g' \
+    -i /etc/yum.repos.d/*.repo
+if [ "$(uname -m)" = 'aarch64' ]; then
+    sed 's|centos/7/sclo|altarch/7/sclo|' -i /etc/yum.repos.d/*.repo
+fi
+EOF
+RUN chmod 755 /tmp/fix-yum-repo-list.sh && \
+    /tmp/fix-yum-repo-list.sh
+
+# Install required dependencies.
+RUN yum groupinstall -y 'Development Tools' && \
+    yum install -y epel-release && \
+    yum install -y centos-release-scl-rh && \
+    /tmp/fix-yum-repo-list.sh \
+    yum update -y && \
+    yum install -y \
+      ca-certificates \
+      centos-release-scl \
+      # Needed for Clang/LLVM
+      cmake3 \
+      curl-devel \
+      expat-devel  \
+      gettext-devel \
+      openssl-devel \
+      zlib-devel \
+      perl-CPAN \
+      perl-devel \
+      scl-utils \
+      wget && \
+    yum clean all && \
+    /tmp/fix-yum-repo-list.sh
+
+# As mentioned above, these packages are unsigned.
+RUN yum install --nogpgcheck -y \
+        ${DEVTOOLSET}-gcc \
+        ${DEVTOOLSET}-make && \
+    yum clean all
+
+# Needed for boring-rs
+ENV CMAKE=cmake3
+RUN ln -s /usr/bin/cmake3 /usr/local/bin/cmake
+
+## GIT2 ###################################################################
+
+# git2 packages are not available on ARM64, so we need to build it from source.
+FROM --platform=$BUILDPLATFORM base AS git2
+
+# Install additional required dependencies.
+RUN yum-builddep -y git
+
+RUN git clone --depth=1 https://github.com/git/git.git -b v2.42.0 && \
+    cd git && \
+    [ "$(git rev-parse HEAD)" = '43c8a30d150ecede9709c1f2527c8fba92c65f40' ] && \
+    scl enable ${DEVTOOLSET} "make configure && \
+    ./configure --prefix=/usr/local && \
+    make -j"$(nproc)" all && \
+    DESTDIR=/opt/git make install"
+
+## LIBFIDO2 ###################################################################
+
+# Build libfido2 separately for isolation, speed and flexibility.
+FROM --platform=$BUILDPLATFORM base AS libfido2
+
+# Install additional required dependencies.
+RUN yum install -y \
+        libudev-devel \
+        perl-Digest-SHA \
+        perl-IPC-Cmd \
+        zlib-devel && \
+    yum clean all
+
+# Install libudev-zero.
+# libudev-zero replaces systemd's libudev.
+RUN git clone --depth=1 https://github.com/illiliti/libudev-zero.git -b 1.0.3 && \
+    cd libudev-zero && \
+    [ "$(git rev-parse HEAD)" = 'ee32ac5f6494047b9ece26e7a5920650cdf46655' ] && \
+    make install-static LIBDIR='$(PREFIX)/lib64'
+
+# Install libcbor.
+RUN git clone --depth=1 https://github.com/PJK/libcbor.git -b v0.11.0 && \
+    cd libcbor && \
+    [ "$(git rev-parse HEAD)" = '170bee2b82cdb7b2ed25af301f62cb6efdd40ec1' ] && \
+    cmake3 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DWITH_EXAMPLES=OFF . && \
+    make && \
+    make install
+
+# Install openssl.
+# Specific install arguments used to skip docs.
+# Note that FIPS is enabled as part of this build, but it is unused without the
+# necessary configuration (which is included as part of the separate FIPS buildbox).
+RUN git clone --depth=1 https://github.com/openssl/openssl.git -b openssl-3.0.16 && \
+    cd openssl && \
+    [ "$(git rev-parse HEAD)" = 'fa1e5dfb142bb1c26c3c38a10aafa7a095df52e5' ] && \
+    ./config enable-fips --release -fPIC --libdir=/usr/local/lib64 && \
+    make -j"$(nproc)" && \
+    make install_sw install_ssldirs install_fips
+# Necessary for libfido2 to find the correct libcrypto.
+ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig"
+
+# Install libfido2.
+# Depends on libcbor, libcrypto (OpenSSL 3.x), libudev and zlib-devel.
+# Linked so `make build/tsh` finds the library where it expects it.
+RUN git clone --depth=1 https://github.com/Yubico/libfido2.git -b 1.15.0 && \
+    cd libfido2 && \
+    [ "$(git rev-parse HEAD)" = 'f87c19c9487c0131531314d9ccb475ea5325794e' ] && \
+    scl enable ${DEVTOOLSET} "\
+      CFLAGS=-pthread cmake3 \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_MANPAGES=OFF \
+          -DBUILD_TOOLS=OFF \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DCMAKE_BUILD_TYPE=Release . && \
+      grep 'CRYPTO_VERSION:INTERNAL=3\.0\.' CMakeCache.txt && \
+      make" && \
+    make install && \
+    make clean
+
+## LIBBPF #####################################################################
+
+FROM --platform=$BUILDPLATFORM base AS libbpf
+
+# Install additional required dependencies.
+RUN yum install -y \
+        elfutils-libelf-devel && \
+    yum clean all
+
+# Install custom package with -fPIC.
+COPY --from=teleport-buildbox-centos7-assets /opt/custom-packages /opt/custom-packages
+RUN if [ "${BUILDARCH}" = "arm64" ]; then export BUILDARCH="aarch64"; fi && \
+    rpm -ivh /opt/custom-packages/elfutils-libelf-devel-static-*.el*.${BUILDARCH}.rpm && \
+    rm -rf /opt/custom-packages
+
+# Install libbpf - compile with a newer GCC. The one installed by default is not able to compile it.
+# BUILD_STATIC_ONLY - builds only static libraries without shared ones
+# EXTRA_CFLAGS - additional CFLAGS to pass to the compiler. fPIC is required so the library code can be moved around in memory
+# DESTDIR - where to install the library
+# V=1 - verbose build
+ARG LIBBPF_VERSION
+RUN mkdir -p /opt && cd /opt && \
+    curl -fsSL https://github.com/libbpf/libbpf/archive/refs/tags/v${LIBBPF_VERSION}.tar.gz | tar xz && \
+    cd /opt/libbpf-${LIBBPF_VERSION}/src && \
+    scl enable ${DEVTOOLSET} "BUILD_STATIC_ONLY=y EXTRA_CFLAGS=-fPIC DESTDIR=/opt/libbpf V=1 make install install_uapi_headers"
+
+## LIBPCSCLITE #####################################################################
+
+FROM --platform=$BUILDPLATFORM base AS libpcsclite
+
+# Install required dependencies.
+RUN yum install -y \
+        autoconf-archive \
+        libudev-devel && \
+    yum clean all
+
+# Install libpcsclite - compile with a newer GCC. The one installed by default is not able to compile it.
+ARG LIBPCSCLITE_VERSION
+RUN git clone --depth=1 https://github.com/gravitational/PCSC.git -b ${LIBPCSCLITE_VERSION} && \
+    cd PCSC && \
+    ./bootstrap && \
+    ./configure --enable-static --with-pic --disable-libsystemd && \
+    scl enable ${DEVTOOLSET} "make" && \
+    make install
+
+## BUILDBOX ###################################################################
+# Build the `buildbox` target to build the non-fips buildbox
+# ============================================================================
+
+FROM base AS buildbox
 
 ENV LANGUAGE=en_US.UTF-8 \
     LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     LC_CTYPE=en_US.UTF-8
 
-ARG GOLANG_VERSION
-ARG RUST_VERSION
+ARG BUILDARCH
+ARG DEVTOOLSET
+ARG TARGETARCH
 
 ARG UID
 ARG GID
 RUN (groupadd ci --gid=$GID -o && useradd ci --uid=$UID --gid=$GID --create-home --shell=/bin/sh && \
      mkdir -p -m0700 /var/lib/teleport && chown -R ci /var/lib/teleport)
 
-# Install dev tools (make, etc) and a Perl package needed to build OpenSSL.
-RUN yum groupinstall -y "Development Tools"
-RUN yum install -y pam-devel net-tools tree git zip libatomic perl-IPC-Cmd && \
-    yum clean all
+# Install additional required dependencies.
+RUN yum install -y \
+    elfutils-libelf-devel \
+    net-tools \
+    # required by Teleport PAM support
+    pam-devel \
+    perl-IPC-Cmd \
+    tree \
+    # used by our Makefile
+    which \
+    zip \
+    zlib-devel && \
+    yum clean all && \
+    localedef -c -i en_US -f UTF-8 en_US.UTF-8
 
-# Install etcd.
-RUN (curl -L https://github.com/coreos/etcd/releases/download/v3.3.9/etcd-v3.3.9-linux-amd64.tar.gz | tar -xz && \
-     cp etcd-v3.3.9-linux-amd64/etcd* /bin/)
+# Install custom packages with -fPIC.
+COPY --from=teleport-buildbox-centos7-assets /opt/custom-packages /opt/custom-packages
+RUN if [ "${BUILDARCH}" = "arm64" ]; then export BUILDARCH="aarch64"; fi && \
+    rpm -ivh /opt/custom-packages/elfutils-libelf-devel-static-*.el*.${BUILDARCH}.rpm \
+        /opt/custom-packages/zlib-static-*.el*.${BUILDARCH}.rpm && \
+    rm -rf /opt/custom-packages
+
+# Override the old git in /usr/local installed by yum. We need git 2+ on GitHub Actions.
+COPY --from=git2 /opt/git /
 
 # Install Go.
-RUN mkdir -p /opt && cd /opt && curl https://storage.googleapis.com/golang/$GOLANG_VERSION.linux-amd64.tar.gz | tar xz && \
+ARG GOLANG_VERSION
+RUN mkdir -p /opt && cd /opt && curl -fsSL https://storage.googleapis.com/golang/${GOLANG_VERSION}.linux-${TARGETARCH}.tar.gz | tar xz && \
     mkdir -p /go/src/github.com/gravitational/teleport && \
     chmod a+w /go && \
     chmod a+w /var/lib && \
     /opt/go/bin/go version
+ENV GOPATH="/go" \
+    GOROOT="/opt/go" \
+    PATH="/opt/llvm/bin:$PATH:/opt/go/bin:/go/bin:/go/src/github.com/gravitational/teleport/build"
 
 # Install PAM module and policies for testing.
 COPY pam/ /opt/pam_teleport/
 RUN make -C /opt/pam_teleport install
 
 # Install Rust.
+ARG RUST_VERSION
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH \
@@ -44,17 +270,120 @@ RUN mkdir -p $RUSTUP_HOME && chmod a+w $RUSTUP_HOME && \
 
 RUN chmod a-w /
 
+# Install Rust using the ci user, as that is the user that
+# will run builds using the Rust toolchains we install here.
 USER ci
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_VERSION && \
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_VERSION && \
     rustup --version && \
     cargo --version && \
     rustc --version && \
-    rustup component add --toolchain $RUST_VERSION-x86_64-unknown-linux-gnu rustfmt clippy && \
-    cargo install cbindgen
+    rustup target add wasm32-unknown-unknown
 
-ENV GOPATH="/go" \
-    GOROOT="/opt/go" \
-    PATH="/opt/bin:$PATH:/opt/go/bin:/go/bin:/go/src/github.com/gravitational/teleport/build"
+# Install wasm-pack for targeting WebAssembly from Rust.
+ARG WASM_PACK_VERSION
+# scl enable is required to use the newer C compiler installed above. Without it, the build fails.
+RUN scl enable ${DEVTOOLSET} "cargo install wasm-pack --locked --version ${WASM_PACK_VERSION}"
+
+# Do a quick switch back to root and copy/setup libfido2 and libpcsclite binaries.
+# Do this last to take better advantage of the multi-stage build.
+USER root
+RUN chmod -R a+w $CARGO_HOME
+COPY --from=libfido2 /usr/local/include/ /usr/local/include/
+COPY --from=libfido2 /usr/local/ssl/ /usr/local/ssl/
+COPY --from=libfido2 /usr/local/lib64/engines-3/ /usr/local/lib64/engines-3/
+COPY --from=libfido2 /usr/local/lib64/ossl-modules/ /usr/local/lib64/ossl-modules/
+COPY --from=libfido2 /usr/local/lib64/pkgconfig/ /usr/local/lib64/pkgconfig/
+COPY --from=libfido2 \
+    /usr/local/lib64/libcbor.a \
+    /usr/local/lib64/libcrypto.a \
+    /usr/local/lib64/libcrypto.so.3 \
+    /usr/local/lib64/libfido2.a \
+    /usr/local/lib64/libfido2.so.1.15.0 \
+    /usr/local/lib64/libssl.a \
+    /usr/local/lib64/libssl.so.3 \
+    /usr/local/lib64/libudev.a \
+    /usr/local/lib64/
+# Re-create usual lib64 links.
+RUN cd /usr/local/lib64 && \
+    ln -s libcrypto.so.3 libcrypto.so && \
+    ln -s libfido2.so.1.15.0 libfido2.so.1 && \
+    ln -s libfido2.so.1 libfido2.so && \
+    ln -s libssl.so.3 libssl.so && \
+# Update ld.
+    echo /usr/local/lib64 > /etc/ld.so.conf.d/libfido2.conf && \
+    ldconfig
+# Configure pkg-config.
+COPY pkgconfig/centos7/ /
+ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig"
+
+# Install libpcsclite.
+COPY --from=libpcsclite /usr/local/include/ /usr/local/include/
+COPY --from=libpcsclite /usr/local/lib/pkgconfig/ /usr/local/lib64/pkgconfig/
+COPY --from=libpcsclite \
+    /usr/local/lib/libpcsclite.a \
+    /usr/local/lib/
+# Set LIBRARY_PATH so that libpcsclite can be found by the linker.
+ENV LIBRARY_PATH=/usr/local/lib:${LIBRARY_PATH}
+
+# Copy libbpf into the final image.
+ARG LIBBPF_VERSION
+COPY --from=libbpf /opt/libbpf/usr /usr/libbpf-${LIBBPF_VERSION}
+
+# Copy the pre-built CentOS 7 assets with clang. Needed to build BoringSSL and BPF tools.
+COPY --from=teleport-buildbox-centos7-assets /opt/llvm /opt/llvm
+# Bring in our custom ninja build, needed for BorinSSL.
+COPY --from=teleport-buildbox-centos7-assets /usr/local/bin/ninja /usr/local/bin/ninja
+
+# Libclang is needed by boring-rs to generate bindings. libclang is kept in /opt/llvm/lib
+# and without this environment variable, boring-rs will not be able to find it.
+ENV LIBCLANG_PATH=/opt/llvm/lib/
+
+# C++14 compatible headers are required to build boring-rs.
+# Teleport's boring fork includes a patch that reads this variable
+# and injects it into the environment as CPLUS_INCLUDE_PATH before
+# boring is built.
+ENV BORING_BSSL_FIPS_CPLUS_INCLUDE_PATH=/opt/llvm/include/c++/v1/
+
+VOLUME ["/go/src/github.com/gravitational/teleport"]
+EXPOSE 6600 2379 2380
+
+
+## BUILDBOX-FIPS ##############################################################
+# Build the `buildbox-fips` target to create a buildbox that creates a FIPS
+# Teleport binary. It enables FIPS in the Go toolchain and in OpenSSL, and
+# builds a test binary to ensure binaries are FIPS-compliant.
+
+FROM buildbox as buildbox-fips
+
+# Set environment variables used for enabling FIPS mode
+# `GOEXPERIMENT=boringcrypto` -- enable FIPS mode (BoringCrypto) for Go
+# https://github.com/golang/go/blob/master/src/crypto/internal/boring/README.md
+# `OPENSSL_FIPS=1` -- enable FIPS mode for OpenSSL
+# https://www.openssl.org/docs/man3.0/man7/fips_module.html
+ENV GOEXPERIMENT=boringcrypto \
+    OPENSSL_FIPS=1
+
+# Enable OpenSSL FIPS mode by default
+# https://www.openssl.org/docs/man3.0/man7/fips_module.html
+COPY fips-files/openssh.cnf /usr/local/ssl/openssl.cnf
+
+USER ci
+
+# Validate that environment variables were set
+RUN echo "Ensure environment variables are set" && \
+    [ -n "$GOEXPERIMENT" ] && \
+    [ -n "$OPENSSL_FIPS" ]
+
+# Validate that Go binaries have BoringCrypto enabled
+COPY --chown=ci fips-files/boringtest.nogo /tmp/boringtest.go
+
+RUN echo "Ensure Go is using BoringCrypto" && \
+    go run /tmp/boringtest.go
+
+RUN echo "Ensure OpenSSL is using FIPS module" && \
+    ! openssl md5 /tmp/boringtest.go > /dev/null 2>&1
+
+RUN rm /tmp/boringtest.go
 
 VOLUME ["/go/src/github.com/gravitational/teleport"]
 EXPOSE 6600 2379 2380

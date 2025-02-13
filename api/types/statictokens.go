@@ -71,14 +71,14 @@ func (c *StaticTokensV2) SetSubKind(sk string) {
 	c.SubKind = sk
 }
 
-// GetResourceID returns resource ID
-func (c *StaticTokensV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *StaticTokensV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *StaticTokensV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *StaticTokensV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the StaticTokens resource.
@@ -113,7 +113,7 @@ func (c *StaticTokensV2) SetStaticTokens(s []ProvisionToken) {
 
 // GetStaticTokens gets the list of static tokens used to provision nodes.
 func (c *StaticTokensV2) GetStaticTokens() []ProvisionToken {
-	return ProvisionTokensFromV1(c.Spec.StaticTokens)
+	return ProvisionTokensFromStatic(c.Spec.StaticTokens)
 }
 
 // setStaticFields sets static resource header and metadata fields.

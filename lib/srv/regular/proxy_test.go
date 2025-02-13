@@ -1,30 +1,33 @@
 /*
-Copyright 2016 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package regular
 
 import (
+	"context"
+	"log/slog"
 	"testing"
-	"time"
 
-	"github.com/google/uuid"
-	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/srv"
 	"github.com/stretchr/testify/require"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/lib/srv"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 func TestParseProxyRequest(t *testing.T) {
@@ -86,6 +89,12 @@ func TestParseProxyRequest(t *testing.T) {
 		},
 	}
 
+	server := &Server{
+		hostname:  "redhorse",
+		proxyMode: true,
+		logger:    slog.New(logutils.DiscardHandler{}),
+	}
+
 	for i, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
 			if tt.expected.namespace == "" {
@@ -94,7 +103,7 @@ func TestParseProxyRequest(t *testing.T) {
 				// never actually be empty.
 				tt.expected.namespace = apidefaults.Namespace
 			}
-			req, err := parseProxySubsysRequest(tt.req)
+			req, err := server.parseProxySubsysRequest(context.Background(), tt.req)
 			require.NoError(t, err, "Test case %d: req=%s, expected=%+v", i, tt.req, tt.expected)
 			require.Equal(t, tt.expected, req, "Test case %d: req=%s, expected=%+v", i, tt.req, tt.expected)
 		})
@@ -107,6 +116,7 @@ func TestParseBadRequests(t *testing.T) {
 	server := &Server{
 		hostname:  "redhorse",
 		proxyMode: true,
+		logger:    slog.New(logutils.DiscardHandler{}),
 	}
 
 	ctx := &srv.ServerContext{}
@@ -122,201 +132,9 @@ func TestParseBadRequests(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
-			subsystem, err := parseProxySubsys(tt.input, server, ctx)
+			subsystem, err := server.parseProxySubsys(context.Background(), tt.input, ctx)
 			require.Error(t, err, "test case: %q", tt.input)
 			require.Nil(t, subsystem, "test case: %q", tt.input)
-		})
-	}
-}
-
-func TestProxySubsys_getMatchingServer(t *testing.T) {
-	t.Parallel()
-
-	serverUUID := uuid.NewString()
-
-	ec2NodeID := "123456789012-i-abcdef12345678901"
-
-	setExpiry := func(time time.Time) func(server types.Server) {
-		return func(server types.Server) {
-			server.SetExpiry(time)
-		}
-	}
-
-	createServer := func(name string, spec types.ServerSpecV2, opts ...func(server types.Server)) types.Server {
-		t.Helper()
-
-		server, err := types.NewServer(name, types.KindNode, spec)
-		require.NoError(t, err)
-
-		for _, opt := range opts {
-			opt(server)
-		}
-
-		return server
-	}
-
-	servers := []types.Server{
-		createServer(serverUUID, types.ServerSpecV2{
-			Hostname: "127.0.0.1",
-			Addr:     "127.0.0.1:80",
-		}, setExpiry(time.Now().Add(-time.Hour))),
-		createServer("server2", types.ServerSpecV2{
-			Hostname: "localhost",
-			Addr:     "127.0.0.1:80",
-		}, setExpiry(time.Now().Add(time.Hour*24))),
-		createServer("server3", types.ServerSpecV2{
-			Hostname: serverUUID,
-			Addr:     "127.0.0.1:",
-		}),
-		createServer(ec2NodeID, types.ServerSpecV2{
-			Hostname: "localhost",
-			Addr:     "127.0.0.1:",
-		}),
-	}
-
-	cases := []struct {
-		desc         string
-		req          proxySubsysRequest
-		strategy     types.RoutingStrategy
-		servers      []types.Server
-		expectError  require.ErrorAssertionFunc
-		expectServer func(servers []types.Server) types.Server
-	}{
-		{
-			desc:        "No matches found",
-			expectError: require.NoError,
-		},
-		{
-			desc:        "No matches found for UUID host",
-			expectError: require.Error,
-			servers: []types.Server{createServer(uuid.NewString(), types.ServerSpecV2{
-				Addr: "127.0.0.1:0",
-			})},
-			req: proxySubsysRequest{
-				host: uuid.NewString(),
-			},
-		},
-		{
-			desc:        "Match by UUID",
-			expectError: require.NoError,
-			expectServer: func(servers []types.Server) types.Server {
-				return servers[0]
-			},
-			servers: servers,
-			req: proxySubsysRequest{
-				host: serverUUID,
-			},
-		},
-		{
-			desc:        "Match by EC2 ID",
-			expectError: require.NoError,
-			expectServer: func(servers []types.Server) types.Server {
-				return servers[3]
-			},
-			servers: servers,
-			req: proxySubsysRequest{
-				host: ec2NodeID,
-			},
-		},
-		{
-			desc:        "Match Tunnel By Host Only",
-			expectError: require.NoError,
-			expectServer: func(servers []types.Server) types.Server {
-				return servers[0]
-			},
-			servers: []types.Server{
-				createServer("server1", types.ServerSpecV2{
-					Addr:      "127.0.0.1",
-					Hostname:  "127.0.0.1",
-					UseTunnel: true,
-				}),
-				createServer("server2", types.ServerSpecV2{
-					Hostname:  "localhost",
-					Addr:      "127.0.0.1:80",
-					UseTunnel: true,
-				}),
-			},
-			req: proxySubsysRequest{
-				host: "127.0.0.1",
-				port: "80",
-			},
-		},
-		{
-			desc:        "Match by IP",
-			expectError: require.NoError,
-			expectServer: func(servers []types.Server) types.Server {
-				return servers[1]
-			},
-			servers: []types.Server{
-				createServer("server1", types.ServerSpecV2{
-					Addr:     "127.0.0.1:0",
-					Hostname: "127.0.0.1",
-				}),
-				createServer("server2", types.ServerSpecV2{
-					Hostname: "localhost",
-					Addr:     "127.0.0.1:80",
-				}),
-			},
-			req: proxySubsysRequest{
-				host: "127.0.0.1",
-				port: "80",
-			},
-		},
-		{
-			desc:        "Match by hostname",
-			expectError: require.NoError,
-			expectServer: func(servers []types.Server) types.Server {
-				return servers[1]
-			},
-			servers: []types.Server{
-				createServer("server1", types.ServerSpecV2{
-					Addr:     "127.0.0.1:0",
-					Hostname: "localhost",
-				}),
-				createServer("server2", types.ServerSpecV2{
-					Hostname: "localhost",
-					Addr:     "127.0.0.1:80",
-				}),
-			},
-			req: proxySubsysRequest{
-				host: "localhost",
-				port: "80",
-			},
-		},
-		{
-			desc:        "Ambiguous match",
-			expectError: require.Error,
-			servers:     servers,
-			req: proxySubsysRequest{
-				host: "localhost",
-			},
-		},
-		{
-			desc:        "Most Recent match",
-			expectError: require.NoError,
-			expectServer: func(servers []types.Server) types.Server {
-				return servers[1]
-			},
-			servers:  servers,
-			strategy: types.RoutingStrategy_MOST_RECENT,
-			req: proxySubsysRequest{
-				host: "localhost",
-			},
-		},
-	}
-
-	for _, tt := range cases {
-		t.Run(tt.desc, func(t *testing.T) {
-			subsystem := proxySubsys{
-				proxySubsysRequest: tt.req,
-				srv:                &Server{},
-			}
-
-			server, err := subsystem.getMatchingServer(tt.servers, tt.strategy)
-			tt.expectError(t, err)
-			if tt.expectServer != nil {
-				require.Equal(t, tt.expectServer(tt.servers), server)
-			}
 		})
 	}
 }

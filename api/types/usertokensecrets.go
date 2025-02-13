@@ -119,14 +119,14 @@ func (u *UserTokenSecretsV3) SetName(name string) {
 	u.Metadata.Name = name
 }
 
-// GetResourceID returns resource ID
-func (u *UserTokenSecretsV3) GetResourceID() int64 {
-	return u.Metadata.ID
+// GetRevision returns the revision
+func (u *UserTokenSecretsV3) GetRevision() string {
+	return u.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (u *UserTokenSecretsV3) SetResourceID(id int64) {
-	u.Metadata.ID = id
+// SetRevision sets the revision
+func (u *UserTokenSecretsV3) SetRevision(rev string) {
+	u.Metadata.SetRevision(rev)
 }
 
 // GetSubKind returns resource sub kind

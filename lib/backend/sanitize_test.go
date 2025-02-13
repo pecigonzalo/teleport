@@ -1,22 +1,25 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package backend
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -26,46 +29,94 @@ import (
 
 func TestSanitize(t *testing.T) {
 	tests := []struct {
-		inKey  []byte
+		inKey  Key
 		assert require.ErrorAssertionFunc
 	}{
 		{
-			inKey:  []byte("a-b/c:d/.e_f/01"),
+			inKey:  NewKey("a-b", "c:d", ".e_f", "01"),
 			assert: require.NoError,
 		},
 		{
-			inKey:  []byte("/namespaces//params"),
+			inKey:  NewKey("namespaces", "", "params"),
 			assert: require.Error,
 		},
 		{
-			inKey:  RangeEnd([]byte("a-b/c:d/.e_f/01")),
-			assert: require.NoError,
-		},
-		{
-			inKey:  RangeEnd([]byte("/")),
-			assert: require.NoError,
-		},
-		{
-			inKey:  RangeEnd([]byte("Malformed \xf0\x90\x28\xbc UTF8")),
+			inKey:  NewKey("namespaces", ".."),
 			assert: require.Error,
 		},
 		{
-			inKey:  []byte("test+subaddr@example.com"),
+			inKey:  NewKey("namespaces", "..", "params"),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey("namespaces", "..params"),
 			assert: require.NoError,
 		},
 		{
-			inKey:  []byte("xyz"),
+			inKey:  NewKey("namespaces", "."),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey("namespaces", ".", "params"),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey("namespaces", ".params"),
+			assert: require.NoError,
+		},
+		{
+			inKey:  NewKey(".."),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey("..params"),
+			assert: require.NoError,
+		},
+		{
+			inKey:  NewKey("..", "params"),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey("."),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey(".params"),
+			assert: require.NoError,
+		},
+		{
+			inKey:  NewKey(".", "params"),
+			assert: require.Error,
+		},
+		{
+			inKey:  RangeEnd(NewKey("a-b", "c:d", ".e_f", "01")),
+			assert: require.NoError,
+		},
+		{
+			inKey:  RangeEnd(NewKey("")),
+			assert: require.NoError,
+		},
+		{
+			inKey:  RangeEnd(NewKey("Malformed \xf0\x90\x28\xbc UTF8")),
+			assert: require.Error,
+		},
+		{
+			inKey:  NewKey("test+subaddr@example.com"),
+			assert: require.NoError,
+		},
+		{
+			inKey:  NewKey("xyz"),
 			assert: require.NoError,
 		},
 	}
 
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%v", string(tt.inKey)), func(t *testing.T) {
+		t.Run(tt.inKey.String(), func(t *testing.T) {
 			ctx := context.Background()
 			safeBackend := NewSanitizer(&nopBackend{})
 
 			_, err := safeBackend.Get(ctx, tt.inKey)
-			tt.assert(t, err)
+			require.NoError(t, err)
 
 			_, err = safeBackend.Create(ctx, Item{Key: tt.inKey})
 			tt.assert(t, err)
@@ -80,23 +131,27 @@ func TestSanitize(t *testing.T) {
 			tt.assert(t, err)
 
 			err = safeBackend.Delete(ctx, tt.inKey)
-			tt.assert(t, err)
+			require.NoError(t, err)
 
 			err = safeBackend.DeleteRange(ctx, tt.inKey, tt.inKey)
-			tt.assert(t, err)
+			require.NoError(t, err)
 		})
 	}
 }
 
 type nopBackend struct{}
 
-func (n *nopBackend) Get(_ context.Context, _ []byte) (*Item, error) {
+func (n *nopBackend) GetName() string {
+	return "nop"
+}
+
+func (n *nopBackend) Get(_ context.Context, _ Key) (*Item, error) {
 	return &Item{}, nil
 }
 
-func (n *nopBackend) GetRange(_ context.Context, startKey []byte, endKey []byte, limit int) (*GetResult, error) {
+func (n *nopBackend) GetRange(_ context.Context, startKey, endKey Key, limit int) (*GetResult, error) {
 	return &GetResult{Items: []Item{
-		{Key: []byte("foo"), Value: []byte("bar")},
+		{Key: NewKey("foo"), Value: []byte("bar")},
 	}}, nil
 }
 
@@ -112,20 +167,32 @@ func (n *nopBackend) Update(_ context.Context, _ Item) (*Lease, error) {
 	return &Lease{}, nil
 }
 
+func (n *nopBackend) ConditionalUpdate(_ context.Context, _ Item) (*Lease, error) {
+	return &Lease{}, nil
+}
+
 func (n *nopBackend) CompareAndSwap(_ context.Context, _ Item, _ Item) (*Lease, error) {
 	return &Lease{}, nil
 }
 
-func (n *nopBackend) Delete(_ context.Context, _ []byte) error {
+func (n *nopBackend) Delete(_ context.Context, _ Key) error {
 	return nil
 }
 
-func (n *nopBackend) DeleteRange(_ context.Context, _ []byte, _ []byte) error {
+func (n *nopBackend) ConditionalDelete(ctx context.Context, key Key, revision string) error {
+	return nil
+}
+
+func (n *nopBackend) DeleteRange(_ context.Context, _ Key, _ Key) error {
 	return nil
 }
 
 func (n *nopBackend) KeepAlive(_ context.Context, _ Lease, _ time.Time) error {
 	return nil
+}
+
+func (n *nopBackend) AtomicWrite(_ context.Context, _ []ConditionalAction) (revision string, err error) {
+	return "", nil
 }
 
 func (n *nopBackend) Close() error {

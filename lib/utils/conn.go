@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
@@ -64,7 +66,7 @@ func (c *CloserConn) Close() error {
 	return trace.NewAggregate(errors...)
 }
 
-// Context returns a context that is cancelled once the connection is closed.
+// Context returns a context that is canceled once the connection is closed.
 func (c *CloserConn) Context() context.Context {
 	return c.ctx
 }
@@ -167,15 +169,19 @@ func (r *TrackingReader) Count() uint64 {
 func (r *TrackingReader) Read(b []byte) (int, error) {
 	n, err := r.r.Read(b)
 	atomic.AddUint64(&r.count, uint64(n))
-	return n, trace.Wrap(err)
+
+	// This has to use the original error type or else utilities using the connection
+	// (like io.Copy, which is used by the oxy forwarder) may incorrectly categorize
+	// the error produced by this and terminate the connection unnecessarily.
+	return n, err
 }
 
 // TrackingWriter is an io.Writer that counts the total number of bytes
 // written.
 // It's thread-safe if the underlying io.Writer is thread-safe.
 type TrackingWriter struct {
+	count uint64 // intentionally placed first to ensure 64-bit alignment
 	w     io.Writer
-	count uint64
 }
 
 // NewTrackingWriter creates a TrackingWriter around w.
@@ -192,4 +198,55 @@ func (w *TrackingWriter) Write(b []byte) (int, error) {
 	n, err := w.w.Write(b)
 	atomic.AddUint64(&w.count, uint64(n))
 	return n, trace.Wrap(err)
+}
+
+// ConnWithAddr is a [net.Conn] wrapper that allows the local and remote address
+// to be overridden.
+type ConnWithAddr struct {
+	net.Conn
+	localAddrOverride  net.Addr
+	remoteAddrOverride net.Addr
+}
+
+// LocalAddr implements [net.Conn].
+func (c *ConnWithAddr) LocalAddr() net.Addr {
+	if c.localAddrOverride != nil {
+		return c.localAddrOverride
+	}
+
+	return c.Conn.LocalAddr()
+}
+
+// RemoteAddr implements [net.Conn].
+func (c *ConnWithAddr) RemoteAddr() net.Addr {
+	if c.remoteAddrOverride != nil {
+		return c.remoteAddrOverride
+	}
+
+	return c.Conn.RemoteAddr()
+}
+
+// NetConn returns the underlying [net.Conn].
+func (c *ConnWithAddr) NetConn() net.Conn {
+	return c.Conn
+}
+
+// NewConnWithSrcAddr wraps provided connection and overrides client remote address.
+func NewConnWithSrcAddr(conn net.Conn, clientSrcAddr net.Addr) *ConnWithAddr {
+	return &ConnWithAddr{
+		Conn: conn,
+
+		remoteAddrOverride: clientSrcAddr,
+	}
+}
+
+// NewConnWithAddr wraps a [net.Conn] optionally overriding the local and remote
+// addresses with the provided ones, if non-nil.
+func NewConnWithAddr(conn net.Conn, localAddr, remoteAddr net.Addr) *ConnWithAddr {
+	return &ConnWithAddr{
+		Conn: conn,
+
+		localAddrOverride:  localAddr,
+		remoteAddrOverride: remoteAddr,
+	}
 }

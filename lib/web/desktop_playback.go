@@ -1,44 +1,85 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
 import (
+	"context"
 	"net/http"
 
-	"github.com/gravitational/teleport/lib/web/desktop"
+	"github.com/gorilla/websocket"
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
-	"golang.org/x/net/websocket"
+
+	"github.com/gravitational/teleport/lib/player"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/session"
+	"github.com/gravitational/teleport/lib/web/desktop"
 )
 
 func (h *Handler) desktopPlaybackHandle(
 	w http.ResponseWriter,
 	r *http.Request,
 	p httprouter.Params,
-	ctx *SessionContext,
+	sctx *SessionContext,
+	site reversetunnelclient.RemoteSite,
+	ws *websocket.Conn,
 ) (interface{}, error) {
 	sID := p.ByName("sid")
 	if sID == "" {
-		return nil, trace.BadParameter("missing sid in request URL")
+		return nil, trace.BadParameter("missing session ID in request URL")
 	}
 
-	websocket.Handler(func(ws *websocket.Conn) {
-		defer h.log.Debug("desktopPlaybackHandle websocket handler returned")
-		desktop.NewPlayer(sID, ws, ctx.clt, h.log).Play(r.Context())
-	}).ServeHTTP(w, r)
+	clt, err := sctx.GetUserClient(r.Context(), site)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	player, err := player.New(&player.Config{
+		Clock:     h.clock,
+		Log:       h.logger,
+		SessionID: session.ID(sID),
+		Streamer:  clt,
+		Context:   r.Context(),
+	})
+	if err != nil {
+		h.logger.ErrorContext(r.Context(), "couldn't create player for session", "session_id", sID, "error", err)
+		ws.WriteMessage(websocket.BinaryMessage,
+			[]byte(`{"message": "error", "errorText": "Internal server error"}`))
+		return nil, nil
+	}
+
+	defer player.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	go func() {
+		defer cancel()
+		desktop.ReceivePlaybackActions(ctx, h.logger, ws, player)
+	}()
+
+	go func() {
+		defer cancel()
+		defer ws.Close()
+		desktop.PlayRecording(ctx, h.logger, ws, player)
+	}()
+
+	<-ctx.Done()
 	return nil, nil
 }

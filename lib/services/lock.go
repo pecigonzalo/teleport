@@ -1,29 +1,31 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"fmt"
 
+	"github.com/gravitational/trace"
+
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
 )
 
 // LockInForceAccessDenied is an AccessDenied error returned when a lock
@@ -34,9 +36,8 @@ func LockInForceAccessDenied(lock types.Lock) error {
 	if len(msg) > 0 {
 		s += ": " + msg
 	}
-	err := trace.AccessDenied(s)
-	err.AddField("lock-in-force", lock)
-	return err
+	err := trace.AccessDenied("%s", s)
+	return trace.WithField(err, "lock-in-force", lock)
 }
 
 // StrictLockingModeAccessDenied is an AccessDenied error returned when strict
@@ -48,6 +49,9 @@ func LockTargetsFromTLSIdentity(id tlsca.Identity) []types.LockTarget {
 	lockTargets := append(RolesToLockTargets(id.Groups), types.LockTarget{User: id.Username})
 	if id.MFAVerified != "" {
 		lockTargets = append(lockTargets, types.LockTarget{MFADevice: id.MFAVerified})
+	}
+	if id.DeviceExtensions.DeviceID != "" {
+		lockTargets = append(lockTargets, types.LockTarget{Device: id.DeviceExtensions.DeviceID})
 	}
 	lockTargets = append(lockTargets, AccessRequestsToLockTargets(id.ActiveRequests)...)
 	return lockTargets
@@ -81,7 +85,7 @@ func UnmarshalLock(bytes []byte, opts ...MarshalOption) (types.Lock, error) {
 
 	var lock types.LockV2
 	if err := utils.FastUnmarshal(bytes, &lock); err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 	if err := lock.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
@@ -91,8 +95,8 @@ func UnmarshalLock(bytes []byte, opts ...MarshalOption) (types.Lock, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if cfg.ID != 0 {
-		lock.SetResourceID(cfg.ID)
+	if cfg.Revision != "" {
+		lock.SetRevision(cfg.Revision)
 	}
 	if !cfg.Expires.IsZero() {
 		lock.SetExpiry(cfg.Expires)
@@ -102,10 +106,6 @@ func UnmarshalLock(bytes []byte, opts ...MarshalOption) (types.Lock, error) {
 
 // MarshalLock marshals the Lock resource to JSON.
 func MarshalLock(lock types.Lock, opts ...MarshalOption) ([]byte, error) {
-	if err := lock.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -113,17 +113,14 @@ func MarshalLock(lock types.Lock, opts ...MarshalOption) ([]byte, error) {
 
 	switch lock := lock.(type) {
 	case *types.LockV2:
+		if err := lock.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
+		}
+
 		if version := lock.GetVersion(); version != types.V2 {
 			return nil, trace.BadParameter("mismatched lock version %v and type %T", version, lock)
 		}
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *lock
-			copy.SetResourceID(0)
-			lock = &copy
-		}
-		return utils.FastMarshal(lock)
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, lock))
 	default:
 		return nil, trace.BadParameter("unrecognized lock version %T", lock)
 	}

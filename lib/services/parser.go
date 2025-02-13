@@ -1,37 +1,42 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"context"
 	"fmt"
-	"io"
+	"log/slog"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/gravitational/trace"
+	"github.com/vulcand/predicate"
+	"github.com/vulcand/predicate/builder"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/types/wrappers"
 	"github.com/gravitational/teleport/lib/session"
-
-	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
-	"github.com/vulcand/predicate"
-	"github.com/vulcand/predicate/builder"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
+	"github.com/gravitational/teleport/lib/utils/typical"
 )
 
 // RuleContext specifies context passed to the
@@ -53,6 +58,93 @@ var (
 	CertAuthorityTypeExpr = builder.Identifier(`system.catype()`)
 )
 
+// predicateAllEndWith is a custom function to test if a string ends with a
+// particular suffix. If given a `[]string` as the first argument, all values
+// must have the given suffix (2nd argument).
+func predicateAllEndWith(a interface{}, b interface{}) predicate.BoolPredicate {
+	return func() bool {
+		// bval is the suffix and must always be a plain string.
+		bval, ok := b.(string)
+		if !ok {
+			return false
+		}
+
+		switch aval := a.(type) {
+		case string:
+			return strings.HasSuffix(aval, bval)
+		case []string:
+			for _, val := range aval {
+				if !strings.HasSuffix(val, bval) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// predicateAllEqual is a custom function to test if all entries in a []string
+// are equal to a certain value. This is primarily useful for comparing string
+// fields that are only expected to contain a single, specific value.
+func predicateAllEqual(a interface{}, b interface{}) predicate.BoolPredicate {
+	return func() bool {
+		// bval is the suffix and must always be a plain string.
+		bval, ok := b.(string)
+		if !ok {
+			return false
+		}
+
+		switch aval := a.(type) {
+		case string:
+			return aval == bval
+		case []string:
+			for _, val := range aval {
+				if val != bval {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// predicateIsSubset determines if the first parameter is contained within the
+// variadic args. The first argument may either by `string` or `[]string`, and
+// the variadic args may only be `string`.
+func predicateIsSubset(a interface{}, b ...interface{}) predicate.BoolPredicate {
+	return func() bool {
+		// Populate the set.
+		set := map[string]bool{}
+		for _, bval := range b {
+			s, ok := bval.(string)
+			if !ok {
+				return false
+			}
+
+			set[s] = true
+		}
+
+		switch aval := a.(type) {
+		case string:
+			return set[aval]
+		case []string:
+			for _, v := range aval {
+				if !set[v] {
+					return false
+				}
+			}
+
+			return true
+		default:
+			return false
+		}
+	}
+}
+
 // NewWhereParser returns standard parser for `where` section in access rules.
 func NewWhereParser(ctx RuleContext) (predicate.Parser, error) {
 	return predicate.NewParser(predicate.Def{
@@ -62,8 +154,11 @@ func NewWhereParser(ctx RuleContext) (predicate.Parser, error) {
 			NOT: predicate.Not,
 		},
 		Functions: map[string]interface{}{
-			"equals":   predicate.Equals,
-			"contains": predicate.Contains,
+			"equals":       predicate.Equals,
+			"contains":     predicate.Contains,
+			"all_end_with": predicateAllEndWith,
+			"all_equal":    predicateAllEqual,
+			"is_subset":    predicateIsSubset,
 			// system.catype is a function that returns cert authority type,
 			// it returns empty values for unrecognized values to
 			// pass static rule checks.
@@ -137,34 +232,41 @@ func NewActionsParser(ctx RuleContext) (predicate.Parser, error) {
 // NewLogActionFn creates logger functions
 func NewLogActionFn(ctx RuleContext) interface{} {
 	l := &LogAction{ctx: ctx}
-	writer, ok := ctx.(io.Writer)
-	if ok && writer != nil {
-		l.writer = writer
-	}
+
 	return l.Log
 }
 
 // LogAction represents action that will emit log entry
 // when specified in the actions of a matched rule
 type LogAction struct {
-	ctx    RuleContext
-	writer io.Writer
+	ctx RuleContext
 }
 
-// Log logs with specified level and formatting string with arguments
-func (l *LogAction) Log(level, format string, args ...interface{}) predicate.BoolPredicate {
+// Log logs with specified level and message string and attributes
+func (l *LogAction) Log(level, msg string, args ...any) predicate.BoolPredicate {
 	return func() bool {
-		ilevel, err := log.ParseLevel(level)
-		if err != nil {
-			ilevel = log.DebugLevel
+		slevel := slog.LevelDebug
+		switch strings.ToLower(level) {
+		case "error":
+			slevel = slog.LevelError
+		case "warn", "warning":
+			slevel = slog.LevelWarn
+		case "info":
+			slevel = slog.LevelInfo
+		case "debug":
+			slevel = slog.LevelDebug
+		case "trace":
+			slevel = logutils.TraceLevel
 		}
-		var writer io.Writer
-		if l.writer != nil {
-			writer = l.writer
-		} else {
-			writer = log.StandardLogger().WriterLevel(ilevel)
+
+		ctx := context.Background()
+		// Expicitly check whether logging is enabled for the level
+		// to avoid formatting the message if the log won't be sampled.
+		if !slog.Default().Handler().Enabled(ctx, slevel) {
+			//nolint:sloglint // msg cannot be constant
+			slog.Log(context.Background(), slevel, fmt.Sprintf(msg, args...))
 		}
-		writer.Write([]byte(fmt.Sprintf(format, args...)))
+
 		return true
 	}
 }
@@ -172,7 +274,7 @@ func (l *LogAction) Log(level, format string, args ...interface{}) predicate.Boo
 // Context is a default rule context used in teleport
 type Context struct {
 	// User is currently authenticated user
-	User types.User
+	User UserState
 	// Resource is an optional resource, in case if the rule
 	// checks access to the resource
 	Resource types.Resource
@@ -181,6 +283,10 @@ type Context struct {
 	Session events.AuditEvent
 	// SSHSession is an optional (active) SSH session.
 	SSHSession *session.Session
+	// HostCert is an optional host certificate.
+	HostCert *HostCertContext
+	// SessionTracker is an optional session tracker, in case if the rule checks access to the tracker.
+	SessionTracker types.SessionTracker
 }
 
 // String returns user friendly representation of this context
@@ -195,7 +301,13 @@ const (
 	ResourceIdentifier = "resource"
 	// ResourceLabelsIdentifier refers to the static and dynamic labels in a resource.
 	ResourceLabelsIdentifier = "labels"
-	// ResourceNameIdentifier refers to the metadata name field for a resource.
+	// ResourceNameIdentifier refers to two different fields depending on the kind of resource:
+	//   - KindNode will refer to its resource.spec.hostname field
+	//   - All other kinds will refer to its resource.metadata.name field
+	// It refers to two different fields because the way this shorthand is being used,
+	// implies it will return the name of the resource where users identifies nodes
+	// by its hostname and all other resources that can be `ls` queried is identified
+	// by its metadata name.
 	ResourceNameIdentifier = "name"
 	// SessionIdentifier refers to a session (recording) in the rules.
 	SessionIdentifier = "session"
@@ -205,6 +317,10 @@ const (
 	ImpersonateRoleIdentifier = "impersonate_role"
 	// ImpersonateUserIdentifier is a user to impersonate
 	ImpersonateUserIdentifier = "impersonate_user"
+	// HostCertIdentifier refers to a host certificate being created.
+	HostCertIdentifier = "host_cert"
+	// SessionTrackerIdentifier refers to a session tracker in the rules.
+	SessionTrackerIdentifier = "session_tracker"
 )
 
 // GetResource returns resource specified in the context,
@@ -220,7 +336,7 @@ func (ctx *Context) GetResource() (types.Resource, error) {
 func (ctx *Context) GetIdentifier(fields []string) (interface{}, error) {
 	switch fields[0] {
 	case UserIdentifier:
-		var user types.User
+		var user UserState
 		if ctx.User == nil {
 			user = emptyUser
 		} else {
@@ -246,8 +362,75 @@ func (ctx *Context) GetIdentifier(fields []string) (interface{}, error) {
 		// Do not expose the original session.Session, instead transform it into a
 		// ctxSession so the exposed fields match our desired API.
 		return predicate.GetFieldByTag(toCtxSession(ctx.SSHSession), teleport.JSON, fields[1:])
+	case HostCertIdentifier:
+		var hostCert *HostCertContext
+		if ctx.HostCert == nil {
+			hostCert = emptyHostCert
+		} else {
+			hostCert = ctx.HostCert
+		}
+		return predicate.GetFieldByTag(hostCert, teleport.JSON, fields[1:])
+	case SessionTrackerIdentifier:
+		return predicate.GetFieldByTag(toCtxTracker(ctx.SessionTracker), teleport.JSON, fields[1:])
 	default:
 		return nil, trace.NotFound("%v is not defined", strings.Join(fields, "."))
+	}
+}
+
+// ctxSession represents the public contract of a session.Session, as exposed
+// to a Context rule.
+// See RFD 82: https://github.com/gravitational/teleport/blob/master/rfd/0082-session-tracker-resource-rbac.md
+type ctxTracker struct {
+	SessionID    string   `json:"session_id"`
+	Kind         string   `json:"kind"`
+	Participants []string `json:"participants"`
+	State        string   `json:"state"`
+	Hostname     string   `json:"hostname"`
+	Address      string   `json:"address"`
+	Login        string   `json:"login"`
+	Cluster      string   `json:"cluster"`
+	KubeCluster  string   `json:"kube_cluster"`
+	HostUser     string   `json:"host_user"`
+	HostRoles    []string `json:"host_roles"`
+}
+
+func toCtxTracker(t types.SessionTracker) ctxTracker {
+	if t == nil {
+		return ctxTracker{}
+	}
+
+	getParticipants := func(s types.SessionTracker) []string {
+		participants := s.GetParticipants()
+		names := make([]string, len(participants))
+		for i, participant := range participants {
+			names[i] = participant.User
+		}
+
+		return names
+	}
+
+	getHostRoles := func(s types.SessionTracker) []string {
+		policySets := s.GetHostPolicySets()
+		roles := make([]string, len(policySets))
+		for i, policySet := range policySets {
+			roles[i] = policySet.Name
+		}
+
+		return roles
+	}
+
+	return ctxTracker{
+		SessionID:    t.GetSessionID(),
+		Kind:         t.GetKind(),
+		Participants: getParticipants(t),
+		State:        string(t.GetState()),
+		Hostname:     t.GetHostname(),
+		Address:      t.GetAddress(),
+		Login:        t.GetLogin(),
+		Cluster:      t.GetClusterName(),
+		KubeCluster:  t.GetKubeCluster(),
+		HostUser:     t.GetHostUser(),
+		HostRoles:    getHostRoles(t),
 	}
 }
 
@@ -293,11 +476,35 @@ func toCtxSession(s *session.Session) ctxSession {
 	}
 }
 
+// HostCertContext is used to evaluate the `where` condition on a `host_cert`
+// pseudo-resource. These resources only exist for RBAC purposes and do not
+// exist in the database.
+type HostCertContext struct {
+	// HostID is the host ID in the cert request.
+	HostID string `json:"host_id"`
+	// NodeName is the node name in the cert request.
+	NodeName string `json:"node_name"`
+	// Principals is the list of requested certificate principals.
+	Principals []string `json:"principals"`
+	// ClusterName is the name of the cluster for which the certificate should
+	// be issued.
+	ClusterName string `json:"cluster_name"`
+	// Role is the name of the Teleport role for which the cert should be
+	// issued.
+	Role types.SystemRole `json:"role"`
+	// TTL is the requested certificate TTL.
+	TTL time.Duration `json:"ttl"`
+}
+
 // emptyResource is used when no resource is specified
 var emptyResource = &EmptyResource{}
 
 // emptyUser is used when no user is specified
 var emptyUser = &types.UserV2{}
+
+// emptyHostCert is an empty host certificate used when no host cert is
+// specified
+var emptyHostCert = &HostCertContext{}
 
 // EmptyResource is used to represent a use case when no resource
 // is specified in the rules matcher
@@ -332,14 +539,14 @@ func (r *EmptyResource) GetKind() string {
 	return r.Kind
 }
 
-// GetResourceID returns resource ID
-func (r *EmptyResource) GetResourceID() int64 {
-	return r.Metadata.ID
+// GetRevision returns the revision
+func (r *EmptyResource) GetRevision() string {
+	return r.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (r *EmptyResource) SetResourceID(id int64) {
-	r.Metadata.ID = id
+// SetRevision sets the revision
+func (r *EmptyResource) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
 }
 
 // SetExpiry sets expiry time for the object.
@@ -368,55 +575,6 @@ func (r *EmptyResource) GetMetadata() types.Metadata {
 }
 
 func (r *EmptyResource) CheckAndSetDefaults() error { return nil }
-
-// BoolPredicateParser extends predicate.Parser with a convenience method
-// for evaluating bool predicates.
-type BoolPredicateParser interface {
-	predicate.Parser
-	EvalBoolPredicate(string) (bool, error)
-}
-
-type boolPredicateParser struct {
-	predicate.Parser
-}
-
-func (p boolPredicateParser) EvalBoolPredicate(expr string) (bool, error) {
-	ifn, err := p.Parse(expr)
-	if err != nil {
-		return false, trace.Wrap(err)
-	}
-
-	fn, ok := ifn.(predicate.BoolPredicate)
-	if !ok {
-		return false, trace.BadParameter("unsupported type: %T", ifn)
-	}
-
-	return fn(), nil
-}
-
-// NewJSONBoolParser returns a generic parser for boolean expressions based on a
-// json-serializable context.
-func NewJSONBoolParser(ctx interface{}) (BoolPredicateParser, error) {
-	p, err := predicate.NewParser(predicate.Def{
-		Operators: predicate.Operators{
-			AND: predicate.And,
-			OR:  predicate.Or,
-			NOT: predicate.Not,
-		},
-		Functions: map[string]interface{}{
-			"equals":   predicate.Equals,
-			"contains": predicate.Contains,
-		},
-		GetIdentifier: func(fields []string) (interface{}, error) {
-			return predicate.GetFieldByTag(ctx, teleport.JSON, fields)
-		},
-		GetProperty: GetStringMapValue,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return boolPredicateParser{Parser: p}, nil
-}
 
 // newParserForIdentifierSubcondition returns a parser customized for
 // extracting the largest admissible subexpression of a `where` condition that
@@ -524,112 +682,75 @@ func newParserForIdentifierSubcondition(ctx RuleContext, identifier string) (pre
 	})
 }
 
-// NewResourceParser returns a parser made for boolean expressions based on a
-// json-serialiable resource. Customized to allow short identifiers common in all
+// NewResourceExpression returns a [typical.Expression] that is to be evaluated against a
+// [types.ResourceWithLabels]. It is customized to allow short identifiers common in all
 // resources:
-//  - `metadata.name` can be referenced with `name` ie: `name == "jenkins"``
-//  - `metadata.labels + spec.dynamic_labels` can be referenced with `labels`
-//     ie: `labels.env == "prod"`
+//   - shorthand `name` refers to `resource.spec.hostname` for node resources, or it refers
+//     to `resource.metadata.name` for all other resources eg: `name == "app-name-jenkins"`
+//   - shorthand `labels` refers to resource `resource.metadata.labels + resource.spec.dynamic_labels`
+//     eg: `labels.env == "prod"`
+//
 // All other fields can be referenced by starting expression with identifier `resource`
 // followed by the names of the json fields ie: `resource.spec.public_addr`.
-func NewResourceParser(resource types.ResourceWithLabels) (BoolPredicateParser, error) {
-	predEquals := func(a interface{}, b interface{}) predicate.BoolPredicate {
-		switch aval := a.(type) {
-		case label:
-			bval, ok := b.(string)
-			return func() bool {
-				return ok && aval.value == bval
-			}
-		default:
-			return predicate.Equals(a, b)
-		}
-	}
+func NewResourceExpression(expression string) (typical.Expression[types.ResourceWithLabels, bool], error) {
+	parser, err := typical.NewParser[types.ResourceWithLabels, bool](typical.ParserSpec[types.ResourceWithLabels]{
+		Variables: map[string]typical.Variable{
+			"resource.metadata.labels": typical.DynamicVariable(func(r types.ResourceWithLabels) (map[string]string, error) {
+				return r.GetStaticLabels(), nil
+			}),
+			"resource.metadata.name": typical.DynamicVariable(func(r types.ResourceWithLabels) (string, error) {
+				return r.GetName(), nil
+			}),
+			"labels": typical.DynamicMapFunction(func(r types.ResourceWithLabels, key string) (string, error) {
+				val, _ := r.GetLabel(key)
+				return val, nil
+			}),
+			"name": typical.DynamicVariable(func(r types.ResourceWithLabels) (string, error) {
+				// For nodes, the resource "name" that user expects is the
+				// nodes hostname, not its UUID. Currently, for other resources,
+				// the metadata.name returns the name as expected.
+				if server, ok := r.(types.Server); ok {
+					return server.GetHostname(), nil
+				}
 
-	p, err := predicate.NewParser(predicate.Def{
-		Operators: predicate.Operators{
-			AND: predicate.And,
-			OR:  predicate.Or,
-			NOT: predicate.Not,
-			EQ:  predEquals,
-			NEQ: func(a interface{}, b interface{}) predicate.BoolPredicate {
-				return predicate.Not(predEquals(a, b))
-			},
+				return r.GetName(), nil
+			}),
 		},
-		Functions: map[string]interface{}{
-			"equals": predEquals,
-			// search allows fuzzy matching against select field values.
-			"search": func(searchVals ...string) predicate.BoolPredicate {
-				return func() bool {
-					return resource.MatchSearch(searchVals)
-				}
-			},
-			// exists checks for an existence of a label by checking
-			// if a key exists. Label value are unchecked.
-			"exists": func(l label) predicate.BoolPredicate {
-				return func() bool {
-					return len(l.key) > 0
-				}
-			},
+		Functions: map[string]typical.Function{
+			"hasPrefix": typical.BinaryFunction[types.ResourceWithLabels](func(s, suffix string) (bool, error) {
+				return strings.HasPrefix(s, suffix), nil
+			}),
+			"equals": typical.BinaryFunction[types.ResourceWithLabels](func(a, b string) (bool, error) {
+				return strings.Compare(a, b) == 0, nil
+			}),
+			"search": typical.UnaryVariadicFunctionWithEnv(func(r types.ResourceWithLabels, v ...string) (bool, error) {
+				return r.MatchSearch(v), nil
+			}),
+			"exists": typical.UnaryFunction[types.ResourceWithLabels](func(value string) (bool, error) {
+				return value != "", nil
+			}),
+			"split": typical.BinaryFunction[types.ResourceWithLabels](func(value string, delimiter string) ([]string, error) {
+				return strings.Split(value, delimiter), nil
+			}),
+			"contains": typical.BinaryFunction[types.ResourceWithLabels](func(list []string, value string) (bool, error) {
+				return slices.Contains(list, value), nil
+			}),
 		},
-		GetIdentifier: func(fields []string) (interface{}, error) {
-			switch fields[0] {
-			case ResourceLabelsIdentifier:
-				combinedLabels := resource.GetAllLabels()
-				switch {
-				// Field length of 1 means the user is using
-				// an index expression ie: labels["env"], which the
-				// parser will expect a map for lookup in `GetProperty`.
-				case len(fields) == 1:
-					return labels(combinedLabels), nil
-				case len(fields) > 2:
-					return nil, trace.BadParameter("only two fields are supported with identifier %q, got %d: %v", ResourceLabelsIdentifier, len(fields), fields)
-				default:
-					key := fields[1]
-					val, ok := combinedLabels[key]
-					if ok {
-						return label{key: key, value: val}, nil
-					}
-					return label{}, nil
+		GetUnknownIdentifier: func(env types.ResourceWithLabels, fields []string) (any, error) {
+			if fields[0] == ResourceIdentifier {
+				if f, err := predicate.GetFieldByTag(env, teleport.JSON, fields[1:]); err == nil {
+					return f, nil
 				}
-
-			case ResourceNameIdentifier:
-				if len(fields) > 1 {
-					return nil, trace.BadParameter("only one field are supported with identifier %q, got %d: %v", ResourceNameIdentifier, len(fields), fields)
-				}
-				return resource.GetName(), nil
-			case ResourceIdentifier:
-				return predicate.GetFieldByTag(resource, teleport.JSON, fields[1:])
-			default:
-				return nil, trace.NotFound("%v is not defined", strings.Join(fields, "."))
-			}
-		},
-		GetProperty: func(mapVal, keyVal interface{}) (interface{}, error) {
-			m, ok := mapVal.(labels)
-			if !ok {
-				return GetStringMapValue(mapVal, keyVal)
 			}
 
-			key, ok := keyVal.(string)
-			if !ok {
-				return nil, trace.BadParameter("only string keys are supported")
-			}
-
-			val, ok := m[key]
-			if ok {
-				return label{key: key, value: val}, nil
-			}
-			return label{}, nil
+			identifier := strings.Join(fields, ".")
+			return nil, trace.BadParameter("identifier %s is not defined", identifier)
 		},
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return boolPredicateParser{Parser: p}, nil
+	expr, err := parser.Parse(expression)
+	return expr, trace.Wrap(err)
 }
-
-type label struct {
-	key, value string
-}
-
-type labels map[string]string

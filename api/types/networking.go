@@ -20,10 +20,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gravitational/teleport/api/defaults"
-
-	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // ClusterNetworkingConfig defines cluster networking configuration. This is
@@ -88,10 +88,40 @@ type ClusterNetworkingConfig interface {
 
 	// SetRoutingStrategy sets the routing strategy setting.
 	SetRoutingStrategy(strategy RoutingStrategy)
+
+	// GetTunnelStrategy gets the tunnel strategy.
+	GetTunnelStrategyType() (TunnelStrategyType, error)
+
+	// GetAgentMeshTunnelStrategy gets the agent mesh tunnel strategy.
+	GetAgentMeshTunnelStrategy() *AgentMeshTunnelStrategy
+
+	// GetProxyPeeringTunnelStrategy gets the proxy peering tunnel strategy.
+	GetProxyPeeringTunnelStrategy() *ProxyPeeringTunnelStrategy
+
+	// SetTunnelStrategy sets the tunnel strategy.
+	SetTunnelStrategy(*TunnelStrategyV1)
+
+	// GetProxyPingInterval gets the proxy ping interval.
+	GetProxyPingInterval() time.Duration
+
+	// SetProxyPingInterval sets the proxy ping interval.
+	SetProxyPingInterval(time.Duration)
+
+	// GetCaseInsensitiveRouting gets the case-insensitive routing option.
+	GetCaseInsensitiveRouting() bool
+
+	// SetCaseInsensitiveRouting sets the case-insenstivie routing option.
+	SetCaseInsensitiveRouting(cir bool)
+
+	// GetSSHDialTimeout gets timeout value that should be used for SSH connections.
+	GetSSHDialTimeout() time.Duration
+
+	// SetSSHDialTimeout sets the timeout value that should be used for SSH connections.
+	SetSSHDialTimeout(t time.Duration)
 }
 
 // NewClusterNetworkingConfigFromConfigFile is a convenience method to create
-// ClusterNetworkingConfigV2 labelled as originating from config file.
+// ClusterNetworkingConfigV2 labeled as originating from config file.
 func NewClusterNetworkingConfigFromConfigFile(spec ClusterNetworkingConfigSpecV2) (ClusterNetworkingConfig, error) {
 	return newClusterNetworkingConfigWithLabels(spec, map[string]string{
 		OriginLabel: OriginConfigFile,
@@ -151,14 +181,14 @@ func (c *ClusterNetworkingConfigV2) GetMetadata() Metadata {
 	return c.Metadata
 }
 
-// GetResourceID returns resource ID.
-func (c *ClusterNetworkingConfigV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *ClusterNetworkingConfigV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID.
-func (c *ClusterNetworkingConfigV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *ClusterNetworkingConfigV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // Origin returns the origin value of the resource.
@@ -258,7 +288,7 @@ func (c *ClusterNetworkingConfigV2) SetProxyListenerMode(mode ProxyListenerMode)
 
 // Clone performs a deep copy.
 func (c *ClusterNetworkingConfigV2) Clone() ClusterNetworkingConfig {
-	return proto.Clone(c).(*ClusterNetworkingConfigV2)
+	return utils.CloneProtoMsg(c)
 }
 
 // setStaticFields sets static resource header and metadata fields.
@@ -276,6 +306,37 @@ func (c *ClusterNetworkingConfigV2) GetRoutingStrategy() RoutingStrategy {
 // SetRoutingStrategy sets the routing strategy setting.
 func (c *ClusterNetworkingConfigV2) SetRoutingStrategy(strategy RoutingStrategy) {
 	c.Spec.RoutingStrategy = strategy
+}
+
+// GetTunnelStrategy gets the tunnel strategy type.
+func (c *ClusterNetworkingConfigV2) GetTunnelStrategyType() (TunnelStrategyType, error) {
+	if c.Spec.TunnelStrategy == nil {
+		return "", trace.BadParameter("tunnel strategy is nil")
+	}
+
+	switch c.Spec.TunnelStrategy.Strategy.(type) {
+	case *TunnelStrategyV1_AgentMesh:
+		return AgentMesh, nil
+	case *TunnelStrategyV1_ProxyPeering:
+		return ProxyPeering, nil
+	}
+
+	return "", trace.BadParameter("unknown tunnel strategy type: %T", c.Spec.TunnelStrategy.Strategy)
+}
+
+// GetAgentMeshTunnelStrategy gets the agent mesh tunnel strategy.
+func (c *ClusterNetworkingConfigV2) GetAgentMeshTunnelStrategy() *AgentMeshTunnelStrategy {
+	return c.Spec.TunnelStrategy.GetAgentMesh()
+}
+
+// GetProxyPeeringTunnelStrategy gets the proxy peering tunnel strategy.
+func (c *ClusterNetworkingConfigV2) GetProxyPeeringTunnelStrategy() *ProxyPeeringTunnelStrategy {
+	return c.Spec.TunnelStrategy.GetProxyPeering()
+}
+
+// SetTunnelStrategy sets the tunnel strategy.
+func (c *ClusterNetworkingConfigV2) SetTunnelStrategy(strategy *TunnelStrategyV1) {
+	c.Spec.TunnelStrategy = strategy
 }
 
 // CheckAndSetDefaults verifies the constraints for ClusterNetworkingConfig.
@@ -298,10 +359,59 @@ func (c *ClusterNetworkingConfigV2) CheckAndSetDefaults() error {
 		c.Spec.KeepAliveCountMax = int64(defaults.KeepAliveCountMax)
 	}
 
+	if c.Spec.TunnelStrategy == nil {
+		c.Spec.TunnelStrategy = &TunnelStrategyV1{
+			Strategy: DefaultTunnelStrategy(),
+		}
+	}
+	if err := c.Spec.TunnelStrategy.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	return nil
 }
 
-// MarshalYAML defines how a proxy listener mode should be marshalled to a string
+// GetProxyPingInterval gets the proxy ping interval.
+func (c *ClusterNetworkingConfigV2) GetProxyPingInterval() time.Duration {
+	return c.Spec.ProxyPingInterval.Duration()
+}
+
+// SetProxyPingInterval sets the proxy ping interval.
+func (c *ClusterNetworkingConfigV2) SetProxyPingInterval(interval time.Duration) {
+	c.Spec.ProxyPingInterval = Duration(interval)
+}
+
+// GetCaseInsensitiveRouting gets the case-insensitive routing option.
+func (c *ClusterNetworkingConfigV2) GetCaseInsensitiveRouting() bool {
+	return c.Spec.CaseInsensitiveRouting
+}
+
+// SetCaseInsensitiveRouting sets the case-insensitive routing option.
+func (c *ClusterNetworkingConfigV2) SetCaseInsensitiveRouting(cir bool) {
+	c.Spec.CaseInsensitiveRouting = cir
+}
+
+// GetSSHDialTimeout returns the timeout to be used for SSH connections.
+// If the value is not set, or was intentionally set to zero or a negative value,
+// [defaults.DefaultIOTimeout] is returned instead. This is because
+// a zero value cannot be distinguished to mean no timeout, or
+// that a value had never been set.
+func (c *ClusterNetworkingConfigV2) GetSSHDialTimeout() time.Duration {
+	if c.Spec.SSHDialTimeout <= 0 {
+		return defaults.DefaultIOTimeout
+	}
+
+	return c.Spec.SSHDialTimeout.Duration()
+}
+
+// SetSSHDialTimeout updates the SSH connection timeout. The value is
+// not validated, but will not be respected if zero or negative. See
+// the docs on [ClusterNetworkingConfigV2.GetSSHDialTimeout] for more details.
+func (c *ClusterNetworkingConfigV2) SetSSHDialTimeout(t time.Duration) {
+	c.Spec.SSHDialTimeout = Duration(t)
+}
+
+// MarshalYAML defines how a proxy listener mode should be marshaled to a string
 func (p ProxyListenerMode) MarshalYAML() (interface{}, error) {
 	return strings.ToLower(p.String()), nil
 }
@@ -327,7 +437,7 @@ func (p *ProxyListenerMode) UnmarshalYAML(unmarshal func(interface{}) error) err
 		"proxy listener mode must be one of %s; got %q", strings.Join(available, ","), stringVar)
 }
 
-// MarshalYAML defines how a routing strategy should be marshalled to a string
+// MarshalYAML defines how a routing strategy should be marshaled to a string
 func (s RoutingStrategy) MarshalYAML() (interface{}, error) {
 	return strings.ToLower(s.String()), nil
 }

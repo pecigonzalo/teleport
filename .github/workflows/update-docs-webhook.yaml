@@ -1,0 +1,25 @@
+name: Update docs webhook
+on:
+  push:
+    paths:
+      - 'docs/**'
+    branches:
+      - master
+      - branch/v*
+  workflow_dispatch:
+
+jobs:
+  update-webhook:
+    name: Update docs webhook
+    runs-on: ubuntu-latest
+    environment: update-docs
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Call deployment webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.AMPLIFY_DOCS_DEPLOY_HOOK }}
+        run: |
+          if curl -X POST --silent --fail --show-error "$WEBHOOK_URL" > /dev/null; then
+            echo "Triggered successfully"
+          fi

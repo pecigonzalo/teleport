@@ -1,36 +1,38 @@
 /*
-Copyright 2018-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/fixtures"
+	"fmt"
+	"testing"
 
-	"gopkg.in/check.v1"
-
+	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/types"
 )
 
-type LicenseSuite struct {
-}
+func TestLicenseUnmarshal(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&LicenseSuite{})
-
-func (l *LicenseSuite) TestUnmarshal(c *check.C) {
 	type testCase struct {
 		description string
 		input       string
@@ -40,7 +42,7 @@ func (l *LicenseSuite) TestUnmarshal(c *check.C) {
 	testCases := []testCase{
 		{
 			description: "simple case",
-			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "Teleport Commercial"}, "spec": {"account_id": "accountID", "usage": true, "k8s": true, "app": true, "db": true, "desktop": true, "aws_account": "123", "aws_pid": "4"}}`,
+			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "Teleport Commercial"}, "spec": {"account_id": "accountID", "usage": true, "k8s": true, "app": true, "db": true, "desktop": true, "feature_hiding": false, "aws_account": "123", "aws_pid": "4", "custom_theme": "cool-theme"}}`,
 			expected: MustNew("Teleport Commercial", types.LicenseSpecV3{
 				ReportsUsage:              types.NewBool(true),
 				SupportsKubernetes:        types.NewBool(true),
@@ -48,14 +50,16 @@ func (l *LicenseSuite) TestUnmarshal(c *check.C) {
 				SupportsDatabaseAccess:    types.NewBool(true),
 				SupportsDesktopAccess:     types.NewBool(true),
 				Cloud:                     types.NewBool(false),
+				SupportsFeatureHiding:     types.NewBool(false),
 				AWSAccountID:              "123",
 				AWSProductID:              "4",
 				AccountID:                 "accountID",
+				CustomTheme:               "cool-theme",
 			}),
 		},
 		{
 			description: "simple case with string booleans",
-			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "license"}, "spec": {"account_id": "accountID", "usage": "yes", "k8s": "yes", "app": "yes", "db": "yes", "desktop": "yes", "aws_account": "123", "aws_pid": "4"}}`,
+			input:       `{"kind": "license", "version": "v3", "metadata": {"name": "license"}, "spec": {"account_id": "accountID", "usage": "yes", "k8s": "yes", "app": "yes", "db": "yes", "desktop": "yes", "feature_hiding": "no", "aws_account": "123", "aws_pid": "4", "custom_theme": "cool-theme"}}`,
 			expected: MustNew("license", types.LicenseSpecV3{
 				ReportsUsage:              types.NewBool(true),
 				SupportsKubernetes:        types.NewBool(true),
@@ -63,9 +67,11 @@ func (l *LicenseSuite) TestUnmarshal(c *check.C) {
 				SupportsDatabaseAccess:    types.NewBool(true),
 				SupportsDesktopAccess:     types.NewBool(true),
 				Cloud:                     types.NewBool(false),
+				SupportsFeatureHiding:     types.NewBool(false),
 				AWSAccountID:              "123",
 				AWSProductID:              "4",
 				AccountID:                 "accountID",
+				CustomTheme:               "cool-theme",
 			}),
 		},
 		{
@@ -94,19 +100,67 @@ func (l *LicenseSuite) TestUnmarshal(c *check.C) {
 		},
 	}
 	for _, tc := range testCases {
-		comment := check.Commentf("test case %q", tc.description)
+		comment := fmt.Sprintf("test case %q", tc.description)
 		out, err := UnmarshalLicense([]byte(tc.input))
 		if tc.err == nil {
-			c.Assert(err, check.IsNil, comment)
-			fixtures.DeepCompare(c, tc.expected, out)
+			require.NoError(t, err, comment)
+			require.Empty(t, cmp.Diff(tc.expected, out))
 			data, err := MarshalLicense(out)
-			c.Assert(err, check.IsNil, comment)
+			require.NoError(t, err, comment)
 			out2, err := UnmarshalLicense(data)
-			c.Assert(err, check.IsNil, comment)
-			fixtures.DeepCompare(c, tc.expected, out2)
+			require.NoError(t, err, comment)
+			require.Empty(t, cmp.Diff(tc.expected, out2))
 		} else {
-			c.Assert(err, check.FitsTypeOf, tc.err, comment)
+			require.IsType(t, err, tc.err, comment)
 		}
+	}
+}
+
+func TestIsDashboard(t *testing.T) {
+	tt := []struct {
+		name     string
+		features proto.Features
+		expected bool
+	}{
+		{
+			name: "not cloud nor recovery codes is not dashboard",
+			features: proto.Features{
+				Cloud:         false,
+				RecoveryCodes: false,
+			},
+			expected: false,
+		},
+		{
+			name: "not cloud, with recovery codes is dashboard",
+			features: proto.Features{
+				Cloud:         false,
+				RecoveryCodes: true,
+			},
+			expected: true,
+		},
+		{
+			name: "cloud, with recovery codes is not dashboard",
+			features: proto.Features{
+				Cloud:         true,
+				RecoveryCodes: true,
+			},
+			expected: false,
+		},
+		{
+			name: "cloud, without recovery codes is not dashboard",
+			features: proto.Features{
+				Cloud:         true,
+				RecoveryCodes: false,
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			result := IsDashboard(tc.features)
+			require.Equal(t, tc.expected, result)
+		})
 	}
 }
 

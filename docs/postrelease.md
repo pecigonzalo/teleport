@@ -4,21 +4,21 @@ This checklist is to be run after cutting a release.
 
 ### All releases
 
-- [ ] Create PR to update default Teleport version in Teleport docs
-  - Example: https://github.com/gravitational/teleport/pull/7033
-- [ ] Create PR to update default AMI versions in Makefile and AMIs.md under https://github.com/gravitational/teleport/blob/master/assets/aws
-  - Example command: `TELEPORT_VERSION=6.2.0 make -C assets/aws create-update-pr`
+Our GitHub Actions workflows will create two PRs when a release is published:
+
+1. A PR against the release branch that updates the default version in our docs.
+2. A PR that updates the AWS AMI IDs for the new release. (This job only runs
+   for releases on the latest release branch)
+
+The AWS AMI ID PR can be merged right away.
 
 ### Major releases only
 
 - [ ] Update support matrix in docs FAQ page
-- [ ] Update `CURRENT_VERSION_ROOT` and other previous versions in Drone `teleport-docker-cron` job
-  - Example: https://github.com/gravitational/teleport/pull/4602
-- [ ] Create PR to update default Teleport image referenced in docker/teleport-quickstart.yml and docker/teleport-ent-quickstart.yml
-  - Example: https://github.com/gravitational/teleport/pull/4655
-- [ ] Create PR to update default Teleport image referenced in docker/teleport-lab.yml
-- [ ] Update the CI buildbox image
-  - [ ] Update the `BUILDBOX_VERSION` in `build.assets/Makefile`
-  - [ ] Run `make dronegen` and ensure _all_ buildbox references in the resulting yaml refer to the new image
-  - [ ] Commit and merge. Drone should build new buildbox images and push to `quay.io`
-  - [ ] Once the new images are confirmed in `quay.io`, update the build yaml files under `.cloudbuild` to refer to the new image
+  - Example: https://github.com/gravitational/teleport/pull/50345
+- [ ] Update the list of OCI images to monitor and rebuild nightly in
+  [`monitor-teleport-oci-distroless.yml` on `master`](https://github.com/gravitational/teleport.e/blob/master/.github/workflows/monitor-teleport-oci-distroless.yml) and
+  [`rebuild-teleport-oci-distroless-cron.yml` on `master`](https://github.com/gravitational/teleport.e/blob/master/.github/workflows/rebuild-teleport-oci-distroless-cron.yml)
+- [ ] Update `e/.github/workflows/build-buildboxes-cron.yaml` to bump the
+  branches on each job (two per job) and to comment out the final job that only
+  exists for the pre-release, and bump the versions for the next release.

@@ -1,53 +1,61 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package teleagent
 
 import (
+	"context"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
-	"strings"
+	"os/user"
+	"path/filepath"
 	"time"
 
-	"github.com/gravitational/teleport/lib/utils"
-
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh/agent"
+
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-// Agent extends the agent.Agent interface.
+// Agent extends the agent.ExtendedAgent interface.
 // APIs which accept this interface promise to
 // call `Close()` when they are done using the
 // supplied agent.
 type Agent interface {
-	agent.Agent
+	agent.ExtendedAgent
 	io.Closer
 }
 
 // nopCloser wraps an agent.Agent in the extended
 // Agent interface by adding a NOP closer.
 type nopCloser struct {
-	agent.Agent
+	agent.ExtendedAgent
 }
 
 func (n nopCloser) Close() error { return nil }
 
 // NopCloser wraps an agent.Agent with a NOP closer, allowing it
 // to be passed to APIs which expect the extended agent interface.
-func NopCloser(std agent.Agent) Agent {
+func NopCloser(std agent.ExtendedAgent) Agent {
 	return nopCloser{std}
 }
 
@@ -58,7 +66,8 @@ type Getter func() (Agent, error)
 type AgentServer struct {
 	getAgent Getter
 	listener net.Listener
-	path     string
+	Path     string
+	Dir      string
 }
 
 // NewServer returns new instance of agent server
@@ -66,22 +75,28 @@ func NewServer(getter Getter) *AgentServer {
 	return &AgentServer{getAgent: getter}
 }
 
-// ListenUnixSocket starts listening and serving agent assuming that
-func (a *AgentServer) ListenUnixSocket(path string, uid, gid int, mode os.FileMode) error {
-	l, err := net.Listen("unix", path)
+func (a *AgentServer) SetListener(l net.Listener) {
+	a.listener = l
+	a.Path = l.Addr().String()
+	a.Dir = filepath.Dir(a.Path)
+}
+
+// ListenUnixSocket starts listening on a new unix socket.
+func (a *AgentServer) ListenUnixSocket(sockDir, sockName string, _ *user.User) error {
+	// Create a temp directory to hold the agent socket.
+	sockDir, err := os.MkdirTemp(os.TempDir(), sockDir+"-")
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if err := os.Chown(path, uid, gid); err != nil {
-		l.Close()
-		return trace.ConvertSystemError(err)
+
+	sockPath := filepath.Join(sockDir, sockName)
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		a.Close()
+		return trace.Wrap(err)
 	}
-	if err := os.Chmod(path, mode); err != nil {
-		l.Close()
-		return trace.ConvertSystemError(err)
-	}
-	a.listener = l
-	a.path = path
+
+	a.SetListener(l)
 	return nil
 }
 
@@ -90,19 +105,21 @@ func (a *AgentServer) Serve() error {
 	if a.listener == nil {
 		return trace.BadParameter("Serve needs a Listen call first")
 	}
+
+	ctx := context.Background()
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
 		conn, err := a.listener.Accept()
 		if err != nil {
-			neterr, ok := err.(net.Error)
-			if !ok {
+			var neterr net.Error
+			if !errors.As(err, &neterr) {
 				return trace.Wrap(err, "unknown error")
 			}
-			if !neterr.Temporary() {
-				if strings.Contains(neterr.Error(), "use of closed network connection") {
-					return nil
-				}
-				log.WithError(err).Error("Got permanent error.")
+			if utils.IsUseOfClosedNetworkError(neterr) {
+				return nil
+			}
+			if !neterr.Timeout() {
+				slog.ErrorContext(ctx, "Got non-timeout error", "error", err)
 				return trace.Wrap(err)
 			}
 			if tempDelay == 0 {
@@ -113,7 +130,7 @@ func (a *AgentServer) Serve() error {
 			if max := 1 * time.Second; tempDelay > max {
 				tempDelay = max
 			}
-			log.WithError(err).Errorf("Got temporary error (will sleep %v).", tempDelay)
+			slog.ErrorContext(ctx, "Got timeout error - backing off", "delay_time", tempDelay, "error", err)
 			time.Sleep(tempDelay)
 			continue
 		}
@@ -122,7 +139,7 @@ func (a *AgentServer) Serve() error {
 		// get an agent instance for serving this conn
 		instance, err := a.getAgent()
 		if err != nil {
-			log.WithError(err).Error("Failed to get agent.")
+			slog.ErrorContext(ctx, "Failed to get agent", "error", err)
 			return trace.Wrap(err)
 		}
 
@@ -130,10 +147,8 @@ func (a *AgentServer) Serve() error {
 		// separate goroutine.
 		go func() {
 			defer instance.Close()
-			if err := agent.ServeAgent(instance, conn); err != nil {
-				if err != io.EOF {
-					log.Error(err)
-				}
+			if err := agent.ServeAgent(instance, conn); err != nil && !errors.Is(err, io.EOF) {
+				slog.ErrorContext(ctx, "Serving agent terminated unexpectedly", "error", err)
 			}
 		}()
 	}
@@ -153,13 +168,20 @@ func (a *AgentServer) ListenAndServe(addr utils.NetAddr) error {
 func (a *AgentServer) Close() error {
 	var errors []error
 	if a.listener != nil {
-		log.Debugf("AgentServer(%v) is closing", a.listener.Addr())
+		slog.DebugContext(context.Background(), "AgentServer is closing",
+			"listen_addr", logutils.StringerAttr(a.listener.Addr()),
+		)
 		if err := a.listener.Close(); err != nil {
 			errors = append(errors, trace.ConvertSystemError(err))
 		}
 	}
-	if a.path != "" {
-		if err := os.Remove(a.path); err != nil {
+	if a.Path != "" {
+		if err := os.Remove(a.Path); err != nil {
+			errors = append(errors, trace.ConvertSystemError(err))
+		}
+	}
+	if a.Dir != "" {
+		if err := os.RemoveAll(a.Dir); err != nil {
 			errors = append(errors, trace.ConvertSystemError(err))
 		}
 	}

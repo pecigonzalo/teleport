@@ -17,19 +17,31 @@ limitations under the License.
 package types
 
 import (
+	"net/netip"
+	"net/url"
+	"slices"
+	"strings"
 	"time"
 
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/api/utils"
-
 	"github.com/gravitational/trace"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // OIDCConnector specifies configuration for Open ID Connect compatible external
-// identity provider, e.g. google in some organisation
+// identity provider, e.g. google in some organization
 type OIDCConnector interface {
 	// ResourceWithSecrets provides common methods for objects
 	ResourceWithSecrets
+	ResourceWithOrigin
+	// Validate will preform checks not found in CheckAndSetDefaults
+	// that should only be preformed when the OIDC connector resource
+	// itself is being created or updated, not when a OIDCConnector
+	// object is being created or updated.
+	Validate() error
 	// Issuer URL is the endpoint of the provider, e.g. https://accounts.google.com
 	GetIssuerURL() string
 	// ClientID is id for authentication client (in our case it's our Auth server)
@@ -37,10 +49,8 @@ type OIDCConnector interface {
 	// ClientSecret is used to authenticate our client and should not
 	// be visible to end user
 	GetClientSecret() string
-	// RedirectURL - Identity provider will use this URL to redirect
-	// client's browser back to it after successful authentication
-	// Should match the URL on Provider's side
-	GetRedirectURL() string
+	// GetRedirectURLs returns list of redirect URLs.
+	GetRedirectURLs() []string
 	// GetACR returns the Authentication Context Class Reference (ACR) value.
 	GetACR() string
 	// GetProvider returns the identity provider.
@@ -62,8 +72,8 @@ type OIDCConnector interface {
 	SetClientID(string)
 	// SetIssuerURL sets the endpoint of the provider
 	SetIssuerURL(string)
-	// SetRedirectURL sets RedirectURL
-	SetRedirectURL(string)
+	// SetRedirectURLs sets the list of redirectURLs
+	SetRedirectURLs([]string)
 	// SetPrompt sets OIDC prompt value
 	SetPrompt(string)
 	// GetPrompt returns OIDC prompt value,
@@ -76,6 +86,8 @@ type OIDCConnector interface {
 	SetScope([]string)
 	// SetClaimsToRoles sets dynamic mapping from claims to roles
 	SetClaimsToRoles([]ClaimMapping)
+	// GetUsernameClaim gets the name of the claim from the OIDC connector to be used as the user's username.
+	GetUsernameClaim() string
 	// SetDisplay sets friendly name for this provider.
 	SetDisplay(string)
 	// GetGoogleServiceAccountURI returns path to google service account URI
@@ -88,6 +100,21 @@ type OIDCConnector interface {
 	// https://developers.google.com/identity/protocols/OAuth2ServiceAccount#delegatingauthority
 	// "Note: Although you can use service accounts in applications that run from a Google Workspace (formerly G Suite) domain, service accounts are not members of your Google Workspace account and aren’t subject to domain policies set by  administrators. For example, a policy set in the Google Workspace admin console to restrict the ability of end users to share documents outside of the domain would not apply to service accounts."
 	GetGoogleAdminEmail() string
+	// GetAllowUnverifiedEmail returns true if unverified emails should be allowed in received users.
+	GetAllowUnverifiedEmail() bool
+	// GetMaxAge returns the amount of time that user logins are
+	// valid for and true if MaxAge is set. If a user logs in, but then
+	// does not login again within this time period, they will be forced
+	// to re-authenticate.
+	GetMaxAge() (time.Duration, bool)
+	// GetClientRedirectSettings returns the client redirect settings.
+	GetClientRedirectSettings() *SSOClientRedirectSettings
+	// GetMFASettings returns the connector's MFA settings.
+	GetMFASettings() *OIDCConnectorMFASettings
+	// IsMFAEnabled returns whether the connector has MFA enabled.
+	IsMFAEnabled() bool
+	// WithMFASettings returns the connector will some settings overwritten set from MFA settings.
+	WithMFASettings() error
 }
 
 // NewOIDCConnector returns a new OIDCConnector based off a name and OIDCConnectorSpecV3.
@@ -163,14 +190,14 @@ func (o *OIDCConnectorV3) GetKind() string {
 	return o.Kind
 }
 
-// GetResourceID returns resource ID
-func (o *OIDCConnectorV3) GetResourceID() int64 {
-	return o.Metadata.ID
+// GetRevision returns the revision
+func (o *OIDCConnectorV3) GetRevision() string {
+	return o.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (o *OIDCConnectorV3) SetResourceID(id int64) {
-	o.Metadata.ID = id
+// SetRevision sets the revision
+func (o *OIDCConnectorV3) SetRevision(rev string) {
+	o.Metadata.SetRevision(rev)
 }
 
 // WithoutSecrets returns an instance of resource without secrets.
@@ -182,6 +209,9 @@ func (o *OIDCConnectorV3) WithoutSecrets() Resource {
 
 	o2.SetClientSecret("")
 	o2.SetGoogleServiceAccount("")
+	if o2.Spec.MFASettings != nil {
+		o2.Spec.MFASettings.ClientSecret = ""
+	}
 
 	return &o2
 }
@@ -199,6 +229,16 @@ func (o *OIDCConnectorV3) SetDisplay(display string) {
 // GetMetadata returns object metadata
 func (o *OIDCConnectorV3) GetMetadata() Metadata {
 	return o.Metadata
+}
+
+// Origin returns the origin value of the resource.
+func (o *OIDCConnectorV3) Origin() string {
+	return o.Metadata.Origin()
+}
+
+// SetOrigin sets the origin value of the resource.
+func (o *OIDCConnectorV3) SetOrigin(origin string) {
+	o.Metadata.SetOrigin(origin)
 }
 
 // SetExpiry sets expiry time for the object
@@ -226,9 +266,9 @@ func (o *OIDCConnectorV3) SetIssuerURL(issuerURL string) {
 	o.Spec.IssuerURL = issuerURL
 }
 
-// SetRedirectURL sets client secret to some value
-func (o *OIDCConnectorV3) SetRedirectURL(redirectURL string) {
-	o.Spec.RedirectURL = redirectURL
+// SetRedirectURLs sets the list of redirectURLs
+func (o *OIDCConnectorV3) SetRedirectURLs(redirectURLs []string) {
+	o.Spec.RedirectURLs = redirectURLs
 }
 
 // SetACR sets the Authentication Context Class Reference (ACR) value.
@@ -277,11 +317,9 @@ func (o *OIDCConnectorV3) GetClientSecret() string {
 	return o.Spec.ClientSecret
 }
 
-// GetRedirectURL - Identity provider will use this URL to redirect
-// client's browser back to it after successful authentication
-// Should match the URL on Provider's side
-func (o *OIDCConnectorV3) GetRedirectURL() string {
-	return o.Spec.RedirectURL
+// GetRedirectURLs returns a list of the connector's redirect URLs.
+func (o *OIDCConnectorV3) GetRedirectURLs() []string {
+	return o.Spec.RedirectURLs
 }
 
 // GetACR returns the Authentication Context Class Reference (ACR) value.
@@ -305,6 +343,11 @@ func (o *OIDCConnectorV3) GetDisplay() string {
 // GetScope is additional scopes set by provider
 func (o *OIDCConnectorV3) GetScope() []string {
 	return o.Spec.Scope
+}
+
+// GetUsernameClaim gets the name of the claim from the OIDC connector to be used as the user's username.
+func (o *OIDCConnectorV3) GetUsernameClaim() string {
+	return o.Spec.UsernameClaim
 }
 
 // GetClaimsToRoles specifies dynamic mapping from claims to roles
@@ -356,19 +399,191 @@ func (o *OIDCConnectorV3) CheckAndSetDefaults() error {
 		return trace.Wrap(err)
 	}
 
-	if o.Metadata.Name == constants.Local {
-		return trace.BadParameter("ID: invalid connector name, %v is a reserved name", constants.Local)
-	}
-	if o.Spec.ClientID == "" {
-		return trace.BadParameter("ClientID: missing client id")
+	if name := o.Metadata.Name; slices.Contains(constants.SystemConnectors, name) {
+		return trace.BadParameter("ID: invalid connector name, %v is a reserved name", name)
 	}
 
-	// make sure claim mappings have either roles or a role template
+	if o.Spec.ClientID == "" {
+		return trace.BadParameter("OIDC connector is missing required client_id")
+	}
+
+	if o.Spec.ClientSecret == "" {
+		return trace.BadParameter("OIDC connector is missing required client_secret")
+	}
+	if strings.HasPrefix(o.Spec.ClientSecret, "file://") {
+		return trace.BadParameter("the client_secret must be a literal value, file:// URLs are not supported")
+	}
+
+	if len(o.GetClaimsToRoles()) == 0 {
+		return trace.BadParameter("claims_to_roles is empty, authorization with connector would never assign any roles")
+	}
 	for _, v := range o.Spec.ClaimsToRoles {
 		if len(v.Roles) == 0 {
 			return trace.BadParameter("add roles in claims_to_roles")
 		}
 	}
 
+	if _, err := url.Parse(o.GetIssuerURL()); err != nil {
+		return trace.BadParameter("bad IssuerURL '%v', err: %v", o.GetIssuerURL(), err)
+	}
+
+	if len(o.GetRedirectURLs()) == 0 {
+		return trace.BadParameter("RedirectURL: missing redirect_url")
+	}
+	for _, redirectURL := range o.GetRedirectURLs() {
+		if _, err := url.Parse(redirectURL); err != nil {
+			return trace.BadParameter("bad RedirectURL '%v', err: %v", redirectURL, err)
+		}
+	}
+
+	if o.GetGoogleServiceAccountURI() != "" && o.GetGoogleServiceAccount() != "" {
+		return trace.BadParameter("one of either google_service_account_uri or google_service_account is supported, not both")
+	}
+
+	if o.GetGoogleServiceAccountURI() != "" {
+		uri, err := utils.ParseSessionsURI(o.GetGoogleServiceAccountURI())
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		if uri.Scheme != "file" {
+			return trace.BadParameter("only file:// scheme is supported for google_service_account_uri")
+		}
+		if o.GetGoogleAdminEmail() == "" {
+			return trace.BadParameter("whenever google_service_account_uri is specified, google_admin_email should be set as well, read https://developers.google.com/identity/protools/OAuth2ServiceAccount#delegatingauthority for more details")
+		}
+	}
+
+	if o.GetGoogleServiceAccount() != "" {
+		if o.GetGoogleAdminEmail() == "" {
+			return trace.BadParameter("whenever google_service_account is specified, google_admin_email should be set as well, read https://developers.google.com/identity/protocols/OAuth2ServiceAccount#delegatingauthority for more details")
+		}
+	}
+
+	if o.Spec.MaxAge != nil {
+		maxAge := o.Spec.MaxAge.Value.Duration()
+		if maxAge < 0 {
+			return trace.BadParameter("max_age cannot be negative")
+		}
+		if maxAge.Round(time.Second) != maxAge {
+			return trace.BadParameter("max_age %q is invalid, cannot have sub-second units", maxAge.String())
+		}
+	}
+
+	if o.Spec.MFASettings != nil {
+		maxAge := o.Spec.MFASettings.MaxAge.Duration()
+		if maxAge < 0 {
+			return trace.BadParameter("max_age cannot be negative")
+		}
+		if maxAge.Round(time.Second) != maxAge {
+			return trace.BadParameter("max_age %q invalid, cannot have sub-second units", maxAge.String())
+		}
+	}
+
+	return nil
+}
+
+// Validate will preform checks not found in CheckAndSetDefaults
+// that should only be preformed when the OIDC connector resource
+// itself is being created or updated, not when a OIDCConnector
+// object is being created or updated.
+func (o *OIDCConnectorV3) Validate() error {
+	if o.Spec.ClientRedirectSettings != nil {
+		for _, cidrStr := range o.Spec.ClientRedirectSettings.InsecureAllowedCidrRanges {
+			_, err := netip.ParsePrefix(cidrStr)
+			if err != nil {
+				return trace.BadParameter("bad CIDR range in insecure_allowed_cidr_ranges '%s': %v", cidrStr, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// GetAllowUnverifiedEmail returns true if unverified emails should be allowed in received users.
+func (o *OIDCConnectorV3) GetAllowUnverifiedEmail() bool {
+	return o.Spec.AllowUnverifiedEmail
+}
+
+// GetMaxAge returns the amount of time that user logins are
+// valid for and true if MaxAge is set. If a user logs in, but then
+// does not login again within this time period, they will be forced
+// to re-authenticate.
+func (o *OIDCConnectorV3) GetMaxAge() (time.Duration, bool) {
+	if o.Spec.MaxAge == nil {
+		return 0, false
+	}
+	return o.Spec.MaxAge.Value.Duration(), true
+}
+
+// GetClientRedirectSettings returns the client redirect settings.
+func (o *OIDCConnectorV3) GetClientRedirectSettings() *SSOClientRedirectSettings {
+	if o == nil {
+		return nil
+	}
+	return o.Spec.ClientRedirectSettings
+}
+
+// GetMFASettings returns the connector's MFA settings.
+func (o *OIDCConnectorV3) GetMFASettings() *OIDCConnectorMFASettings {
+	return o.Spec.MFASettings
+}
+
+// IsMFAEnabled returns whether the connector has MFA enabled.
+func (o *OIDCConnectorV3) IsMFAEnabled() bool {
+	mfa := o.GetMFASettings()
+	return mfa != nil && mfa.Enabled
+}
+
+// WithMFASettings returns the connector will some settings overwritten set from MFA settings.
+func (o *OIDCConnectorV3) WithMFASettings() error {
+	if !o.IsMFAEnabled() {
+		return trace.BadParameter("this connector does not have MFA enabled")
+	}
+
+	o.Spec.ClientID = o.Spec.MFASettings.ClientId
+	o.Spec.ClientSecret = o.Spec.MFASettings.ClientSecret
+	o.Spec.ACR = o.Spec.MFASettings.AcrValues
+	o.Spec.Prompt = o.Spec.MFASettings.Prompt
+	o.Spec.MaxAge = &MaxAge{
+		Value: o.Spec.MFASettings.MaxAge,
+	}
+	return nil
+}
+
+// Check returns nil if all parameters are great, err otherwise
+func (r *OIDCAuthRequest) Check() error {
+	switch {
+	case r.ConnectorID == "":
+		return trace.BadParameter("ConnectorID: missing value")
+	case r.StateToken == "":
+		return trace.BadParameter("StateToken: missing value")
+	case len(r.PublicKey) != 0 && len(r.SshPublicKey) != 0:
+		return trace.BadParameter("illegal to set both PublicKey and SshPublicKey")
+	case len(r.PublicKey) != 0 && len(r.TlsPublicKey) != 0:
+		return trace.BadParameter("illegal to set both PublicKey and TlsPublicKey")
+	case r.AttestationStatement != nil && r.SshAttestationStatement != nil:
+		return trace.BadParameter("illegal to set both AttestationStatement and SshAttestationStatement")
+	case r.AttestationStatement != nil && r.TlsAttestationStatement != nil:
+		return trace.BadParameter("illegal to set both AttestationStatement and TlsAttestationStatement")
+	// we could collapse these two checks into one, but the error message would become ambiguous.
+	case r.SSOTestFlow && r.ConnectorSpec == nil:
+		return trace.BadParameter("ConnectorSpec cannot be nil when SSOTestFlow is true")
+	case !r.SSOTestFlow && r.ConnectorSpec != nil:
+		return trace.BadParameter("ConnectorSpec must be nil when SSOTestFlow is false")
+	}
+	sshPubKey := r.PublicKey
+	if len(sshPubKey) == 0 {
+		sshPubKey = r.SshPublicKey
+	}
+	if len(sshPubKey) > 0 {
+		_, _, _, _, err := ssh.ParseAuthorizedKey(sshPubKey)
+		if err != nil {
+			return trace.BadParameter("bad SSH public key: %v", err)
+		}
+	}
+	if len(r.PublicKey)+len(r.SshPublicKey)+len(r.TlsPublicKey) > 0 &&
+		(r.CertTTL > defaults.MaxCertDuration || r.CertTTL < defaults.MinCertDuration) {
+		return trace.BadParameter("wrong CertTTL")
+	}
 	return nil
 }

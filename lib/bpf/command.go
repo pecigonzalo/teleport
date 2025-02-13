@@ -2,33 +2,34 @@
 // +build bpf,!386
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package bpf
 
 import (
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
+	_ "embed"
 
 	"github.com/aquasecurity/libbpfgo"
+	"github.com/gravitational/trace"
 	"github.com/prometheus/client_golang/prometheus"
 
-	_ "embed"
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/observability/metrics"
 )
 
 var (
@@ -70,7 +71,7 @@ type rawExecEvent struct {
 }
 
 type exec struct {
-	module *libbpfgo.Module
+	session
 
 	eventBuf *RingBuffer
 	lost     *Counter
@@ -79,7 +80,7 @@ type exec struct {
 // startExec will load, start, and pull events off the ring buffer
 // for the BPF program.
 func startExec(bufferSize int) (*exec, error) {
-	err := utils.RegisterPrometheusCollectors(lostCommandEvents)
+	err := metrics.RegisterPrometheusCollectors(lostCommandEvents)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -91,36 +92,36 @@ func startExec(bufferSize int) (*exec, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	e.module, err = libbpfgo.NewModuleFromBuffer(commandBPF, "command")
+	e.session.module, err = libbpfgo.NewModuleFromBuffer(commandBPF, "command")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Resizing the ring buffer must be done here, after the module
 	// was created but before it's loaded into the kernel.
-	if err = ResizeMap(e.module, commandEventsBuffer, uint32(bufferSize*pageSize)); err != nil {
+	if err = ResizeMap(e.session.module, commandEventsBuffer, uint32(bufferSize*pageSize)); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Load into the kernel
-	if err = e.module.BPFLoadObject(); err != nil {
+	if err = e.session.module.BPFLoadObject(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	syscalls := []string{"execve", "execveat"}
 
 	for _, syscall := range syscalls {
-		if err = AttachSyscallTracepoint(e.module, syscall); err != nil {
+		if err = AttachSyscallTracepoint(e.session.module, syscall); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
 
-	e.eventBuf, err = NewRingBuffer(e.module, commandEventsBuffer)
+	e.eventBuf, err = NewRingBuffer(e.session.module, commandEventsBuffer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	e.lost, err = NewCounter(e.module, "lost", lostCommandEvents)
+	e.lost, err = NewCounter(e.session.module, "lost", lostCommandEvents)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -133,7 +134,7 @@ func startExec(bufferSize int) (*exec, error) {
 func (e *exec) close() {
 	e.lost.Close()
 	e.eventBuf.Close()
-	e.module.Close()
+	e.session.module.Close()
 }
 
 // events contains raw events off the perf buffer.

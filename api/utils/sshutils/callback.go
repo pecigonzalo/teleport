@@ -17,8 +17,11 @@ limitations under the License.
 package sshutils
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"github.com/jonboulle/clockwork"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -34,13 +37,18 @@ type HostKeyCallbackConfig struct {
 	// FIPS allows to set FIPS mode which will validate algorithms.
 	FIPS bool
 	// OnCheckCert is called on SSH certificate validation.
-	OnCheckCert func(*ssh.Certificate)
+	OnCheckCert func(*ssh.Certificate) error
+	// Clock is used to set the Checker Time
+	Clock clockwork.Clock
 }
 
 // Check validates the config.
 func (c *HostKeyCallbackConfig) Check() error {
 	if c.GetHostCheckers == nil {
 		return trace.BadParameter("missing GetHostCheckers")
+	}
+	if c.Clock == nil {
+		c.Clock = clockwork.NewRealClock()
 	}
 	return nil
 }
@@ -54,6 +62,7 @@ func NewHostKeyCallback(conf HostKeyCallbackConfig) (ssh.HostKeyCallback, error)
 		CertChecker: ssh.CertChecker{
 			IsHostAuthority: makeIsHostAuthorityFunc(conf.GetHostCheckers),
 			HostKeyFallback: conf.HostKeyFallback,
+			Clock:           conf.Clock.Now,
 		},
 		FIPS:        conf.FIPS,
 		OnCheckCert: conf.OnCheckCert,
@@ -65,7 +74,7 @@ func makeIsHostAuthorityFunc(getCheckers CheckersGetter) func(key ssh.PublicKey,
 	return func(key ssh.PublicKey, host string) bool {
 		checkers, err := getCheckers()
 		if err != nil {
-			logrus.WithError(err).Errorf("Failed to get checkers for %v.", host)
+			slog.ErrorContext(context.Background(), "Failed to get checkers.", "host", host, "error", err)
 			return false
 		}
 		for _, checker := range checkers {
@@ -80,7 +89,7 @@ func makeIsHostAuthorityFunc(getCheckers CheckersGetter) func(key ssh.PublicKey,
 				}
 			}
 		}
-		logrus.Debugf("No CA for host %v.", host)
+		slog.DebugContext(context.Background(), "No CA found for target host.", "host", host)
 		return false
 	}
 }

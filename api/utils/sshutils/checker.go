@@ -17,13 +17,15 @@ limitations under the License.
 package sshutils
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"net"
 
-	"github.com/gravitational/teleport/api/constants"
-
 	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/constants"
 )
 
 // CertChecker is a drop-in replacement for ssh.CertChecker. In FIPS mode,
@@ -36,7 +38,7 @@ type CertChecker struct {
 	FIPS bool
 
 	// OnCheckCert is called when validating host certificate.
-	OnCheckCert func(*ssh.Certificate)
+	OnCheckCert func(*ssh.Certificate) error
 }
 
 // Authenticate checks the validity of a user certificate.
@@ -67,7 +69,9 @@ func (c *CertChecker) CheckCert(principal string, cert *ssh.Certificate) error {
 	}
 
 	if c.OnCheckCert != nil {
-		c.OnCheckCert(cert)
+		if err := c.OnCheckCert(cert); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	return nil
@@ -86,7 +90,9 @@ func (c *CertChecker) CheckHostKey(addr string, remote net.Addr, key ssh.PublicK
 	}
 
 	if cert, ok := key.(*ssh.Certificate); ok && c.OnCheckCert != nil {
-		c.OnCheckCert(cert)
+		if err := c.OnCheckCert(cert); err != nil {
+			return trace.Wrap(err)
+		}
 	}
 
 	return nil
@@ -119,12 +125,21 @@ func validateFIPSAlgorithm(key ssh.PublicKey) error {
 	if !ok {
 		return trace.BadParameter("unable to determine underlying public key")
 	}
-	k, ok := cryptoKey.CryptoPublicKey().(*rsa.PublicKey)
-	if !ok {
-		return trace.BadParameter("only RSA keys supported")
-	}
-	if k.N.BitLen() != constants.RSAKeySize {
-		return trace.BadParameter("found %v-bit key, only %v-bit supported", k.N.BitLen(), constants.RSAKeySize)
+	switch k := cryptoKey.CryptoPublicKey().(type) {
+	case *rsa.PublicKey:
+		if k.N.BitLen() != constants.RSAKeySize {
+			return trace.BadParameter("found %v-bit RSA key, only %v-bit supported", k.N.BitLen(), constants.RSAKeySize)
+		}
+	case *ecdsa.PublicKey:
+		if k.Curve != elliptic.P256() && k.Curve != elliptic.P384() {
+			params := k.Curve.Params()
+			if params == nil {
+				return trace.BadParameter("unable to determine curve of ECDSA public key")
+			}
+			return trace.BadParameter("found ECDSA key with curve %s, only P-256 and P-384 are supported", params.Name)
+		}
+	default:
+		return trace.BadParameter("only RSA and ECDSA keys supported")
 	}
 	return nil
 }

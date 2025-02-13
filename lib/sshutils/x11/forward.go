@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package X11 contains contains the ssh client/server helper functions
 // for performing X11 forwarding.
@@ -18,48 +22,18 @@ package x11
 
 import (
 	"context"
-	"io"
-	"sync"
 
-	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
 )
 
-// forwardIO forwards io between two XServer connections until
-// one of the connections is closed. If the ctx is closed early,
-// the function will return, but forwarding will continue until
-// the XServer connnections are closed.
-func Forward(ctx context.Context, client, server XServerConn) error {
-	errs := make(chan error)
-	var wg sync.WaitGroup
+const (
+	// ForwardRequest is a request to initiate X11 forwarding.
+	ForwardRequest = "x11-req"
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(client, server)
-		errs <- trace.Wrap(err)
-		// Send other goroutine an EOF
-		err = client.CloseWrite()
-		errs <- trace.Wrap(err)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(server, client)
-		errs <- trace.Wrap(err)
-		// Send other goroutine an EOF
-		err = server.CloseWrite()
-		errs <- trace.Wrap(err)
-	}()
-
-	go func() {
-		wg.Wait()
-		close(errs)
-	}()
-
-	return trace.NewAggregateFromChannel(errs, ctx)
-}
+	// ChannelRequest is the type of an X11 forwarding channel.
+	ChannelRequest = "x11"
+)
 
 // ForwardRequestPayload according to http://www.ietf.org/rfc/rfc4254.txt
 type ForwardRequestPayload struct {
@@ -88,7 +62,7 @@ func RequestForwarding(sess *ssh.Session, xauthEntry *XAuthEntry) error {
 		ScreenNumber: uint32(xauthEntry.Display.ScreenNumber),
 	}
 
-	ok, err := sess.SendRequest(sshutils.X11ForwardRequest, true, ssh.Marshal(payload))
+	ok, err := sess.SendRequest(ForwardRequest, true, ssh.Marshal(payload))
 	if err != nil {
 		return trace.Wrap(err)
 	} else if !ok {
@@ -111,9 +85,9 @@ type x11ChannelHandler func(ctx context.Context, nch ssh.NewChannel)
 // ServeChannelRequests opens an X11 channel handler and starts a
 // goroutine to serve any channels received with the handler provided.
 func ServeChannelRequests(ctx context.Context, clt *ssh.Client, handler x11ChannelHandler) error {
-	channels := clt.HandleChannelOpen(sshutils.X11ChannelRequest)
+	channels := clt.HandleChannelOpen(ChannelRequest)
 	if channels == nil {
-		return trace.AlreadyExists("X11 forwarding channel already open")
+		return trace.Wrap(trace.AlreadyExists("X11 forwarding channel already open"))
 	}
 
 	go func() {

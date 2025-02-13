@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gravitational/teleport/api/constants"
-
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/constants"
 )
 
 // SemaphoreKindConnection is the semaphore kind used by
@@ -31,6 +31,29 @@ import (
 // connections (corresponds to the `max_connections`
 // role option).
 const SemaphoreKindConnection = "connection"
+
+// SemaphoreKindKubernetesConnection is the semaphore kind used by
+// the Concurrent Session Control feature to limit concurrent
+// connections for Kubernetes (corresponds to the `max_kubernetes_connections`
+// role option).
+const SemaphoreKindKubernetesConnection = "kubernetes_connection"
+
+// SemaphoreKindHostUserModification is the semaphore kind used to limit
+// the number of operations that can occur on a unix user to one at a time
+const SemaphoreKindHostUserModification = "host_user_modification"
+
+// SemaphoreKindAccessMonitoringLimiter is the semaphore kind used by
+// the Access Monitoring feature during handling user queries.
+const SemaphoreKindAccessMonitoringLimiter = "access_monitoring_limiter"
+
+// SemaphoreKindUploadCompleter is the semaphore kind used by the
+// auth server's upload completer to protect access to the shared
+// session recordings backend.
+const SemaphoreKindUploadCompleter = "upload_completer"
+
+// SemaphoreKindAccessListReminderLimiter is the semaphore kind used by
+// the periodic check which creates access list reminder notifications.
+const SemaphoreKindAccessListReminderLimiter = "access_list_reminder_limiter"
 
 // Semaphore represents distributed semaphore concept
 type Semaphore interface {
@@ -226,14 +249,14 @@ func (c *SemaphoreV3) GetKind() string {
 	return c.Kind
 }
 
-// GetResourceID returns resource ID
-func (c *SemaphoreV3) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *SemaphoreV3) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *SemaphoreV3) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *SemaphoreV3) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the cluster.

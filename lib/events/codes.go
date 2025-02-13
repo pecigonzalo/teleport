@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -26,255 +28,19 @@ type Event struct {
 	Code string
 }
 
-var (
-	// UserLocalLoginE is emitted when a local user successfully logs in.
-	UserLocalLoginE = Event{
-		Name: UserLoginEvent,
-		Code: UserLocalLoginCode,
-	}
-	// UserLocalLoginFailureE is emitted when a local user login attempt fails.
-	UserLocalLoginFailureE = Event{
-		Name: UserLoginEvent,
-		Code: UserLocalLoginFailureCode,
-	}
-	// UserSSOLoginE is emitted when an SSO user successfully logs in.
-	UserSSOLoginE = Event{
-		Name: UserLoginEvent,
-		Code: UserSSOLoginCode,
-	}
-	// UserSSOLoginFailureE is emitted when an SSO user login attempt fails.
-	UserSSOLoginFailureE = Event{
-		Name: UserLoginEvent,
-		Code: UserSSOLoginFailureCode,
-	}
-	// UserUpdateE is emitted when a user is updated.
-	UserUpdateE = Event{
-		Name: UserUpdatedEvent,
-		Code: UserUpdateCode,
-	}
-	// UserDeleteE is emitted when a user is deleted.
-	UserDeleteE = Event{
-		Name: UserDeleteEvent,
-		Code: UserDeleteCode,
-	}
-	// UserCreateE is emitted when a user is created.
-	UserCreateE = Event{
-		Name: UserCreateEvent,
-		Code: UserCreateCode,
-	}
-	// UserPasswordChangeE is emitted when a user changes their own password.
-	UserPasswordChangeE = Event{
-		Name: UserPasswordChangeEvent,
-		Code: UserPasswordChangeCode,
-	}
-	// SessionStartE is emitted when a user starts a new session.
-	SessionStartE = Event{
-		Name: SessionStartEvent,
-		Code: SessionStartCode,
-	}
-	// SessionJoinE is emitted when a user joins the session.
-	SessionJoinE = Event{
-		Name: SessionJoinEvent,
-		Code: SessionJoinCode,
-	}
-	// TerminalResizeE is emitted when a user resizes the terminal.
-	TerminalResizeE = Event{
-		Name: ResizeEvent,
-		Code: TerminalResizeCode,
-	}
-	// SessionLeaveE is emitted when a user leaves the session.
-	SessionLeaveE = Event{
-		Name: SessionLeaveEvent,
-		Code: SessionLeaveCode,
-	}
-	// SessionEndE is emitted when a user ends the session.
-	SessionEndE = Event{
-		Name: SessionEndEvent,
-		Code: SessionEndCode,
-	}
-	// SessionUploadE is emitted after a session recording has been uploaded.
-	SessionUploadE = Event{
-		Name: SessionUploadEvent,
-		Code: SessionUploadCode,
-	}
-	// SessionDataE is emitted to report session data usage.
-	SessionDataE = Event{
-		Name: SessionDataEvent,
-		Code: SessionDataCode,
-	}
-	// SubsystemE is emitted when a user requests a new subsystem.
-	SubsystemE = Event{
-		Name: SubsystemEvent,
-		Code: SubsystemCode,
-	}
-	// SubsystemFailureE is emitted when a user subsystem request fails.
-	SubsystemFailureE = Event{
-		Name: SubsystemEvent,
-		Code: SubsystemFailureCode,
-	}
-	// ExecE is emitted when a user executes a command on a node.
-	ExecE = Event{
-		Name: ExecEvent,
-		Code: ExecCode,
-	}
-	// ExecFailureE is emitted when a user command execution fails.
-	ExecFailureE = Event{
-		Name: ExecEvent,
-		Code: ExecFailureCode,
-	}
-	// X11ForwardE is emitted when a user requests X11 forwarding.
-	X11ForwardE = Event{
-		Name: X11ForwardEvent,
-		Code: X11ForwardCode,
-	}
-	// X11ForwardFailureE is emitted when an X11 forwarding request fails.
-	X11ForwardFailureE = Event{
-		Name: X11ForwardEvent,
-		Code: X11ForwardFailureCode,
-	}
-	// PortForwardE is emitted when a user requests port forwarding.
-	PortForwardE = Event{
-		Name: PortForwardEvent,
-		Code: PortForwardCode,
-	}
-	// PortForwardFailureE is emitted when a port forward request fails.
-	PortForwardFailureE = Event{
-		Name: PortForwardEvent,
-		Code: PortForwardFailureCode,
-	}
-	// SCPDownloadE is emitted when a user downloads a file.
-	SCPDownloadE = Event{
-		Name: SCPEvent,
-		Code: SCPDownloadCode,
-	}
-	// SCPDownloadFailureE is emitted when a file download fails.
-	SCPDownloadFailureE = Event{
-		Name: SCPEvent,
-		Code: SCPDownloadFailureCode,
-	}
-	// SCPUploadE is emitted when a user uploads a file.
-	SCPUploadE = Event{
-		Name: SCPEvent,
-		Code: SCPUploadCode,
-	}
-	// SCPUploadFailureE is emitted when a file upload fails.
-	SCPUploadFailureE = Event{
-		Name: SCPEvent,
-		Code: SCPUploadFailureCode,
-	}
-	// ClientDisconnectE is emitted when a user session is disconnected.
-	ClientDisconnectE = Event{
-		Name: ClientDisconnectEvent,
-		Code: ClientDisconnectCode,
-	}
-	// AuthAttemptFailureE is emitted upon a failed authentication attempt.
-	AuthAttemptFailureE = Event{
-		Name: AuthAttemptEvent,
-		Code: AuthAttemptFailureCode,
-	}
-	// AccessRequestCreatedE is emitted when an access request is created.
-	AccessRequestCreatedE = Event{
-		Name: AccessRequestCreateEvent,
-		Code: AccessRequestCreateCode,
-	}
-	AccessRequestUpdatedE = Event{
-		Name: AccessRequestUpdateEvent,
-		Code: AccessRequestUpdateCode,
-	}
-	// SessionCommandE is emitted upon execution of a command when using enhanced
-	// session recording.
-	SessionCommandE = Event{
-		Name: SessionCommandEvent,
-		Code: SessionCommandCode,
-	}
-	// SessionDiskE is emitted upon open of a file when using enhanced session recording.
-	SessionDiskE = Event{
-		Name: SessionDiskEvent,
-		Code: SessionDiskCode,
-	}
-	// SessionNetworkE is emitted when a network request is issued when
-	// using enhanced session recording.
-	SessionNetworkE = Event{
-		Name: SessionNetworkEvent,
-		Code: SessionNetworkCode,
-	}
-	// ResetPasswordTokenCreatedE is emitted when a password reset token is created.
-	ResetPasswordTokenCreatedE = Event{
-		Name: ResetPasswordTokenCreateEvent,
-		Code: ResetPasswordTokenCreateCode,
-	}
-	// RoleCreatedE is emitted when a role is created/updated.
-	RoleCreatedE = Event{
-		Name: RoleCreatedEvent,
-		Code: RoleCreatedCode,
-	}
-	// RoleDeletedE is emitted when a role is deleted.
-	RoleDeletedE = Event{
-		Name: RoleDeletedEvent,
-		Code: RoleDeletedCode,
-	}
-	// TrustedClusterCreateE is emitted when a trusted cluster relationship is created.
-	TrustedClusterCreateE = Event{
-		Name: TrustedClusterCreateEvent,
-		Code: TrustedClusterCreateCode,
-	}
-	// TrustedClusterDeleteE is emitted when a trusted cluster is removed from the root cluster.
-	TrustedClusterDeleteE = Event{
-		Name: TrustedClusterDeleteEvent,
-		Code: TrustedClusterDeleteCode,
-	}
-	// TrustedClusterTokenCreateE is emitted when a new join
-	// token for trusted cluster is created.
-	TrustedClusterTokenCreateE = Event{
-		Name: TrustedClusterTokenCreateEvent,
-		Code: TrustedClusterTokenCreateCode,
-	}
-	// GithubConnectorCreatedE is emitted when a Github connector is created/updated.
-	GithubConnectorCreatedE = Event{
-		Name: GithubConnectorCreatedEvent,
-		Code: GithubConnectorCreatedCode,
-	}
-	// GithubConnectorDeletedE is emitted when a Github connector is deleted.
-	GithubConnectorDeletedE = Event{
-		Name: GithubConnectorDeletedEvent,
-		Code: GithubConnectorDeletedCode,
-	}
-	// OIDCConnectorCreatedE is emitted when an OIDC connector is created/updated.
-	OIDCConnectorCreatedE = Event{
-		Name: OIDCConnectorCreatedEvent,
-		Code: OIDCConnectorCreatedCode,
-	}
-	// OIDCConnectorDeletedE is emitted when an OIDC connector is deleted.
-	OIDCConnectorDeletedE = Event{
-		Name: OIDCConnectorDeletedEvent,
-		Code: OIDCConnectorDeletedCode,
-	}
-	// SAMLConnectorCreatedE is emitted when a SAML connector is created/updated.
-	SAMLConnectorCreatedE = Event{
-		Name: SAMLConnectorCreatedEvent,
-		Code: SAMLConnectorCreatedCode,
-	}
-	// SAMLConnectorDeletedE is emitted when a SAML connector is deleted.
-	SAMLConnectorDeletedE = Event{
-		Name: SAMLConnectorDeletedEvent,
-		Code: SAMLConnectorDeletedCode,
-	}
-	// SessionRejectedE is emitted when a user hits `max_connections`.
-	SessionRejectedE = Event{
-		Name: SessionRejectedEvent,
-		Code: SessionRejectedCode,
-	}
-)
-
 // There is no strict algorithm for picking an event code, however existing
 // event codes are currently loosely categorized as follows:
 //
-//  * Teleport event codes start with "T" and belong in this const block.
+//   - Teleport event codes start with "T" and belong in this const block.
 //
-//  * Related events are grouped starting with the same number.
-//		eg: All user related events are grouped under 1xxx.
+//   - Related events are grouped starting with the same number.
+//     eg: All user related events are grouped under 1xxx.
 //
-//  * Suffix code with one of these letters: I (info), W (warn), E (error).
+//   - Suffix code with one of these letters: I (info), W (warn), E (error).
+//
+// After defining an event code, make sure to keep
+// `web/packages/teleport/src/services/audit/types.ts` in sync and add an
+// entry in the `eventsMap` in `lib/events/events_test.go`.
 const (
 	// UserLocalLoginCode is the successful local user login event code.
 	UserLocalLoginCode = "T1000I"
@@ -304,6 +70,26 @@ const (
 	// RecoveryCodeUseFailureCode is an event code for when a
 	// recovery code was not used successfully.
 	RecoveryCodeUseFailureCode = "T1009W"
+	// UserSSOTestFlowLoginCode is the successful SSO test flow user login event code.
+	UserSSOTestFlowLoginCode = "T1010I"
+	// UserSSOTestFlowLoginFailureCode is the unsuccessful SSO test flow user login event code.
+	UserSSOTestFlowLoginFailureCode = "T1011W"
+	// UserHeadlessLoginRequestedCode is an event code for when headless login attempt was requested.
+	UserHeadlessLoginRequestedCode = "T1012I"
+	// UserHeadlessLoginApprovedCode is an event code for when headless login attempt was successfully approved.
+	UserHeadlessLoginApprovedCode = "T1013I"
+	// UserHeadlessLoginApprovedFailureCode is an event code for when headless login was approved with an error.
+	UserHeadlessLoginApprovedFailureCode = "T1013W"
+	// UserHeadlessLoginRejectedCode is an event code for when headless login attempt was rejected.
+	UserHeadlessLoginRejectedCode = "T1014W"
+	// CreateMFAAuthChallenge is an event code for when an MFA auth challenge is created.
+	CreateMFAAuthChallengeCode = "T1015I"
+	// ValidateMFAAuthResponseCode is an event code for when an MFA auth challenge
+	// response is successfully validated.
+	ValidateMFAAuthResponseCode = "T1016I"
+	// VValidateMFAAuthResponseFailureCode is an event code for when an MFA auth challenge
+	// response fails validation.
+	ValidateMFAAuthResponseFailureCode = "T1016W"
 
 	// BillingCardCreateCode is an event code for when a user creates a new credit card.
 	BillingCardCreateCode = "TBL00I"
@@ -332,6 +118,20 @@ const (
 	SessionUploadCode = "T2005I"
 	// SessionDataCode is the session data event code.
 	SessionDataCode = "T2006I"
+	// AppSessionStartCode is the application session start code.
+	AppSessionStartCode = "T2007I"
+	// AppSessionChunkCode is the application session chunk create code.
+	AppSessionChunkCode = "T2008I"
+	// AppSessionRequestCode is the application request/response code.
+	AppSessionRequestCode = "T2009I"
+	// SessionConnectCode is the session connect event code.
+	SessionConnectCode = "T2010I"
+	// AppSessionEndCode is the application session end event code.
+	AppSessionEndCode = "T2011I"
+	// SessionRecordingAccessCode is the session recording view data event code.
+	SessionRecordingAccessCode = "T2012I"
+	// AppSessionDynamoDBRequestCode is the application request/response code.
+	AppSessionDynamoDBRequestCode = "T2013I"
 
 	// AppCreateCode is the app.create event code.
 	AppCreateCode = "TAP03I"
@@ -339,16 +139,6 @@ const (
 	AppUpdateCode = "TAP04I"
 	// AppDeleteCode is the app.delete event code.
 	AppDeleteCode = "TAP05I"
-
-	// AppSessionStartCode is the application session start code.
-	AppSessionStartCode = "T2007I"
-	// AppSessionChunkCode is the application session chunk create code.
-	AppSessionChunkCode = "T2008I"
-	// AppSessionRequestCode is the application request/response code.
-	AppSessionRequestCode = "T2009I"
-
-	// SessionConnectCode is the session connect event code.
-	SessionConnectCode = "T2010I"
 
 	// DatabaseSessionStartCode is the database session start event code.
 	DatabaseSessionStartCode = "TDB00I"
@@ -360,6 +150,20 @@ const (
 	DatabaseSessionQueryCode = "TDB02I"
 	// DatabaseSessionQueryFailedCode is the database query failure event code.
 	DatabaseSessionQueryFailedCode = "TDB02W"
+	// DatabaseSessionMalformedPacketCode is the db.session.malformed_packet event code.
+	DatabaseSessionMalformedPacketCode = "TDB06I"
+	// DatabaseSessionPermissionUpdateCode is the db.session.permissions.update event code.
+	DatabaseSessionPermissionUpdateCode = "TDB07I"
+	// DatabaseSessionUserCreateCode is the db.session.user.create event code.
+	DatabaseSessionUserCreateCode = "TDB08I"
+	// DatabaseSessionUserCreateFailureCode is the db.session.user.create event failure code.
+	DatabaseSessionUserCreateFailureCode = "TDB08W"
+	// DatabaseSessionUserDeactivateCode is the db.session.user.deactivate event code.
+	DatabaseSessionUserDeactivateCode = "TDB09I"
+	// DatabaseSessionUserDeactivateFailureCode is the db.session.user.deactivate event failure code.
+	DatabaseSessionUserDeactivateFailureCode = "TDB09W"
+	// DatabaseSessionCommandResultCode is the db.session.result event code.
+	DatabaseSessionCommandResultCode = "TDB10I"
 
 	// PostgresParseCode is the db.session.postgres.statements.parse event code.
 	PostgresParseCode = "TPG00I"
@@ -386,6 +190,54 @@ const (
 	MySQLStatementFetchCode = "TMY05I"
 	// MySQLStatementBulkExecuteCode is the db.session.mysql.statements.bulk_execute event code.
 	MySQLStatementBulkExecuteCode = "TMY06I"
+	// MySQLInitDBCode is the db.session.mysql.init_db event code.
+	MySQLInitDBCode = "TMY07I"
+	// MySQLCreateDBCode is the db.session.mysql.create_db event code.
+	MySQLCreateDBCode = "TMY08I"
+	// MySQLDropDBCode is the db.session.mysql.drop_db event code.
+	MySQLDropDBCode = "TMY09I"
+	// MySQLShutDownCode is the db.session.mysql.shut_down event code.
+	MySQLShutDownCode = "TMY10I"
+	// MySQLProcessKillCode is the db.session.mysql.process_kill event code.
+	MySQLProcessKillCode = "TMY11I"
+	// MySQLDebugCode is the db.session.mysql.debug event code.
+	MySQLDebugCode = "TMY12I"
+	// MySQLRefreshCode is the db.session.mysql.refresh event code.
+	MySQLRefreshCode = "TMY13I"
+
+	// SQLServerRPCRequestCode is the db.session.sqlserver.rpc_request event code.
+	SQLServerRPCRequestCode = "TMS00I"
+
+	// CassandraBatchEventCode is the db.session.cassandra.batch event code.
+	CassandraBatchEventCode = "TCA01I"
+	// CassandraPrepareEventCode is the db.session.cassandra.prepare event code.
+	CassandraPrepareEventCode = "TCA02I"
+	// CassandraExecuteEventCode is the db.session.cassandra.execute event code.
+	CassandraExecuteEventCode = "TCA03I"
+	// CassandraRegisterEventCode is the db.session.cassandra.register event code.
+	CassandraRegisterEventCode = "TCA04I"
+
+	// ElasticsearchRequestCode is the db.session.elasticsearch.request event code.
+	ElasticsearchRequestCode = "TES00I"
+	// ElasticsearchRequestFailureCode is the db.session.elasticsearch.request event failure code.
+	ElasticsearchRequestFailureCode = "TES00E"
+
+	// OpenSearchRequestCode is the db.session.opensearch.request event code.
+	OpenSearchRequestCode = "TOS00I"
+	// OpenSearchRequestFailureCode is the db.session.opensearch.request event failure code.
+	OpenSearchRequestFailureCode = "TOS00E"
+
+	// DynamoDBRequestCode is the db.session.dynamodb.request event code.
+	DynamoDBRequestCode = "TDY01I"
+	// DynamoDBRequestFailureCode is the db.session.dynamodb.request event failure code.
+	// This is indicates that the database agent http transport failed to round trip the request.
+	DynamoDBRequestFailureCode = "TDY01E"
+
+	// SpannerRPCCode is the db.session.spanner.rpc event code.
+	SpannerRPCCode = "TSPN001I"
+	// SpannerRPCDeniedCode is the warning event code for a Spanner client RPC
+	// that is denied.
+	SpannerRPCDeniedCode = "TSPN001W"
 
 	// DatabaseCreateCode is the db.create event code.
 	DatabaseCreateCode = "TDB03I"
@@ -405,6 +257,24 @@ const (
 	DesktopClipboardSendCode = "TDP02I"
 	// DesktopClipboardReceiveCode is the desktop clipboard receive code.
 	DesktopClipboardReceiveCode = "TDP03I"
+	// DesktopSharedDirectoryStartCode is the desktop directory start code.
+	DesktopSharedDirectoryStartCode = "TDP04I"
+	// DesktopSharedDirectoryStartFailureCode is the desktop directory start code
+	// for when a start operation fails, or for when the internal cache state was corrupted
+	// causing information loss, or for when the internal cache has exceeded its max size.
+	DesktopSharedDirectoryStartFailureCode = "TDP04W"
+	// DesktopSharedDirectoryReadCode is the desktop directory read code.
+	DesktopSharedDirectoryReadCode = "TDP05I"
+	// DesktopSharedDirectoryReadFailureCode is the desktop directory read code
+	// for when a read operation fails, or for if the internal cache state was corrupted
+	// causing information loss, or for when the internal cache has exceeded its max size.
+	DesktopSharedDirectoryReadFailureCode = "TDP05W"
+	// DesktopSharedDirectoryWriteCode is the desktop directory write code.
+	DesktopSharedDirectoryWriteCode = "TDP06I"
+	// DesktopSharedDirectoryWriteFailureCode is the desktop directory write code
+	// for when a write operation fails, or for if the internal cache state was corrupted
+	// causing information loss, or for when the internal cache has exceeded its max size.
+	DesktopSharedDirectoryWriteFailureCode = "TDP06W"
 
 	// SubsystemCode is the subsystem event code.
 	SubsystemCode = "T3001I"
@@ -416,6 +286,8 @@ const (
 	ExecFailureCode = "T3002E"
 	// PortForwardCode is the port forward event code.
 	PortForwardCode = "T3003I"
+	// PortForwardStopCode is the port forward stop event code.
+	PortForwardStopCode = "T3003S"
 	// PortForwardFailureCode is the port forward failure event code.
 	PortForwardFailureCode = "T3003E"
 	// SCPDownloadCode is the file download event code.
@@ -439,6 +311,40 @@ const (
 	// Note: some requests (like exec into a pod) use other codes (like
 	// ExecCode).
 	KubeRequestCode = "T3009I"
+	// SCPDisallowedCode is the SCP disallowed event code.
+	SCPDisallowedCode = "T3010E"
+
+	// KubernetesClusterCreateCode is the kube.create event code.
+	KubernetesClusterCreateCode = "T3010I"
+	// KubernetesClusterUpdateCode is the kube.update event code.
+	KubernetesClusterUpdateCode = "T3011I"
+	// KubernetesClusterDeleteCode is the kube.delete event code.
+	KubernetesClusterDeleteCode = "T3012I"
+
+	// The following codes correspond to SFTP file operations.
+	SFTPOpenCode           = "TS001I"
+	SFTPOpenFailureCode    = "TS001E"
+	SFTPSetstatCode        = "TS007I"
+	SFTPSetstatFailureCode = "TS007E"
+	SFTPOpendirCode        = "TS009I"
+	SFTPOpendirFailureCode = "TS009E"
+	SFTPReaddirCode        = "TS010I"
+	SFTPReaddirFailureCode = "TS010E"
+	SFTPRemoveCode         = "TS011I"
+	SFTPRemoveFailureCode  = "TS011E"
+	SFTPMkdirCode          = "TS012I"
+	SFTPMkdirFailureCode   = "TS012E"
+	SFTPRmdirCode          = "TS013I"
+	SFTPRmdirFailureCode   = "TS013E"
+	SFTPRenameCode         = "TS016I"
+	SFTPRenameFailureCode  = "TS016E"
+	SFTPSymlinkCode        = "TS018I"
+	SFTPSymlinkFailureCode = "TS018E"
+	SFTPLinkCode           = "TS019I"
+	SFTPLinkFailureCode    = "TS019E"
+	SFTPDisallowedCode     = "TS020E"
+	// SFTPSummaryCode is the SFTP summary code.
+	SFTPSummaryCode = "TS021I"
 
 	// SessionCommandCode is a session command code.
 	SessionCommandCode = "T4000I"
@@ -447,7 +353,7 @@ const (
 	// SessionNetworkCode is a session network code.
 	SessionNetworkCode = "T4002I"
 
-	// AccessRequestCreateCode is the the access request creation code.
+	// AccessRequestCreateCode is the access request creation code.
 	AccessRequestCreateCode = "T5000I"
 	// AccessRequestUpdateCode is the access request state update code.
 	AccessRequestUpdateCode = "T5001I"
@@ -455,6 +361,10 @@ const (
 	AccessRequestReviewCode = "T5002I"
 	// AccessRequestDeleteCode is the access request deleted code.
 	AccessRequestDeleteCode = "T5003I"
+	// AccessRequestResourceSearchCode is the access request resource search code.
+	AccessRequestResourceSearchCode = "T5004I"
+	// AccessRequestExpireCode is the access request expires code.
+	AccessRequestExpireCode = "T5005I"
 
 	// ResetPasswordTokenCreateCode is the token create event code.
 	ResetPasswordTokenCreateCode = "T6000I"
@@ -467,29 +377,59 @@ const (
 	TrustedClusterCreateCode = "T7000I"
 	// TrustedClusterDeleteCode is the event code for removing a trusted cluster.
 	TrustedClusterDeleteCode = "T7001I"
-	// TrustedClusterTokenCreateCode is the event code for
-	// creating new join token for a trusted cluster.
+	// TrustedClusterTokenCreateCode is the event code for creating new
+	// provisioning token for a trusted cluster. Deprecated in favor of
+	// [ProvisionTokenCreateEvent].
 	TrustedClusterTokenCreateCode = "T7002I"
+
+	// ProvisionTokenCreateCode is the event code for creating a provisioning
+	// token, also known as Join Token. See
+	// [github.com/gravitational/teleport/api/types.ProvisionToken].
+	ProvisionTokenCreateCode = "TJT00I"
 
 	// GithubConnectorCreatedCode is the Github connector created event code.
 	GithubConnectorCreatedCode = "T8000I"
 	// GithubConnectorDeletedCode is the Github connector deleted event code.
 	GithubConnectorDeletedCode = "T8001I"
+	// GithubConnectorUpdatedCode is the Github connector updated event code.
+	GithubConnectorUpdatedCode = "T80002I"
 
 	// OIDCConnectorCreatedCode is the OIDC connector created event code.
 	OIDCConnectorCreatedCode = "T8100I"
 	// OIDCConnectorDeletedCode is the OIDC connector deleted event code.
 	OIDCConnectorDeletedCode = "T8101I"
+	// OIDCConnectorUpdatedCode is the OIDC connector updated event code.
+	OIDCConnectorUpdatedCode = "T8102I"
 
 	// SAMLConnectorCreatedCode is the SAML connector created event code.
 	SAMLConnectorCreatedCode = "T8200I"
 	// SAMLConnectorDeletedCode is the SAML connector deleted event code.
 	SAMLConnectorDeletedCode = "T8201I"
+	// SAMLConnectorUpdatedCode is the SAML connector updated event code.
+	SAMLConnectorUpdatedCode = "T8202I"
 
 	// RoleCreatedCode is the role created event code.
 	RoleCreatedCode = "T9000I"
 	// RoleDeletedCode is the role deleted event code.
 	RoleDeletedCode = "T9001I"
+	// RoleUpdatedCode is the role created event code.
+	RoleUpdatedCode = "T9002I"
+
+	// BotJoinCode is the 'bot.join' event code.
+	BotJoinCode = "TJ001I"
+	// BotJoinFailureCode is the 'bot.join' event code for failures.
+	BotJoinFailureCode = "TJ001E"
+	// InstanceJoinCode is the 'node.join' event code.
+	InstanceJoinCode = "TJ002I"
+	// InstanceJoinFailureCode is the 'node.join' event code for failures.
+	InstanceJoinFailureCode = "TJ002E"
+
+	// BotCreateCode is the `bot.create` event code.
+	BotCreateCode = "TB001I"
+	// BotUpdateCode is the `bot.update` event code.
+	BotUpdateCode = "TB002I"
+	// BotDeleteCode is the `bot.delete` event code.
+	BotDeleteCode = "TB003I"
 
 	// LockCreatedCode is the lock created event code.
 	LockCreatedCode = "TLK00I"
@@ -503,6 +443,272 @@ const (
 	// generation mismatch code.
 	RenewableCertificateGenerationMismatchCode = "TCB00W"
 
+	// UpgradeWindowStartUpdatedCode is the edit code of UpgradeWindowStartUpdateEvent.
+	UpgradeWindowStartUpdatedCode = "TUW01I"
+
+	// SSMRunSuccessCode is the discovery script success code.
+	SSMRunSuccessCode = "TDS00I"
+	// SSMRunFailCode is the discovery script success code.
+	SSMRunFailCode = "TDS00W"
+
+	// DeviceCreateCode is the device creation/registration code.
+	DeviceCreateCode = "TV001I"
+	// DeviceDeleteCode is the device deletion code.
+	DeviceDeleteCode = "TV002I"
+	// DeviceEnrollTokenCreateCode is the device enroll token creation code
+	DeviceEnrollTokenCreateCode = "TV003I"
+	// DeviceEnrollTokenSpentCode is the device enroll token spent code.
+	DeviceEnrollTokenSpentCode = "TV004I"
+	// DeviceEnrollCode is the device enrollment completion code.
+	DeviceEnrollCode = "TV005I"
+	// DeviceAuthenticateCode is the device authentication code.
+	DeviceAuthenticateCode = "TV006I"
+	// DeviceUpdateCode is the device update code.
+	DeviceUpdateCode = "TV007I"
+	// DeviceWebTokenCreateCode is the device web token creation code.
+	DeviceWebTokenCreateCode = "TV008I"
+	// DeviceAuthenticateConfirmCode is the device authentication confirm code.
+	DeviceAuthenticateConfirmCode = "TV009I"
+
+	// LoginRuleCreateCode is the login rule create code.
+	LoginRuleCreateCode = "TLR00I"
+	// LoginRuleDeleteCode is the login rule delete code.
+	LoginRuleDeleteCode = "TLR01I"
+
+	// SAMLIdPAuthAttemptCode is the SAML IdP auth attempt code.
+	SAMLIdPAuthAttemptCode = "TSI000I"
+
+	// SAMLIdPServiceProviderCreateCode is the SAML IdP service provider create code.
+	SAMLIdPServiceProviderCreateCode = "TSI001I"
+
+	// SAMLIdPServiceProviderCreateFailureCode is the SAML IdP service provider create failure code.
+	SAMLIdPServiceProviderCreateFailureCode = "TSI001W"
+
+	// SAMLIdPServiceProviderUpdateCode is the SAML IdP service provider update code.
+	SAMLIdPServiceProviderUpdateCode = "TSI002I"
+
+	// SAMLIdPServiceProviderUpdateFailureCode is the SAML IdP service provider update failure code.
+	SAMLIdPServiceProviderUpdateFailureCode = "TSI002W"
+
+	// SAMLIdPServiceProviderDeleteCode is the SAML IdP service provider delete code.
+	SAMLIdPServiceProviderDeleteCode = "TSI003I"
+
+	// SAMLIdPServiceProviderDeleteFailureCode is the SAML IdP service provider delete failure code.
+	SAMLIdPServiceProviderDeleteFailureCode = "TSI003W"
+
+	// SAMLIdPServiceProviderDeleteAllCode is the SAML IdP service provider delete all code.
+	SAMLIdPServiceProviderDeleteAllCode = "TSI004I"
+
+	// SAMLIdPServiceProviderDeleteAllFailureCode is the SAML IdP service provider delete all failure code.
+	SAMLIdPServiceProviderDeleteAllFailureCode = "TSI004W"
+
+	// OktaGroupsUpdateCode is the Okta groups updated code.
+	OktaGroupsUpdateCode = "TOK001I"
+
+	// OktaApplicationsUpdateCode is the Okta applications updated code.
+	OktaApplicationsUpdateCode = "TOK002I"
+
+	// OktaSyncFailureCode is the Okta synchronization failure code.
+	OktaSyncFailureCode = "TOK003E"
+
+	// OktaAssignmentProcessSuccessCode is the Okta assignment process success code.
+	OktaAssignmentProcessSuccessCode = "TOK004I"
+
+	// OktaAssignmentProcessFailureCode is the Okta assignment process failure code.
+	OktaAssignmentProcessFailureCode = "TOK004E"
+
+	// OktaAssignmentCleanupSuccessCode is the Okta assignment cleanup success code.
+	OktaAssignmentCleanupSuccessCode = "TOK005I"
+
+	// OktaAssignmentCleanupFailureCode is the Okta assignment cleanup failure code.
+	OktaAssignmentCleanupFailureCode = "TOK005E"
+
+	// OktaAccessListSyncSuccessCode is the Okta access list sync success code.
+	OktaAccessListSyncSuccessCode = "TOK006I"
+
+	// OktaAccessListSyncSuccessCode is the Okta access list sync failure code.
+	OktaAccessListSyncFailureCode = "TOK006E"
+
+	// OktaUserSyncSuccessCode is the Okta user sync success code.
+	OktaUserSyncSuccessCode = "TOK007I"
+
+	// OktaUserSyncSuccessCode is the Okta user sync failure code.
+	OktaUserSyncFailureCode = "TOK007E"
+
+	// AccessListCreateSuccessCode is the access list create success code.
+	AccessListCreateSuccessCode = "TAL001I"
+
+	// AccessListCreateFailureCode is the access list create failure code.
+	AccessListCreateFailureCode = "TAL001E"
+
+	// AccessListUpdateSuccessCode is the access list update success code.
+	AccessListUpdateSuccessCode = "TAL002I"
+
+	// AccessListUpdateFailureCode is the access list update failure code.
+	AccessListUpdateFailureCode = "TAL002E"
+
+	// AccessListDeleteSuccessCode is the access list delete success code.
+	AccessListDeleteSuccessCode = "TAL003I"
+
+	// AccessListDeleteFailureCode is the access list delete failure code.
+	AccessListDeleteFailureCode = "TAL003E"
+
+	// AccessListReviewSuccessCode is the access list review success code.
+	AccessListReviewSuccessCode = "TAL004I"
+
+	// AccessListReviewFailureCode is the access list review failure code.
+	AccessListReviewFailureCode = "TAL004E"
+
+	// AccessListMemberCreateSuccessCode is the access list member create success code.
+	AccessListMemberCreateSuccessCode = "TAL005I"
+
+	// AccessListMemberCreateFailureCode is the access list member create failure code.
+	AccessListMemberCreateFailureCode = "TAL005E"
+
+	// AccessListMemberUpdateSuccessCode is the access list member update success code.
+	AccessListMemberUpdateSuccessCode = "TAL006I"
+
+	// AccessListMemberUpdateFailureCode is the access list member update failure code.
+	AccessListMemberUpdateFailureCode = "TAL006E"
+
+	// AccessListMemberDeleteSuccessCode is the access list member delete success code.
+	AccessListMemberDeleteSuccessCode = "TAL007I"
+
+	// AccessListMemberDeleteFailureCode is the access list member delete failure code.
+	AccessListMemberDeleteFailureCode = "TAL007E"
+
+	// AccessListMemberDeleteAllForAccessListSuccessCode is the access list all member delete success code.
+	AccessListMemberDeleteAllForAccessListSuccessCode = "TAL008I"
+
+	// AccessListMemberDeleteAllForAccessListFailureCode is the access list member delete failure code.
+	AccessListMemberDeleteAllForAccessListFailureCode = "TAL008E"
+
+	// UserLoginAccessListInvalidCode is the user login access list invalid code. This event is a warning that an access list is invalid and was not applied upon the user's login.
+	UserLoginAccessListInvalidCode = "TAL009W"
+
+	// SecReportsAuditQueryRunCode is used when a custom Security Reports Query is run.
+	SecReportsAuditQueryRunCode = "SRE001I"
+
+	// SecReportsReportRunCode is used when a report in run.
+	SecReportsReportRunCode = "SRE002I"
+
+	// ExternalAuditStorageEnableCode is the External Audit Storage enabled code.
+	ExternalAuditStorageEnableCode = "TEA001I"
+	// ExternalAuditStorageDisableCode is the External Audit Storage disabled code.
+	ExternalAuditStorageDisableCode = "TEA002I"
+
+	// SPIFFESVIDIssuedSuccessCode is the SPIFFE SVID issued success code.
+	SPIFFESVIDIssuedSuccessCode = "TSPIFFE000I"
+	// SPIFFESVIDIssuedFailureCode is the SPIFFE SVID issued failure code.
+	SPIFFESVIDIssuedFailureCode = "TSPIFFE000E"
+	// SPIFFEFederationCreateCode is the SPIFFE Federation created code.
+	SPIFFEFederationCreateCode = "TSPIFFE001I"
+	// SPIFFEFederationDeleteCode is the SPIFFE Federation deleted code.
+	SPIFFEFederationDeleteCode = "TSPIFFE002I"
+
+	// AuthPreferenceUpdateCode is the auth preference updated event code.
+	AuthPreferenceUpdateCode = "TCAUTH001I"
+	// ClusterNetworkingConfigUpdateCode is the cluster networking config updated event code.
+	ClusterNetworkingConfigUpdateCode = "TCNET002I"
+	// SessionRecordingConfigUpdateCode is the session recording config updated event code.
+	SessionRecordingConfigUpdateCode = "TCREC003I"
+	// AccessGraphSettingsUpdateCode is the access graph settings updated event code.
+	AccessGraphSettingsUpdateCode = "TCAGC003I"
+
+	// AccessGraphAccessPathChangedCode is the access graph access path changed event code.
+	AccessGraphAccessPathChangedCode = "TAG001I"
+
+	// DiscoveryConfigCreateCode is the discovery config created event code.
+	DiscoveryConfigCreateCode = "DC001I"
+	// DiscoveryConfigUpdateCode is the discovery config updated event code.
+	DiscoveryConfigUpdateCode = "DC002I"
+	// DiscoveryConfigDeleteCode is the discovery config delete event code.
+	DiscoveryConfigDeleteCode = "DC003I"
+	// DiscoveryConfigDeleteAllCode is the discovery config delete all event code.
+	DiscoveryConfigDeleteAllCode = "DC004I"
+
+	// IntegrationCreateCode is the integration resource create event code.
+	IntegrationCreateCode = "IG001I"
+	// IntegrationUpdateCode is the integration resource update event code.
+	IntegrationUpdateCode = "IG002I"
+	// IntegrationDeleteCode is the integration resource delete event code.
+	IntegrationDeleteCode = "IG003I"
+
+	// PluginCreateCode is the plugin resource create event code.
+	PluginCreateCode = "PG001I"
+	// PluginUpdateCode is the plugin resource update event code.
+	PluginUpdateCode = "PG002I"
+	// PluginDeleteCode is the plugin resource delete event code.
+	PluginDeleteCode = "PG003I"
+
+	// StaticHostUserCreateCode is the static host user resource create event code.
+	StaticHostUserCreateCode = "SHU001I"
+	// StaticHostUserUpdateCode is the static host user resource update event code.
+	StaticHostUserUpdateCode = "SHU002I"
+	// StaticHostUserDeleteCode is the static host user resource delete event code.
+	StaticHostUserDeleteCode = "SHU003I"
+
+	// CrownJewelCreateCode is the crown jewel create event code.
+	CrownJewelCreateCode = "CJ001I"
+	// CrownJewelUpdateCode is the crown jewel update event code.
+	CrownJewelUpdateCode = "CJ002I"
+	// CrownJewelDeleteCode is the crown jewel delete event code.
+	CrownJewelDeleteCode = "CJ003I"
+
+	// UserTaskCreateCode is the user task create event code.
+	UserTaskCreateCode = "UT001I"
+	// UserTaskUpdateCode is the user task update event code.
+	UserTaskUpdateCode = "UT002I"
+	// UserTaskDeleteCode is the user task delete event code.
+	UserTaskDeleteCode = "UT003I"
+
+	// AutoUpdateConfigCreateCode is the auto update config create event code.
+	AutoUpdateConfigCreateCode = "AUC001I"
+	// AutoUpdateConfigUpdateCode is the auto update config update event code.
+	AutoUpdateConfigUpdateCode = "AUC002I"
+	// AutoUpdateConfigDeleteCode is the auto update config delete event code.
+	AutoUpdateConfigDeleteCode = "AUC003I"
+
+	// AutoUpdateVersionCreateCode is the auto update version create event code.
+	AutoUpdateVersionCreateCode = "AUV001I"
+	// AutoUpdateVersionUpdateCode is the auto update version update event code.
+	AutoUpdateVersionUpdateCode = "AUV002I"
+	// AutoUpdateVersionDeleteCode is the auto update version delete event code.
+	AutoUpdateVersionDeleteCode = "AUV003I"
+
+	// ContactCreateCode is the auto update version create event code.
+	ContactCreateCode = "TCTC001I"
+	// ContactDeleteCode is the auto update version delete event code.
+	ContactDeleteCode = "TCTC002I"
+
+	// WorkloadIdentityCreateCode is the workload identity create event code.
+	WorkloadIdentityCreateCode = "WID001I"
+	// WorkloadIdentityUpdateCode is the workload identity update event code.
+	WorkloadIdentityUpdateCode = "WID002I"
+	// WorkloadIdentityDeleteCode is the workload identity delete event code.
+	WorkloadIdentityDeleteCode = "WID003I"
+	// WorkloadIdentityX509RevocationCreateCode is the
+	// WorkloadIdentityX509Revocation create event code.
+	WorkloadIdentityX509RevocationCreateCode = "WID004I"
+	// WorkloadIdentityX509RevocationUpdateCode is the
+	// WorkloadIdentityX509Revocation update event code.
+	WorkloadIdentityX509RevocationUpdateCode = "WID005I"
+	// WorkloadIdentityX509RevocationDeleteCode is the
+	// WorkloadIdentityX509Revocation delete event code.
+	WorkloadIdentityX509RevocationDeleteCode = "WID006I"
+
+	// GitCommandCode is the git command event code
+	GitCommandCode = "TGIT001I"
+	// GitCommandFailureCode is the git command feature event code.
+	GitCommandFailureCode = "TGIT001E"
+
+	// StableUNIXUserCreateCode is the stable UNIX user create event code.
+	StableUNIXUserCreateCode = "TSUU001I"
+
 	// UnknownCode is used when an event of unknown type is encountered.
 	UnknownCode = apievents.UnknownCode
 )
+
+// After defining an event code, make sure to keep
+// `web/packages/teleport/src/services/audit/types.ts` in sync and add an
+// entry in the `eventsMap` in `lib/events/events_test.go`.

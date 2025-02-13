@@ -1,37 +1,34 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package bpf
 
-// #cgo LDFLAGS: -ldl
-// #include <dlfcn.h>
-// #include <stdlib.h>
 import "C"
 
 import (
 	"context"
 
-	"github.com/gravitational/teleport/api/constants"
-	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/utils"
-
+	"github.com/coreos/go-semver/semver"
 	"github.com/gravitational/trace"
 
-	"github.com/coreos/go-semver/semver"
+	"github.com/gravitational/teleport/api/constants"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 // BPF implements an interface to open and close a recording session.
@@ -44,7 +41,10 @@ type BPF interface {
 	CloseSession(ctx *SessionContext) error
 
 	// Close will stop any running BPF programs.
-	Close() error
+	Close(restarting bool) error
+
+	// Enabled returns whether enhanced recording is active.
+	Enabled() bool
 }
 
 // SessionContext contains all the information needed to track and emit
@@ -64,6 +64,9 @@ type SessionContext struct {
 	// ServerID is the UUID of the server this session is executing on.
 	ServerID string
 
+	// ServerHostname is the hostname of the server this session is executing on.
+	ServerHostname string
+
 	// Login is the Unix login for this session.
 	Login string
 
@@ -82,62 +85,27 @@ type SessionContext struct {
 	Events map[string]bool
 }
 
-// Config holds configuration for the BPF service.
-type Config struct {
-	// Enabled is if this service will try and install BPF programs on this system.
-	Enabled bool
-
-	// CommandBufferSize is the size of the perf buffer for command events.
-	CommandBufferSize *int
-
-	// DiskBufferSize is the size of the perf buffer for disk events.
-	DiskBufferSize *int
-
-	// NetworkBufferSize is the size of the perf buffer for network events.
-	NetworkBufferSize *int
-
-	// CgroupPath is where the cgroupv2 hierarchy is mounted.
-	CgroupPath string
-}
-
-// CheckAndSetDefaults checks BPF configuration.
-func (c *Config) CheckAndSetDefaults() error {
-	var perfBufferPageCount = defaults.PerfBufferPageCount
-	var openPerfBufferPageCount = defaults.OpenPerfBufferPageCount
-
-	if c.CommandBufferSize == nil {
-		c.CommandBufferSize = &perfBufferPageCount
-	}
-	if c.DiskBufferSize == nil {
-		c.DiskBufferSize = &openPerfBufferPageCount
-	}
-	if c.NetworkBufferSize == nil {
-		c.NetworkBufferSize = &perfBufferPageCount
-	}
-	if c.CgroupPath == "" {
-		c.CgroupPath = defaults.CgroupPath
-	}
-
-	return nil
-}
-
 // NOP is used on either non-Linux systems or when BPF support is not enabled.
 type NOP struct {
 }
 
 // Close closes the NOP service. Note this function does nothing.
-func (s *NOP) Close() error {
+func (s *NOP) Close(bool) error {
 	return nil
 }
 
 // OpenSession opens a NOP session. Note this function does nothing.
-func (s *NOP) OpenSession(ctx *SessionContext) (uint64, error) {
+func (s *NOP) OpenSession(_ *SessionContext) (uint64, error) {
 	return 0, nil
 }
 
 // CloseSession closes a NOP session. Note this function does nothing.
-func (s *NOP) CloseSession(ctx *SessionContext) error {
+func (s *NOP) CloseSession(_ *SessionContext) error {
 	return nil
+}
+
+func (s *NOP) Enabled() bool {
+	return false
 }
 
 // IsHostCompatible checks that BPF programs can run on this host.

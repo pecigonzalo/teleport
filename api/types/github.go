@@ -17,17 +17,27 @@ limitations under the License.
 package types
 
 import (
+	"context"
+	"log/slog"
 	"time"
 
-	"github.com/gravitational/teleport/api/utils"
-
 	"github.com/gravitational/trace"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/utils"
+)
+
+const (
+	GithubURL    = "https://github.com"
+	GithubAPIURL = "https://api.github.com"
 )
 
 // GithubConnector defines an interface for a Github OAuth2 connector
 type GithubConnector interface {
 	// ResourceWithSecrets is a common interface for all resources
 	ResourceWithSecrets
+	ResourceWithOrigin
 	// SetMetadata sets object metadata
 	SetMetadata(meta Metadata)
 	// GetClientID returns the connector client ID
@@ -46,13 +56,23 @@ type GithubConnector interface {
 	GetTeamsToLogins() []TeamMapping
 	// SetTeamsToLogins sets the mapping of Github teams to allowed logins
 	SetTeamsToLogins([]TeamMapping)
+	// GetTeamsToRoles returns the mapping of Github teams to allowed roles
+	GetTeamsToRoles() []TeamRolesMapping
+	// SetTeamsToRoles sets the mapping of Github teams to allowed roles
+	SetTeamsToRoles([]TeamRolesMapping)
 	// MapClaims returns the list of allows logins based on the retrieved claims
 	// returns list of logins and kubernetes groups
-	MapClaims(GithubClaims) (logins []string, kubeGroups []string, kubeUsers []string)
+	MapClaims(GithubClaims) (roles []string, kubeGroups []string, kubeUsers []string)
 	// GetDisplay returns the connector display name
 	GetDisplay() string
 	// SetDisplay sets the connector display name
 	SetDisplay(string)
+	// GetEndpointURL returns the endpoint URL
+	GetEndpointURL() string
+	// GetAPIEndpointURL returns the API endpoint URL
+	GetAPIEndpointURL() string
+	// GetClientRedirectSettings returns the client redirect settings.
+	GetClientRedirectSettings() *SSOClientRedirectSettings
 }
 
 // NewGithubConnector creates a new Github connector from name and spec
@@ -67,16 +87,6 @@ func NewGithubConnector(name string, spec GithubConnectorSpecV3) (GithubConnecto
 		return nil, trace.Wrap(err)
 	}
 	return c, nil
-}
-
-// GithubClaims represents Github user information obtained during OAuth2 flow
-type GithubClaims struct {
-	// Username is the user's username
-	Username string
-	// OrganizationToTeams is the user's organization and team membership
-	OrganizationToTeams map[string][]string
-	// Teams is the users team membership
-	Teams []string
 }
 
 // GetVersion returns resource version
@@ -99,14 +109,14 @@ func (c *GithubConnectorV3) SetSubKind(s string) {
 	c.SubKind = s
 }
 
-// GetResourceID returns resource ID
-func (c *GithubConnectorV3) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *GithubConnectorV3) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (c *GithubConnectorV3) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *GithubConnectorV3) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // GetName returns the name of the connector
@@ -139,6 +149,16 @@ func (c *GithubConnectorV3) GetMetadata() Metadata {
 	return c.Metadata
 }
 
+// Origin returns the origin value of the resource.
+func (c *GithubConnectorV3) Origin() string {
+	return c.Metadata.Origin()
+}
+
+// SetOrigin sets the origin value of the resource.
+func (c *GithubConnectorV3) SetOrigin(origin string) {
+	c.Metadata.SetOrigin(origin)
+}
+
 // WithoutSecrets returns an instance of resource without secrets.
 func (c *GithubConnectorV3) WithoutSecrets() Resource {
 	if c.GetClientSecret() == "" {
@@ -161,6 +181,28 @@ func (c *GithubConnectorV3) CheckAndSetDefaults() error {
 	if err := c.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
+
+	// DELETE IN 11.0.0
+	if len(c.Spec.TeamsToLogins) > 0 {
+		slog.WarnContext(context.Background(), "GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
+	}
+
+	// make sure claim mappings have either roles or a role template
+	for i, v := range c.Spec.TeamsToLogins {
+		if v.Team == "" {
+			return trace.BadParameter("team_to_logins mapping #%v is invalid, team is empty.", i+1)
+		}
+	}
+	for i, v := range c.Spec.TeamsToRoles {
+		if v.Team == "" {
+			return trace.BadParameter("team_to_roles mapping #%v is invalid, team is empty.", i+1)
+		}
+	}
+
+	if len(c.Spec.TeamsToLogins)+len(c.Spec.TeamsToRoles) == 0 {
+		return trace.BadParameter("team_to_logins or team_to_roles mapping is invalid, no mappings defined.")
+	}
+
 	return nil
 }
 
@@ -195,13 +237,27 @@ func (c *GithubConnectorV3) SetRedirectURL(redirectURL string) {
 }
 
 // GetTeamsToLogins returns the connector team membership mappings
+//
+// DEPRECATED: use GetTeamsToRoles instead
 func (c *GithubConnectorV3) GetTeamsToLogins() []TeamMapping {
 	return c.Spec.TeamsToLogins
 }
 
 // SetTeamsToLogins sets the connector team membership mappings
+//
+// DEPRECATED: use SetTeamsToRoles instead
 func (c *GithubConnectorV3) SetTeamsToLogins(teamsToLogins []TeamMapping) {
 	c.Spec.TeamsToLogins = teamsToLogins
+}
+
+// GetTeamsToRoles returns the mapping of Github teams to allowed roles
+func (c *GithubConnectorV3) GetTeamsToRoles() []TeamRolesMapping {
+	return c.Spec.TeamsToRoles
+}
+
+// SetTeamsToRoles sets the mapping of Github teams to allowed roles
+func (c *GithubConnectorV3) SetTeamsToRoles(m []TeamRolesMapping) {
+	c.Spec.TeamsToRoles = m
 }
 
 // GetDisplay returns the connector display name
@@ -214,10 +270,28 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 	c.Spec.Display = display
 }
 
+// GetEndpointURL returns the endpoint URL
+func (c *GithubConnectorV3) GetEndpointURL() string {
+	return GithubURL
+}
+
+// GetEndpointURL returns the API endpoint URL
+func (c *GithubConnectorV3) GetAPIEndpointURL() string {
+	return GithubAPIURL
+}
+
+// GetClientRedirectSettings returns the client redirect settings.
+func (c *GithubConnectorV3) GetClientRedirectSettings() *SSOClientRedirectSettings {
+	if c == nil {
+		return nil
+	}
+	return c.Spec.ClientRedirectSettings
+}
+
 // MapClaims returns a list of logins based on the provided claims,
 // returns a list of logins and list of kubernetes groups
 func (c *GithubConnectorV3) MapClaims(claims GithubClaims) ([]string, []string, []string) {
-	var logins, kubeGroups, kubeUsers []string
+	var roles, kubeGroups, kubeUsers []string
 	for _, mapping := range c.GetTeamsToLogins() {
 		teams, ok := claims.OrganizationToTeams[mapping.Organization]
 		if !ok {
@@ -227,11 +301,80 @@ func (c *GithubConnectorV3) MapClaims(claims GithubClaims) ([]string, []string, 
 		for _, team := range teams {
 			// see if the user belongs to this team
 			if team == mapping.Team {
-				logins = append(logins, mapping.Logins...)
+				roles = append(roles, mapping.Logins...)
 				kubeGroups = append(kubeGroups, mapping.KubeGroups...)
 				kubeUsers = append(kubeUsers, mapping.KubeUsers...)
 			}
 		}
 	}
-	return utils.Deduplicate(logins), utils.Deduplicate(kubeGroups), utils.Deduplicate(kubeUsers)
+	for _, mapping := range c.GetTeamsToRoles() {
+		teams, ok := claims.OrganizationToTeams[mapping.Organization]
+		if !ok {
+			// the user does not belong to this organization
+			continue
+		}
+		for _, team := range teams {
+			// see if the user belongs to this team
+			if team == mapping.Team {
+				roles = append(roles, mapping.Roles...)
+			}
+		}
+	}
+	return utils.Deduplicate(roles), utils.Deduplicate(kubeGroups), utils.Deduplicate(kubeUsers)
+}
+
+// SetExpiry sets expiry time for the object
+func (r *GithubAuthRequest) SetExpiry(expires time.Time) {
+	r.Expires = &expires
+}
+
+// Expiry returns object expiry setting.
+func (r *GithubAuthRequest) Expiry() time.Time {
+	if r.Expires == nil {
+		return time.Time{}
+	}
+	return *r.Expires
+}
+
+// Check makes sure the request is valid
+func (r *GithubAuthRequest) Check() error {
+	authenticatedUserFlow := r.AuthenticatedUser != ""
+	regularLoginFlow := !r.SSOTestFlow && !authenticatedUserFlow
+
+	switch {
+	case r.ConnectorID == "":
+		return trace.BadParameter("missing ConnectorID")
+	case r.StateToken == "":
+		return trace.BadParameter("missing StateToken")
+	// we could collapse these two checks into one, but the error message would become ambiguous.
+	case r.SSOTestFlow && r.ConnectorSpec == nil:
+		return trace.BadParameter("ConnectorSpec cannot be nil when SSOTestFlow is true")
+	case authenticatedUserFlow && r.ConnectorSpec == nil:
+		return trace.BadParameter("ConnectorSpec cannot be nil for authenticated user")
+	case regularLoginFlow && r.ConnectorSpec != nil:
+		return trace.BadParameter("ConnectorSpec must be nil")
+	case len(r.PublicKey) != 0 && len(r.SshPublicKey) != 0:
+		return trace.BadParameter("illegal to set both PublicKey and SshPublicKey")
+	case len(r.PublicKey) != 0 && len(r.TlsPublicKey) != 0:
+		return trace.BadParameter("illegal to set both PublicKey and TlsPublicKey")
+	case r.AttestationStatement != nil && r.SshAttestationStatement != nil:
+		return trace.BadParameter("illegal to set both AttestationStatement and SshAttestationStatement")
+	case r.AttestationStatement != nil && r.TlsAttestationStatement != nil:
+		return trace.BadParameter("illegal to set both AttestationStatement and TlsAttestationStatement")
+	}
+	sshPubKey := r.PublicKey
+	if len(sshPubKey) == 0 {
+		sshPubKey = r.SshPublicKey
+	}
+	if len(sshPubKey) > 0 {
+		_, _, _, _, err := ssh.ParseAuthorizedKey(sshPubKey)
+		if err != nil {
+			return trace.BadParameter("bad SSH public key: %v", err)
+		}
+	}
+	if len(r.PublicKey)+len(r.SshPublicKey)+len(r.TlsPublicKey) > 0 &&
+		(r.CertTTL > defaults.MaxCertDuration || r.CertTTL < defaults.MinCertDuration) {
+		return trace.BadParameter("wrong CertTTL")
+	}
+	return nil
 }

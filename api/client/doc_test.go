@@ -19,6 +19,7 @@ package client_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -49,7 +50,7 @@ func ExampleClient_roleCRUD() {
 	defer clt.Close()
 
 	// Resource Spec structs reflect their Resource's yaml definition.
-	roleSpec := types.RoleSpecV5{
+	roleSpec := types.RoleSpecV6{
 		Options: types.RoleOptions{
 			MaxSessionTTL: types.Duration(time.Hour),
 		},
@@ -75,7 +76,7 @@ func ExampleClient_roleCRUD() {
 
 	// Upsert overwrites the resource if it exists. Use this to create/update resources.
 	// Equivalent to `tctl create -f role1.yaml`.
-	err = clt.UpsertRole(ctx, role)
+	role, err = clt.UpsertRole(ctx, role)
 	if err != nil {
 		log.Fatalf("failed to create role: %v", err)
 	}
@@ -92,6 +93,7 @@ func ExampleClient_roleCRUD() {
 		log.Fatalf("failed to delete role: %v", err)
 	}
 }
+
 func ExampleNew() {
 	ctx := context.Background()
 	clt, err := client.New(ctx, client.Config{
@@ -129,7 +131,9 @@ func ExampleNew() {
 }
 
 // Generate tsh profile with tsh.
-//  $ tsh login --user=api-user
+//
+//	$ tsh login --user=api-user
+//
 // Load credentials from the default directory and current profile, or specify the directory and profile.
 func ExampleCredentials_loadProfile() {
 	client.LoadProfile("", "")
@@ -143,8 +147,10 @@ func ExampleLoadProfile() {
 }
 
 // Generate identity file with tsh or tctl.
-//  $ tsh login --user=api-user --out=identity-file-path
-//  $ tctl auth sign --user=api-user --out=identity-file-path
+//
+//	$ tsh login --user=api-user --out=identity-file-path
+//	$ tctl auth sign --user=api-user --out=identity-file-path
+//
 // Load credentials from the specified identity file.
 func ExampleCredentials_loadIdentity() {
 	client.LoadIdentityFile("identity-file-path")
@@ -156,9 +162,11 @@ func ExampleLoadIdentityFile() {
 }
 
 // Generate identity file with tsh or tctl.
-//  $ tsh login --user=api-user --out=identity-file-path
-//  $ tctl auth sign --user=api-user --out=identity-file-path
-//  $ export TELEPORT_IDENTITY=$(cat identity-file-path)
+//
+//	$ tsh login --user=api-user --out=identity-file-path
+//	$ tctl auth sign --user=api-user --out=identity-file-path
+//	$ export TELEPORT_IDENTITY=$(cat identity-file-path)
+//
 // Load credentials from the envrironment variable.
 func ExampleCredentials_loadIdentityString() {
 	client.LoadIdentityFileFromString(os.Getenv("TELEPORT_IDENTITY"))
@@ -170,7 +178,9 @@ func ExampleLoadIdentityFileFromString() {
 }
 
 // Generate certificate key pair with tctl.
-//  $ tctl auth sign --format=tls --user=api-user --out=path/to/certs
+//
+//	$ tctl auth sign --format=tls --user=api-user --out=path/to/certs
+//
 // Load credentials from the specified certificate files.
 func ExampleCredentials_loadKeyPair() {
 	client.LoadKeyPair(
@@ -187,4 +197,15 @@ func ExampleLoadKeyPair() {
 		"path/to/certs.key",
 		"path/to/certs.cas",
 	)
+}
+
+// Perform ALPN handshake test to see if ALPN connection upgrade is required.
+//
+//	$ TELEPORT_ALPN_TEST_ADDR=proxy.example.com:443 go test -run=ExampleIsALPNConnUpgradeRequired -v
+//
+// Note that "Output" is set to "false" to mark this as a testable example.
+func ExampleIsALPNConnUpgradeRequired() {
+	addr := os.Getenv("TELEPORT_ALPN_TEST_ADDR")
+	fmt.Println(client.IsALPNConnUpgradeRequired(context.Background(), addr, false))
+	// Output: false
 }

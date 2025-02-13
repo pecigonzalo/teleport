@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services_test
 
@@ -20,29 +22,36 @@ import (
 	"context"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth/testauthority"
-	"github.com/gravitational/teleport/lib/backend/lite"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/services/local"
-	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/constants"
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/backend/memory"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/fixtures"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/local"
+	"github.com/gravitational/teleport/lib/services/readonly"
+	"github.com/gravitational/teleport/lib/tlsca"
 )
 
 var _ types.Events = (*errorWatcher)(nil)
 
-type errorWatcher struct {
-}
+type errorWatcher struct{}
 
 func (e errorWatcher) NewWatcher(context.Context, types.Watch) (types.Watcher, error) {
 	return nil, errors.New("watcher error")
@@ -50,8 +59,7 @@ func (e errorWatcher) NewWatcher(context.Context, types.Watch) (types.Watcher, e
 
 var _ services.ProxyGetter = (*nopProxyGetter)(nil)
 
-type nopProxyGetter struct {
-}
+type nopProxyGetter struct{}
 
 func (n nopProxyGetter) GetProxies() ([]types.Server, error) {
 	return nil, nil
@@ -99,11 +107,13 @@ func TestResourceWatcher_Backoff(t *testing.T) {
 
 func TestProxyWatcher(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -122,26 +132,23 @@ func TestProxyWatcher(t *testing.T) {
 				Events:   local.NewEventsService(bk),
 			},
 		},
-		ProxiesC: make(chan []types.Server, 10),
+		ProxyGetter: presence,
+		ProxiesC:    make(chan []types.Server, 10),
+		ProxyDiffer: func(old, new types.Server) bool {
+			return old.GetPeerAddr() != new.GetPeerAddr()
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
-	// Since no proxy is yet present, the ProxyWatcher should immediately
-	// yield back to its retry loop.
-	select {
-	case <-w.ResetC:
-	case <-time.After(time.Second):
-		t.Fatal("Timeout waiting for ProxyWatcher reset.")
-	}
-
+	require.NoError(t, w.WaitInitialization())
 	// Add a proxy server.
 	proxy := newProxyServer(t, "proxy1", "127.0.0.1:2023")
-	require.NoError(t, presence.UpsertProxy(proxy))
+	require.NoError(t, presence.UpsertProxy(ctx, proxy))
 
 	// The first event is always the current list of proxies.
 	select {
-	case changeset := <-w.ProxiesC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 1)
 		require.Empty(t, resourceDiff(changeset[0], proxy))
 	case <-w.Done():
@@ -152,11 +159,11 @@ func TestProxyWatcher(t *testing.T) {
 
 	// Add a second proxy.
 	proxy2 := newProxyServer(t, "proxy2", "127.0.0.1:2023")
-	require.NoError(t, presence.UpsertProxy(proxy2))
+	require.NoError(t, presence.UpsertProxy(ctx, proxy2))
 
 	// Watcher should detect the proxy list change.
 	select {
-	case changeset := <-w.ProxiesC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 2)
 	case <-w.Done():
 		t.Fatal("Watcher has unexpectedly exited.")
@@ -165,13 +172,26 @@ func TestProxyWatcher(t *testing.T) {
 	}
 
 	// Delete the first proxy.
-	require.NoError(t, presence.DeleteProxy(proxy.GetName()))
+	require.NoError(t, presence.DeleteProxy(ctx, proxy.GetName()))
 
 	// Watcher should detect the proxy list change.
 	select {
-	case changeset := <-w.ProxiesC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 1)
 		require.Empty(t, resourceDiff(changeset[0], proxy2))
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the update event.")
+	}
+
+	// Delete the second proxy.
+	require.NoError(t, presence.DeleteProxy(ctx, proxy2.GetName()))
+
+	// Watcher should detect the proxy list change.
+	select {
+	case changeset := <-w.ResourcesC:
+		require.Empty(t, changeset)
 	case <-w.Done():
 		t.Fatal("Watcher has unexpectedly exited.")
 	case <-time.After(2 * time.Second):
@@ -181,8 +201,8 @@ func TestProxyWatcher(t *testing.T) {
 
 func newProxyServer(t *testing.T, name, addr string) types.Server {
 	s, err := types.NewServer(name, types.KindProxy, types.ServerSpecV2{
-		Addr:       addr,
-		PublicAddr: addr,
+		Addr:        addr,
+		PublicAddrs: []string{addr},
 	})
 	require.NoError(t, err)
 	return s
@@ -190,13 +210,13 @@ func newProxyServer(t *testing.T, name, addr string) types.Server {
 
 func TestLockWatcher(t *testing.T) {
 	t.Parallel()
+
 	ctx := context.Background()
 	clock := clockwork.NewFakeClock()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
-		Clock:            clock,
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -295,13 +315,13 @@ func TestLockWatcher(t *testing.T) {
 
 func TestLockWatcherSubscribeWithEmptyTarget(t *testing.T) {
 	t.Parallel()
+
 	ctx := context.Background()
 	clock := clockwork.NewFakeClock()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
-		Clock:            clock,
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -372,13 +392,13 @@ func TestLockWatcherSubscribeWithEmptyTarget(t *testing.T) {
 
 func TestLockWatcherStale(t *testing.T) {
 	t.Parallel()
+
 	ctx := context.Background()
 	clock := clockwork.NewFakeClock()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
-		Clock:            clock,
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -500,7 +520,11 @@ func (e *withUnreliability) NewWatcher(ctx context.Context, watch types.Watch) (
 
 func expectLockInForce(t *testing.T, expectedLock types.Lock, err error) {
 	require.Error(t, err)
-	errLock := err.(trace.Error).GetFields()["lock-in-force"]
+	var lockErr trace.Error
+	var errLock any
+	if errors.As(err, &lockErr) {
+		errLock = lockErr.GetFields()["lock-in-force"]
+	}
 	if expectedLock != nil {
 		require.Empty(t, resourceDiff(expectedLock, errLock.(types.Lock)))
 	} else {
@@ -510,29 +534,21 @@ func expectLockInForce(t *testing.T, expectedLock types.Lock, err error) {
 
 func resourceDiff(res1, res2 types.Resource) string {
 	return cmp.Diff(res1, res2,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 		cmpopts.EquateEmpty())
-}
-
-func caDiff(ca1, ca2 types.CertAuthority) string {
-	return cmp.Diff(ca1, ca2,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
-		cmpopts.IgnoreFields(types.CertAuthoritySpecV2{}, "CheckingKeys", "TLSKeyPairs"),
-		cmpopts.IgnoreFields(types.SSHKeyPair{}, "PrivateKey"),
-		cmpopts.IgnoreFields(types.TLSKeyPair{}, "Key"),
-		cmpopts.EquateEmpty(),
-	)
 }
 
 // TestDatabaseWatcher tests that database resource watcher properly receives
 // and dispatches updates to database resources.
 func TestDatabaseWatcher(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -551,15 +567,16 @@ func TestDatabaseWatcher(t *testing.T) {
 				Events:    local.NewEventsService(bk),
 			},
 		},
-		DatabasesC: make(chan types.Databases, 10),
+		DatabaseGetter: databasesService,
+		DatabasesC:     make(chan []types.Database, 10),
 	})
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
 	// Initially there are no databases so watcher should send an empty list.
 	select {
-	case changeset := <-w.DatabasesC:
-		require.Len(t, changeset, 0)
+	case changeset := <-w.ResourcesC:
+		require.Empty(t, changeset)
 	case <-w.Done():
 		t.Fatal("Watcher has unexpectedly exited.")
 	case <-time.After(2 * time.Second):
@@ -572,7 +589,7 @@ func TestDatabaseWatcher(t *testing.T) {
 
 	// The first event is always the current list of databases.
 	select {
-	case changeset := <-w.DatabasesC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 1)
 		require.Empty(t, resourceDiff(changeset[0], database1))
 	case <-w.Done():
@@ -587,7 +604,7 @@ func TestDatabaseWatcher(t *testing.T) {
 
 	// Watcher should detect the database list change.
 	select {
-	case changeset := <-w.DatabasesC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 2)
 	case <-w.Done():
 		t.Fatal("Watcher has unexpectedly exited.")
@@ -600,7 +617,7 @@ func TestDatabaseWatcher(t *testing.T) {
 
 	// Watcher should detect the database list change.
 	select {
-	case changeset := <-w.DatabasesC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 1)
 		require.Empty(t, resourceDiff(changeset[0], database2))
 	case <-w.Done():
@@ -625,11 +642,13 @@ func newDatabase(t *testing.T, name string) types.Database {
 // and dispatches updates.
 func TestAppWatcher(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -648,15 +667,16 @@ func TestAppWatcher(t *testing.T) {
 				Events: local.NewEventsService(bk),
 			},
 		},
-		AppsC: make(chan types.Apps, 10),
+		AppGetter: appService,
+		AppsC:     make(chan []types.Application, 10),
 	})
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
 	// Initially there are no apps so watcher should send an empty list.
 	select {
-	case changeset := <-w.AppsC:
-		require.Len(t, changeset, 0)
+	case changeset := <-w.ResourcesC:
+		require.Empty(t, changeset)
 	case <-w.Done():
 		t.Fatal("Watcher has unexpectedly exited.")
 	case <-time.After(2 * time.Second):
@@ -669,7 +689,7 @@ func TestAppWatcher(t *testing.T) {
 
 	// The first event is always the current list of apps.
 	select {
-	case changeset := <-w.AppsC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 1)
 		require.Empty(t, resourceDiff(changeset[0], app1))
 	case <-w.Done():
@@ -684,7 +704,7 @@ func TestAppWatcher(t *testing.T) {
 
 	// Watcher should detect the app list change.
 	select {
-	case changeset := <-w.AppsC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 2)
 	case <-w.Done():
 		t.Fatal("Watcher has unexpectedly exited.")
@@ -697,7 +717,7 @@ func TestAppWatcher(t *testing.T) {
 
 	// Watcher should detect the database list change.
 	select {
-	case changeset := <-w.AppsC:
+	case changeset := <-w.ResourcesC:
 		require.Len(t, changeset, 1)
 		require.Empty(t, resourceDiff(changeset[0], app2))
 	case <-w.Done():
@@ -707,7 +727,7 @@ func TestAppWatcher(t *testing.T) {
 	}
 }
 
-func newApp(t *testing.T, name string) types.Application {
+func newApp(t *testing.T, name string) *types.AppV3 {
 	app, err := types.NewAppV3(types.Metadata{
 		Name: name,
 	}, types.AppSpecV3{
@@ -719,11 +739,13 @@ func newApp(t *testing.T, name string) types.Application {
 
 func TestCertAuthorityWatcher(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
-	bk, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:             t.TempDir(),
-		PollStreamPeriod: 200 * time.Millisecond,
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
@@ -741,92 +763,87 @@ func TestCertAuthorityWatcher(t *testing.T) {
 				Trust:  caService,
 				Events: local.NewEventsService(bk),
 			},
+			Clock: clock,
 		},
-		CertAuthorityC: make(chan []types.CertAuthority, 10),
-		WatchUserCA:    true,
-		WatchHostCA:    true,
+		Types: []types.CertAuthType{types.HostCA, types.UserCA, types.DatabaseCA, types.OpenSSHCA},
 	})
 	require.NoError(t, err)
 	t.Cleanup(w.Close)
 
-	nothingWatcher, err := services.NewCertAuthorityWatcher(ctx, services.CertAuthorityWatcherConfig{
-		ResourceWatcherConfig: services.ResourceWatcherConfig{
-			Component:      "test",
-			MaxRetryPeriod: 200 * time.Millisecond,
-			Client: &client{
-				Trust:  caService,
-				Events: local.NewEventsService(bk),
-			},
-		},
-		CertAuthorityC: make(chan []types.CertAuthority, 10),
+	waitForEvent := func(t *testing.T, sub types.Watcher, caType types.CertAuthType, clusterName string, op types.OpType) {
+		select {
+		case event := <-sub.Events():
+			require.Equal(t, types.KindCertAuthority, event.Resource.GetKind())
+			require.Equal(t, string(caType), event.Resource.GetSubKind())
+			require.Equal(t, clusterName, event.Resource.GetName())
+			require.Equal(t, op, event.Type)
+			require.Empty(t, sub.Events()) // no more events.
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for event")
+		}
+	}
+
+	ensureNoEvents := func(t *testing.T, sub types.Watcher) {
+		select {
+		case event := <-sub.Events():
+			t.Fatalf("Unexpected event: %v.", event)
+		case <-sub.Done():
+			t.Fatal("CA watcher subscription has unexpectedly exited.")
+		case <-time.After(time.Second):
+		}
+	}
+
+	t.Run("Subscribe all", func(t *testing.T) {
+		// Use nil CertAuthorityFilter to subscribe all events from the watcher.
+		sub, err := w.Subscribe(ctx, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, sub.Close()) })
+
+		// Create a CA and ensure we receive the event.
+		ca := newCertAuthority(t, "test", types.HostCA)
+		require.NoError(t, caService.UpsertCertAuthority(ctx, ca))
+		waitForEvent(t, sub, types.HostCA, "test", types.OpPut)
+
+		// Delete a CA and ensure we receive the event.
+		require.NoError(t, caService.DeleteCertAuthority(ctx, ca.GetID()))
+		waitForEvent(t, sub, types.HostCA, "test", types.OpDelete)
+
+		// Create a CA with a type that the watcher is NOT receiving and ensure
+		// we DO NOT receive the event.
+		signer := newCertAuthority(t, "test", types.JWTSigner)
+		require.NoError(t, caService.UpsertCertAuthority(ctx, signer))
+		ensureNoEvents(t, sub)
 	})
-	require.NoError(t, err)
-	t.Cleanup(nothingWatcher.Close)
 
-	require.Empty(t, w.GetCurrent())
-	require.Empty(t, nothingWatcher.GetCurrent())
+	t.Run("Subscribe with filter", func(t *testing.T) {
+		sub, err := w.Subscribe(ctx,
+			types.CertAuthorityFilter{
+				types.HostCA: "test",
+				types.UserCA: types.Wildcard,
+			},
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, sub.Close()) })
 
-	// Initially there are no cas so watcher should send an empty list.
-	select {
-	case changeset := <-w.CertAuthorityC:
-		require.Len(t, changeset, 0)
-		require.Empty(t, nothingWatcher.GetCurrent())
-	case <-w.Done():
-		t.Fatal("Watcher has unexpectedly exited.")
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for the first event.")
-	}
+		// Receives one HostCA event, matched by type and specific cluster name.
+		require.NoError(t, caService.UpsertCertAuthority(ctx, newCertAuthority(t, "test", types.HostCA)))
+		waitForEvent(t, sub, types.HostCA, "test", types.OpPut)
 
-	// Add an authority.
-	ca1 := newCertAuthority(t, "ca1", types.HostCA)
-	require.NoError(t, caService.CreateCertAuthority(ca1))
+		// Receives one UserCA event, matched by type and wildcard cluster name.
+		require.NoError(t, caService.UpsertCertAuthority(ctx, newCertAuthority(t, "unknown", types.UserCA)))
+		waitForEvent(t, sub, types.UserCA, "unknown", types.OpPut)
 
-	// The first event is always the current list of apps.
-	select {
-	case changeset := <-w.CertAuthorityC:
-		require.Len(t, changeset, 1)
-		require.Empty(t, caDiff(changeset[0], ca1))
-		require.Empty(t, nothingWatcher.GetCurrent())
-	case <-w.Done():
-		t.Fatal("Watcher has unexpectedly exited.")
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for the first event.")
-	}
-
-	// Add a second ca.
-	ca2 := newCertAuthority(t, "ca2", types.UserCA)
-	require.NoError(t, caService.CreateCertAuthority(ca2))
-
-	// Watcher should detect the ca list change.
-	select {
-	case changeset := <-w.CertAuthorityC:
-		require.Len(t, changeset, 2)
-		require.Empty(t, nothingWatcher.GetCurrent())
-	case <-w.Done():
-		t.Fatal("Watcher has unexpectedly exited.")
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for the update event.")
-	}
-
-	// Delete the first ca.
-	require.NoError(t, caService.DeleteCertAuthority(ca1.GetID()))
-
-	// Watcher should detect the ca list change.
-	select {
-	case changeset := <-w.CertAuthorityC:
-		require.Len(t, changeset, 1)
-		require.Empty(t, caDiff(changeset[0], ca2))
-		require.Empty(t, nothingWatcher.GetCurrent())
-	case <-w.Done():
-		t.Fatal("Watcher has unexpectedly exited.")
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for the update event.")
-	}
+		// Should NOT receive any HostCA events from another cluster.
+		require.NoError(t, caService.UpsertCertAuthority(ctx, newCertAuthority(t, "unknown", types.HostCA)))
+		// Should NOT receive any DatabaseCA events.
+		require.NoError(t, caService.UpsertCertAuthority(ctx, newCertAuthority(t, "test", types.DatabaseCA)))
+		ensureNoEvents(t, sub)
+	})
 }
 
 func newCertAuthority(t *testing.T, name string, caType types.CertAuthType) types.CertAuthority {
 	ta := testauthority.New()
-	priv, pub, err := ta.GenerateKeyPair("")
+	priv, pub, err := ta.GenerateKeyPair()
 	require.NoError(t, err)
 
 	// CA for cluster1 with 1 key pair.
@@ -837,19 +854,615 @@ func newCertAuthority(t *testing.T, name string, caType types.CertAuthType) type
 		Type:        caType,
 		ClusterName: name,
 		ActiveKeys: types.CAKeySet{
-			SSH: []*types.SSHKeyPair{{
-				PrivateKey:     priv,
-				PrivateKeyType: types.PrivateKeyType_RAW,
-				PublicKey:      pub,
-			}},
-			TLS: []*types.TLSKeyPair{{
-				Cert: cert,
-				Key:  key,
-			}},
+			SSH: []*types.SSHKeyPair{
+				{
+					PrivateKey:     priv,
+					PrivateKeyType: types.PrivateKeyType_RAW,
+					PublicKey:      pub,
+				},
+			},
+			TLS: []*types.TLSKeyPair{
+				{
+					Cert: cert,
+					Key:  key,
+				},
+			},
+			JWT: []*types.JWTKeyPair{
+				{
+					PublicKey:  []byte(fixtures.JWTSignerPublicKey),
+					PrivateKey: []byte(fixtures.JWTSignerPrivateKey),
+				},
+			},
 		},
-		Roles:      nil,
-		SigningAlg: types.CertAuthoritySpecV2_RSA_SHA2_256,
 	})
 	require.NoError(t, err)
 	return ca
+}
+
+type unhealthyWatcher struct{}
+
+func (f unhealthyWatcher) NewWatcher(ctx context.Context, watch types.Watch) (types.Watcher, error) {
+	return nil, trace.LimitExceeded("too many watchers")
+}
+
+// TestNodeWatcherFallback validates that calling GetNodes on
+// a NodeWatcher will pull data from the cache if the resourceWatcher
+// run loop is unhealthy due to issues creating a types.Watcher.
+func TestNodeWatcherFallback(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
+	})
+	require.NoError(t, err)
+
+	type client struct {
+		services.Presence
+		types.Events
+	}
+
+	presence := local.NewPresenceService(bk)
+	w, err := services.NewNodeWatcher(ctx, services.NodeWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: "test",
+			Client: &client{
+				Presence: presence,
+				Events:   unhealthyWatcher{},
+			},
+			MaxStaleness: time.Minute,
+		},
+		NodesGetter: presence,
+	})
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+
+	// Add some servers.
+	nodes := make([]types.Server, 0, 5)
+	for i := 0; i < 5; i++ {
+		node := newNodeServer(t, fmt.Sprintf("node%d", i), fmt.Sprintf("hostname%d", i), "127.0.0.1:2023", i%2 == 0)
+		_, err = presence.UpsertNode(ctx, node)
+		require.NoError(t, err)
+		nodes = append(nodes, node)
+	}
+
+	require.Empty(t, w.ResourceCount())
+	require.False(t, w.IsInitialized())
+
+	got, err := w.CurrentResources(ctx)
+	require.NoError(t, err)
+	require.Len(t, nodes, len(got))
+
+	require.Len(t, nodes, w.ResourceCount())
+	require.False(t, w.IsInitialized())
+}
+
+func TestNodeWatcher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
+	})
+	require.NoError(t, err)
+
+	type client struct {
+		services.Presence
+		types.Events
+	}
+
+	presence := local.NewPresenceService(bk)
+	w, err := services.NewNodeWatcher(ctx, services.NodeWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: "test",
+			Client: &client{
+				Presence: presence,
+				Events:   local.NewEventsService(bk),
+			},
+			MaxStaleness: time.Minute,
+		},
+		NodesGetter: presence,
+	})
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+	require.NoError(t, w.WaitInitialization())
+	// Add some node servers.
+	nodes := make([]types.Server, 0, 5)
+	for i := 0; i < 5; i++ {
+		node := newNodeServer(t, fmt.Sprintf("node%d", i), fmt.Sprintf("hostname%d", i), "127.0.0.1:2023", i%2 == 0)
+		_, err = presence.UpsertNode(ctx, node)
+		require.NoError(t, err)
+		nodes = append(nodes, node)
+	}
+
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResources(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, filtered, len(nodes))
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive nodes.")
+
+	filtered, err := w.CurrentResourcesWithFilter(ctx, func(n readonly.Server) bool { return n.GetUseTunnel() })
+	require.NoError(t, err)
+	require.Len(t, filtered, 3)
+
+	require.NoError(t, presence.DeleteNode(ctx, apidefaults.Namespace, nodes[0].GetName()))
+
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResources(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, filtered, len(nodes)-1)
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive nodes.")
+
+	filtered, err = w.CurrentResourcesWithFilter(ctx, func(n readonly.Server) bool { return n.GetName() == nodes[0].GetName() })
+	require.NoError(t, err)
+	require.Empty(t, filtered)
+}
+
+func newNodeServer(t *testing.T, name, hostname, addr string, tunnel bool) types.Server {
+	s, err := types.NewServer(name, types.KindNode, types.ServerSpecV2{
+		Addr:      addr,
+		UseTunnel: tunnel,
+		Hostname:  hostname,
+	})
+	require.NoError(t, err)
+	return s
+}
+
+func TestKubeServerWatcher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
+	})
+	require.NoError(t, err)
+
+	type client struct {
+		services.Presence
+		types.Events
+	}
+
+	presence := local.NewPresenceService(bk)
+	w, err := services.NewKubeServerWatcher(ctx, services.KubeServerWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: "test",
+			Client: &client{
+				Presence: presence,
+				Events:   local.NewEventsService(bk),
+			},
+			MaxStaleness: time.Minute,
+		},
+		KubernetesServerGetter: presence,
+	})
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+	require.NoError(t, w.WaitInitialization())
+	newKubeServer := func(t *testing.T, name, addr, hostID string) types.KubeServer {
+		kube, err := types.NewKubernetesClusterV3(
+			types.Metadata{
+				Name: name,
+			},
+			types.KubernetesClusterSpecV3{})
+		require.NoError(t, err)
+		server, err := types.NewKubernetesServerV3FromCluster(kube, addr, hostID)
+		require.NoError(t, err)
+		return server
+	}
+
+	// Add some kube servers.
+	kubeServers := make([]types.KubeServer, 0, 5)
+	for i := 0; i < 5; i++ {
+		kubeServer := newKubeServer(t, fmt.Sprintf("kube_cluster-%d", i), "addr", fmt.Sprintf("host-%d", i))
+		_, err = presence.UpsertKubernetesServer(ctx, kubeServer)
+		require.NoError(t, err)
+		kubeServers = append(kubeServers, kubeServer)
+	}
+
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResources(context.Background())
+		assert.NoError(t, err)
+		assert.Len(t, filtered, len(kubeServers))
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive kube servers.")
+
+	// Test filtering by cluster name.
+	filtered, err := w.CurrentResourcesWithFilter(context.Background(), func(ks readonly.KubeServer) bool {
+		return ks.GetName() == kubeServers[0].GetName()
+	})
+	require.NoError(t, err)
+	require.Len(t, filtered, 1)
+
+	// Test Deleting a kube server.
+	require.NoError(t, presence.DeleteKubernetesServer(ctx, kubeServers[0].GetHostID(), kubeServers[0].GetName()))
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		kube, err := w.CurrentResources(context.Background())
+		assert.NoError(t, err)
+		assert.Len(t, kube, len(kubeServers)-1)
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive the delete event.")
+
+	filtered, err = w.CurrentResourcesWithFilter(context.Background(), func(ks readonly.KubeServer) bool {
+		return ks.GetName() == kubeServers[0].GetName()
+	})
+	require.NoError(t, err)
+	require.Empty(t, filtered)
+
+	// Test adding a kube server with the same name as an existing one.
+	kubeServer := newKubeServer(t, kubeServers[1].GetName(), "addr", uuid.NewString())
+	_, err = presence.UpsertKubernetesServer(ctx, kubeServer)
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResourcesWithFilter(context.Background(), func(ks readonly.KubeServer) bool {
+			return ks.GetName() == kubeServers[1].GetName()
+		})
+		assert.NoError(t, err)
+		assert.Len(t, filtered, 2)
+	}, 1000*time.Second, time.Millisecond, "Timeout waiting for watcher to the new registered kube server.")
+
+	// Test deleting all kube servers with the same name.
+	filtered, err = w.CurrentResourcesWithFilter(context.Background(), func(ks readonly.KubeServer) bool {
+		return ks.GetName() == kubeServers[1].GetName()
+	})
+	assert.NoError(t, err)
+	for _, server := range filtered {
+		require.NoError(t, presence.DeleteKubernetesServer(ctx, server.GetHostID(), server.GetName()))
+	}
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResourcesWithFilter(context.Background(), func(ks readonly.KubeServer) bool {
+			return ks.GetName() == kubeServers[1].GetName()
+		})
+		assert.NoError(t, err)
+		assert.Empty(t, filtered)
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive the two delete events.")
+
+	require.NoError(t, presence.DeleteAllKubernetesServers(ctx))
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResources(context.Background())
+		assert.NoError(t, err)
+		assert.Empty(t, filtered)
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive all delete events.")
+}
+
+// TestAccessRequestWatcher tests that access request resource watcher properly receives
+// and dispatches updates to access request resources.
+func TestAccessRequestWatcher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
+	})
+	require.NoError(t, err)
+
+	type client struct {
+		services.DynamicAccessCore
+		types.Events
+	}
+
+	dynamicAccessService := local.NewDynamicAccessService(bk)
+	w, err := services.NewAccessRequestWatcher(ctx, services.AccessRequestWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component:      "test",
+			MaxRetryPeriod: 200 * time.Millisecond,
+			Client: &client{
+				DynamicAccessCore: dynamicAccessService,
+				Events:            local.NewEventsService(bk),
+			},
+		},
+		AccessRequestsC: make(chan types.AccessRequests, 10),
+	})
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+
+	// Initially there are no access requests so watcher should send an empty list.
+	select {
+	case changeset := <-w.AccessRequestsC:
+		require.Empty(t, changeset)
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the first event.")
+	}
+
+	// Add an access request.
+	accessRequest1 := newAccessRequest(t, uuid.NewString())
+	accessRequest1, err = dynamicAccessService.CreateAccessRequestV2(ctx, accessRequest1)
+	require.NoError(t, err)
+
+	// The first event is always the current list of access requests.
+	select {
+	case changeset := <-w.AccessRequestsC:
+		require.Len(t, changeset, 1)
+		require.Empty(t, resourceDiff(changeset[0], accessRequest1))
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the first event.")
+	}
+
+	// Add a second access request.
+	accessRequest2 := newAccessRequest(t, uuid.NewString())
+	accessRequest2, err = dynamicAccessService.CreateAccessRequestV2(ctx, accessRequest2)
+	require.NoError(t, err)
+
+	// Watcher should detect the access request list change.
+	select {
+	case changeset := <-w.AccessRequestsC:
+		require.Len(t, changeset, 2)
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the second event.")
+	}
+
+	// Change the second access request
+	accessRequest2.SetState(types.RequestState_APPROVED)
+	require.NoError(t, dynamicAccessService.UpsertAccessRequest(ctx, accessRequest2))
+
+	// Watcher should detect the access request list change.
+	select {
+	case changeset := <-w.AccessRequestsC:
+		require.Len(t, changeset, 2)
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the updated event.")
+	}
+
+	// Delete the first access request.
+	require.NoError(t, dynamicAccessService.DeleteAccessRequest(ctx, accessRequest1.GetName()))
+
+	// Watcher should detect the access request list change.
+	select {
+	case changeset := <-w.AccessRequestsC:
+		require.Len(t, changeset, 1)
+		require.Empty(t, resourceDiff(changeset[0], accessRequest2))
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the update event.")
+	}
+}
+
+func newAccessRequest(t *testing.T, name string) types.AccessRequest {
+	accessRequest, err := types.NewAccessRequest(name, "test-user", "role1")
+	accessRequest.SetState(types.RequestState_PENDING)
+	require.NoError(t, err)
+	return accessRequest
+}
+
+// TestOktaAssignmentWatcher tests that Okta assignment resource watcher properly receives
+// and dispatches updates to Okta assignment resources.
+func TestOktaAssignmentWatcher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
+	})
+	require.NoError(t, err)
+
+	type client struct {
+		services.OktaAssignments
+		types.Events
+	}
+
+	oktaService, err := local.NewOktaService(bk, clock)
+	require.NoError(t, err)
+	w, err := services.NewOktaAssignmentWatcher(ctx, services.OktaAssignmentWatcherConfig{
+		RWCfg: services.ResourceWatcherConfig{
+			Component:      "test",
+			MaxRetryPeriod: 200 * time.Millisecond,
+			Client: &client{
+				OktaAssignments: oktaService,
+				Events:          local.NewEventsService(bk),
+			},
+		},
+		OktaAssignments:  oktaService,
+		PageSize:         1, // Set page size to 1 to exercise pagination logic.
+		OktaAssignmentsC: make(chan types.OktaAssignments, 10),
+	})
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+
+	// Initially there are no assignments so watcher should send an empty list.
+	select {
+	case changeset := <-w.CollectorChan():
+		require.Empty(t, changeset, "initial assignment list should be empty")
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the initial empty event.")
+	}
+
+	// Add an assignment.
+	a1 := newOktaAssignment(t, uuid.NewString())
+	_, err = oktaService.CreateOktaAssignment(ctx, a1)
+	require.NoError(t, err)
+
+	// The first event is always the current list of assignments.
+	select {
+	case changeset := <-w.CollectorChan():
+		expected := types.OktaAssignments{a1}
+		sortedChangeset := changeset
+		sort.Sort(expected)
+		sort.Sort(sortedChangeset)
+
+		require.Empty(t,
+			cmp.Diff(expected,
+				changeset,
+				cmpopts.IgnoreFields(types.Metadata{}, "Revision")),
+			"should be no differences in the changeset after adding the first assignment")
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the first event.")
+	}
+
+	// Add a second assignment.
+	a2 := newOktaAssignment(t, uuid.NewString())
+	_, err = oktaService.CreateOktaAssignment(ctx, a2)
+	require.NoError(t, err)
+
+	// Watcher should detect the assignment list change.
+	select {
+	case changeset := <-w.CollectorChan():
+		expected := types.OktaAssignments{a1, a2}
+		sort.Sort(expected)
+		sort.Sort(changeset)
+
+		require.Empty(t,
+			cmp.Diff(
+				expected,
+				changeset,
+				cmpopts.IgnoreFields(types.Metadata{}, "Revision")),
+			"should be no difference in the changeset after adding the second assignment")
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the second event.")
+	}
+
+	// Change the second assignment.
+	a2.SetExpiry(time.Now().Add(30 * time.Minute))
+	_, err = oktaService.UpdateOktaAssignment(ctx, a2)
+	require.NoError(t, err)
+
+	// Watcher should detect the assignment list change.
+	select {
+	case changeset := <-w.CollectorChan():
+		expected := types.OktaAssignments{a1, a2}
+		sort.Sort(expected)
+		sort.Sort(changeset)
+
+		require.Empty(t,
+			cmp.Diff(
+				expected,
+				changeset,
+				cmpopts.IgnoreFields(types.Metadata{}, "Revision")),
+			"should be no difference in the changeset after update")
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the updated event.")
+	}
+
+	// Delete the first assignment.
+	require.NoError(t, oktaService.DeleteOktaAssignment(ctx, a1.GetName()))
+
+	// Watcher should detect the Okta assignment list change.
+	select {
+	case changeset := <-w.CollectorChan():
+		expected := types.OktaAssignments{a2}
+		sort.Sort(expected)
+		sort.Sort(changeset)
+
+		require.Empty(t,
+			cmp.Diff(
+				expected,
+				changeset,
+				cmpopts.IgnoreFields(types.Metadata{}, "Revision")),
+			"should be no difference in the changeset after deleting the first assignment")
+	case <-w.Done():
+		t.Fatal("Watcher has unexpectedly exited.")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for the delete event.")
+	}
+}
+
+func newOktaAssignment(t *testing.T, name string) types.OktaAssignment {
+	assignment, err := types.NewOktaAssignment(
+		types.Metadata{
+			Name: name,
+		},
+		types.OktaAssignmentSpecV1{
+			User: "test-user@test.user",
+			Targets: []*types.OktaAssignmentTargetV1{
+				{
+					Type: types.OktaAssignmentTargetV1_APPLICATION,
+					Id:   "123456",
+				},
+			},
+			Status: types.OktaAssignmentSpecV1_PENDING,
+		},
+	)
+	require.NoError(t, err)
+	return assignment
+}
+
+func TestGitServerWatcher(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	bk, err := memory.New(memory.Config{})
+	require.NoError(t, err)
+
+	gitServerService, err := local.NewGitServerService(bk)
+	require.NoError(t, err)
+	w, err := services.NewGitServerWatcher(ctx, services.GitServerWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component:    "test",
+			Client:       local.NewEventsService(bk),
+			MaxStaleness: time.Minute,
+		},
+		GitServerGetter: gitServerService,
+	})
+	require.NoError(t, err)
+	t.Cleanup(w.Close)
+	require.NoError(t, w.WaitInitialization())
+
+	// Add some git servers.
+	servers := make([]types.Server, 0, 5)
+	for i := 0; i < 5; i++ {
+		server := newGitServer(t, fmt.Sprintf("org%v", i+1))
+		_, err = gitServerService.CreateGitServer(ctx, server)
+		require.NoError(t, err)
+		servers = append(servers, server)
+	}
+
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResources(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, filtered, len(servers))
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive nodes.")
+
+	filtered, err := w.CurrentResourcesWithFilter(ctx, func(s readonly.Server) bool {
+		if github := s.GetGitHub(); github != nil {
+			return github.Organization == "org1" || github.Organization == "org2"
+		}
+		return false
+	})
+	require.NoError(t, err)
+	require.Len(t, filtered, 2)
+
+	// Delete a server.
+	require.NoError(t, gitServerService.DeleteGitServer(ctx, servers[0].GetName()))
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		filtered, err := w.CurrentResources(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, filtered, len(servers)-1)
+	}, time.Second, time.Millisecond, "Timeout waiting for watcher to receive nodes.")
+
+	filtered, err = w.CurrentResourcesWithFilter(ctx, func(s readonly.Server) bool {
+		if github := s.GetGitHub(); github != nil {
+			return github.Organization == "org1"
+		}
+		return false
+	})
+	require.NoError(t, err)
+	require.Empty(t, filtered)
 }

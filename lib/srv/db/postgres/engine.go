@@ -1,49 +1,48 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package postgres
 
 import (
+	"cmp"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/srv/db/cloud"
-	"github.com/gravitational/teleport/lib/srv/db/common"
-	"github.com/gravitational/teleport/lib/srv/db/common/role"
-	"github.com/gravitational/teleport/lib/utils"
-
+	"github.com/gravitational/trace"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
 
-	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/srv/db/common"
+	"github.com/gravitational/teleport/lib/srv/db/common/role"
+	"github.com/gravitational/teleport/lib/utils"
+	logutil "github.com/gravitational/teleport/lib/utils/log"
 )
 
-func init() {
-	common.RegisterEngine(newEngine,
-		defaults.ProtocolPostgres,
-		defaults.ProtocolCockroachDB)
-}
-
-func newEngine(ec common.EngineConfig) common.Engine {
+// NewEngine create new Postgres engine.
+func NewEngine(ec common.EngineConfig) common.Engine {
 	return &Engine{
 		EngineConfig: ec,
 	}
@@ -59,10 +58,19 @@ type Engine struct {
 	common.EngineConfig
 	// client is a client connection.
 	client *pgproto3.Backend
+	// cancelReq is a cancel request saved when a cancel request is received
+	// instead of a startup message.
+	cancelReq *pgproto3.CancelRequest
+
+	// rawClientConn is raw, unwrapped network connection to the client
+	rawClientConn net.Conn
+	// rawServerConn is raw, unwrapped network connection to the server
+	rawServerConn net.Conn
 }
 
 // InitializeConnection initializes the client connection.
 func (e *Engine) InitializeConnection(clientConn net.Conn, sessionCtx *common.Session) error {
+	e.rawClientConn = clientConn
 	e.client = pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
 
 	// The proxy is supposed to pass a startup message it received from
@@ -79,7 +87,7 @@ func (e *Engine) InitializeConnection(clientConn net.Conn, sessionCtx *common.Se
 // SendError sends an error to connected client in a Postgres understandable format.
 func (e *Engine) SendError(err error) {
 	if err := e.client.Send(toErrorResponse(err)); err != nil && !utils.IsOKNetworkError(err) {
-		e.Log.WithError(err).Error("Failed to send error to client.")
+		e.Log.ErrorContext(e.Context, "Failed to send error to client.", "error", err)
 	}
 }
 
@@ -108,17 +116,42 @@ func toErrorResponse(err error) *pgproto3.ErrorResponse {
 // middleman between the proxy and the database intercepting and interpreting
 // all messages i.e. doing protocol parsing.
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
 	// Now we know which database/username the user is connecting to, so
 	// perform an authorization check.
 	err := e.checkAccess(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	// This is where we connect to the actual Postgres database.
-	server, hijackedConn, err := e.connect(ctx, sessionCtx)
+	if e.cancelReq != nil {
+		// Special case when sending a cancel request.
+		// Postgres cancel request message flow is unique:
+		// 1. No startup message is sent by the client.
+		// 2. The server closes the connection without responding to the client.
+		return trace.Wrap(e.handleCancelRequest(ctx, sessionCtx))
+	}
+	// Automatically create the database user if needed.
+	cancelAutoUserLease, err := e.GetUserProvisioner(e).Activate(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	defer func() {
+		err := e.GetUserProvisioner(e).Teardown(ctx, sessionCtx)
+		if err != nil {
+			e.Log.ErrorContext(e.Context, "Failed to teardown auto user.", "user", sessionCtx.DatabaseUser, "error", err)
+		}
+	}()
+	// This is where we connect to the actual Postgres database.
+	server, hijackedConn, err := e.connect(ctx, sessionCtx)
+	if err != nil {
+		cancelAutoUserLease()
+		return trace.Wrap(err)
+	}
+	sessionCtx.PostgresPID = hijackedConn.PID
+	e.Log = e.Log.With("pg_backend_pid", hijackedConn.PID)
+	e.rawServerConn = hijackedConn.Conn
+	// Release the auto-users semaphore now that we've successfully connected.
+	cancelAutoUserLease()
 	// Upon successful connect, indicate to the Postgres client that startup
 	// has been completed, and it can start sending queries.
 	err = e.makeClientReady(e.client, hijackedConn)
@@ -138,22 +171,25 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 	defer func() {
 		err = serverConn.Close(ctx)
 		if err != nil && !utils.IsOKNetworkError(err) {
-			e.Log.WithError(err).Error("Failed to close connection.")
+			e.Log.ErrorContext(e.Context, "Failed to close connection.", "error", err)
 		}
 	}()
+
+	observe()
+
 	// Now launch the message exchange relaying all intercepted messages b/w
 	// the client (psql or other Postgres client) and the server (database).
 	clientErrCh := make(chan error, 1)
 	serverErrCh := make(chan error, 1)
 	go e.receiveFromClient(e.client, server, clientErrCh, sessionCtx)
-	go e.receiveFromServer(server, e.client, serverConn, serverErrCh, sessionCtx)
+	go e.receiveFromServer(serverConn, serverErrCh, sessionCtx)
 	select {
 	case err := <-clientErrCh:
-		e.Log.WithError(err).Debug("Client done.")
+		e.Log.DebugContext(e.Context, "Client done.", "error", err)
 	case err := <-serverErrCh:
-		e.Log.WithError(err).Debug("Server done.")
+		e.Log.DebugContext(e.Context, "Server done.", "error", err)
 	case <-ctx.Done():
-		e.Log.Debug("Context canceled.")
+		e.Log.DebugContext(e.Context, "Context canceled.")
 	}
 	return nil
 }
@@ -165,46 +201,62 @@ func (e *Engine) handleStartup(client *pgproto3.Backend, sessionCtx *common.Sess
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	e.Log.Debugf("Received startup message: %#v.", startupMessageI)
-	startupMessage, ok := startupMessageI.(*pgproto3.StartupMessage)
-	if !ok {
-		return trace.BadParameter("expected *pgproto3.StartupMessage, got %T", startupMessageI)
-	}
-	// Pass startup parameters received from the client along (this is how the
-	// client sets default date style format for example), but remove database
-	// name and user from them.
-	for key, value := range startupMessage.Parameters {
-		switch key {
-		case "database":
-			sessionCtx.DatabaseName = value
-		case "user":
-			sessionCtx.DatabaseUser = value
-		default:
-			sessionCtx.StartupParameters[key] = value
+	switch m := startupMessageI.(type) {
+	case *pgproto3.StartupMessage:
+		e.Log.DebugContext(e.Context, "Received startup message.", "message", m)
+		// Pass startup parameters received from the client along (this is how the
+		// client sets default date style format for example), but remove database
+		// name and user from them.
+		for key, value := range m.Parameters {
+			switch key {
+			case "database":
+				sessionCtx.DatabaseName = value
+			case "user":
+				sessionCtx.DatabaseUser = value
+			// https://www.postgresql.org/docs/17/libpq-connect.html#LIBPQ-CONNECT-APPLICATION-NAME
+			case "application_name":
+				sessionCtx.UserAgent = value
+			default:
+				sessionCtx.StartupParameters[key] = value
+			}
 		}
+	case *pgproto3.CancelRequest:
+		e.Log.DebugContext(e.Context, "Received cancel request.", "pid", m.ProcessID)
+		e.cancelReq = m
+	default:
+		return trace.BadParameter("unexpected startup message type: %T", startupMessageI)
 	}
 	return nil
 }
 
 func (e *Engine) checkAccess(ctx context.Context, sessionCtx *common.Session) error {
-	ap, err := e.Auth.GetAuthPreference(ctx)
+	// Don't allow an empty user names. Postgres will silently use
+	// the user name as the database name if no database name is passed which
+	// can cause Teleport to allow connections that are explicitly blocked by
+	// RBAC rules. Follow Postgres' behavior and use the user name as the
+	// database name if no database name is passed.
+	if sessionCtx.DatabaseUser == "" {
+		return trace.BadParameter("user name must not be empty")
+	}
+	sessionCtx.DatabaseName = cmp.Or(sessionCtx.DatabaseName, sessionCtx.DatabaseUser)
+
+	if err := sessionCtx.CheckUsernameForAutoUserProvisioning(); err != nil {
+		return trace.Wrap(err)
+	}
+	authPref, err := e.Auth.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	mfaParams := services.AccessMFAParams{
-		Verified:       sessionCtx.Identity.MFAVerified != "",
-		AlwaysRequired: ap.GetRequireSessionMFA(),
-	}
-
-	dbRoleMatchers := role.DatabaseRoleMatchers(
-		sessionCtx.Database.GetProtocol(),
-		sessionCtx.DatabaseUser,
-		sessionCtx.DatabaseName,
-	)
+	matchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:       sessionCtx.Database,
+		DatabaseUser:   sessionCtx.DatabaseUser,
+		DatabaseName:   sessionCtx.DatabaseName,
+		AutoCreateUser: sessionCtx.AutoCreateUserMode.IsEnabled(),
+	})
 	err = sessionCtx.Checker.CheckAccess(
 		sessionCtx.Database,
-		mfaParams,
-		dbRoleMatchers...,
+		sessionCtx.GetAccessState(authPref),
+		matchers...,
 	)
 	if err != nil {
 		e.Audit.OnSessionStart(e.Context, sessionCtx, err)
@@ -217,7 +269,7 @@ func (e *Engine) checkAccess(ctx context.Context, sessionCtx *common.Session) er
 // the hijacked connection and the frontend, an interface used for message
 // exchange with the database.
 func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (*pgproto3.Frontend, *pgconn.HijackedConn, error) {
-	connectConfig, err := e.getConnectConfig(ctx, sessionCtx)
+	connectConfig, err := e.newConnector(sessionCtx).getConnectConfig(ctx)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -244,19 +296,19 @@ func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (*pgpr
 // server is ready to accept messages from it.
 func (e *Engine) makeClientReady(client *pgproto3.Backend, hijackedConn *pgconn.HijackedConn) error {
 	// AuthenticationOk indicates that the authentication was successful.
-	e.Log.Debug("Sending AuthenticationOk.")
+	e.Log.DebugContext(e.Context, "Sending AuthenticationOk.")
 	if err := client.Send(&pgproto3.AuthenticationOk{}); err != nil {
 		return trace.Wrap(err)
 	}
 	// BackendKeyData provides secret-key data that the frontend must save
 	// if it wants to be able to issue cancel requests later.
-	e.Log.Debugf("Sending BackendKeyData: PID=%v.", hijackedConn.PID)
+	e.Log.DebugContext(e.Context, "Sending BackendKeyData.", "pid", hijackedConn.PID)
 	if err := client.Send(&pgproto3.BackendKeyData{ProcessID: hijackedConn.PID, SecretKey: hijackedConn.SecretKey}); err != nil {
 		return trace.Wrap(err)
 	}
 	// ParameterStatuses contains parameters reported by the server such as
 	// server version, relay them back to the client.
-	e.Log.Debugf("Sending ParameterStatuses: %v.", hijackedConn.ParameterStatuses)
+	e.Log.DebugContext(e.Context, "Sending ParameterStatuses.", "statuses", hijackedConn.ParameterStatuses)
 	for k, v := range hijackedConn.ParameterStatuses {
 		if err := client.Send(&pgproto3.ParameterStatus{Name: k, Value: v}); err != nil {
 			return trace.Wrap(err)
@@ -264,7 +316,7 @@ func (e *Engine) makeClientReady(client *pgproto3.Backend, hijackedConn *pgconn.
 	}
 	// ReadyForQuery indicates that the start-up is completed and the
 	// frontend can now issue commands.
-	e.Log.Debug("Sending ReadyForQuery")
+	e.Log.DebugContext(e.Context, "Sending ReadyForQuery")
 	if err := client.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
 		return trace.Wrap(err)
 	}
@@ -275,16 +327,21 @@ func (e *Engine) makeClientReady(client *pgproto3.Backend, hijackedConn *pgconn.
 // in turn receives them from psql or other client) and relays them to
 // the frontend connected to the database instance.
 func (e *Engine) receiveFromClient(client *pgproto3.Backend, server *pgproto3.Frontend, clientErrCh chan<- error, sessionCtx *common.Session) {
-	log := e.Log.WithField("from", "client")
-	defer log.Debug("Stop receiving from client.")
+	log := e.Log.With("from", "client")
+	defer log.DebugContext(e.Context, "Stop receiving from client.")
+
+	ctr := common.GetMessagesFromClientMetric(sessionCtx.Database)
+
 	for {
 		message, err := client.Receive()
 		if err != nil {
-			log.WithError(err).Errorf("Failed to receive message from client.")
+			log.ErrorContext(e.Context, "Failed to receive message from client.", "error", err)
 			clientErrCh <- err
 			return
 		}
-		log.Debugf("Received client message: %#v.", message)
+		log.Log(e.Context, logutil.TraceLevel, "Received client message", "message", message)
+		ctr.Inc()
+
 		switch msg := message.(type) {
 		case *pgproto3.Query:
 			e.auditQueryMessage(sessionCtx, msg)
@@ -304,7 +361,7 @@ func (e *Engine) receiveFromClient(client *pgproto3.Backend, server *pgproto3.Fr
 		}
 		err = server.Send(message)
 		if err != nil {
-			log.WithError(err).Error("Failed to send message to server.")
+			log.ErrorContext(e.Context, "Failed to send message to server.", "error", err)
 			clientErrCh <- err
 			return
 		}
@@ -361,109 +418,157 @@ func (e *Engine) auditFuncCallMessage(session *common.Session, msg *pgproto3.Fun
 		formatParameters(msg.Arguments, formatCodes)))
 }
 
+// auditUserPermissions calls OnPermissionsUpdate() with appropriate context.
+func (e *Engine) auditUserPermissions(session *common.Session, entries []events.DatabasePermissionEntry) {
+	e.Audit.OnPermissionsUpdate(e.Context, session, entries)
+}
+
+// auditResult process backend wire messages and emit result event on
+// appropriate messages.
+func (e *Engine) auditResult(session *common.Session, pgMsg pgproto3.BackendMessage) {
+	var res common.Result
+
+	switch m := pgMsg.(type) {
+	case *pgproto3.CommandComplete:
+		res.AffectedRecords = uint64(pgconn.CommandTag(m.CommandTag).RowsAffected())
+	case *pgproto3.ErrorResponse:
+		res.Error = common.ConvertError(pgconn.ErrorResponseToPgError(m))
+	default:
+		return
+	}
+
+	e.Audit.OnResult(e.Context, session, res)
+}
+
 // receiveFromServer receives messages from the provided frontend (which
 // is connected to the database instance) and relays them back to the psql
 // or other client via the provided backend.
-func (e *Engine) receiveFromServer(server *pgproto3.Frontend, client *pgproto3.Backend, serverConn *pgconn.PgConn, serverErrCh chan<- error, sessionCtx *common.Session) {
-	log := e.Log.WithField("from", "server")
-	defer log.Debug("Stop receiving from server.")
-	for {
-		message, err := server.Receive()
-		if err != nil {
-			if serverConn.IsClosed() {
-				log.Debug("Server connection closed.")
-				serverErrCh <- nil
+func (e *Engine) receiveFromServer(serverConn *pgconn.PgConn, serverErrCh chan<- error, sessionCtx *common.Session) {
+	log := e.Log.With("from", "server")
+	ctr := common.GetMessagesFromServerMetric(sessionCtx.Database)
+
+	// parse and count the messages from the server in a separate goroutine,
+	// operating on a copy of the server message stream. the copy is arranged below.
+	copyReader, copyWriter := io.Pipe()
+	closeChan := make(chan struct{})
+
+	go func() {
+		defer copyReader.Close()
+		defer close(closeChan)
+
+		// server will never be used to write to server,
+		// which is why we pass io.Discard instead of e.rawServerConn
+		server := pgproto3.NewFrontend(pgproto3.NewChunkReader(copyReader), io.Discard)
+
+		var count int64
+		defer func() {
+			log.DebugContext(e.Context, "Stopped parsing messages from server.", "parsed_total", count)
+		}()
+
+		for {
+			message, err := server.Receive()
+			if err != nil {
+				if serverConn.IsClosed() {
+					log.DebugContext(e.Context, "Server connection closed.")
+					return
+				}
+				log.ErrorContext(e.Context, "Failed to receive message from server.", "error", err)
 				return
 			}
-			log.WithError(err).Errorf("Failed to receive message from server.")
-			serverErrCh <- err
-			return
+
+			count += 1
+			ctr.Inc()
+			log.Log(e.Context, logutil.TraceLevel, "Received client message", "message", message)
+			e.auditResult(sessionCtx, message)
 		}
-		log.Debugf("Received server message: %#v.", message)
-		// This is where we would plug in custom logic for particular
-		// messages received from the Postgres server (i.e. emitting
-		// an audit event), but for now just pass them along back to
-		// the client.
-		err = client.Send(message)
-		if err != nil {
-			log.WithError(err).Error("Failed to send message to client.")
-			serverErrCh <- err
-			return
-		}
+	}()
+
+	// the messages are ultimately copied from e.rawServerConn to e.rawClientConn,
+	// but a copy of that message stream is written to a synchronous pipe,
+	// which is read by the analysis goroutine above.
+	total, err := io.Copy(e.rawClientConn, io.TeeReader(e.rawServerConn, copyWriter))
+	if err != nil && !trace.IsConnectionProblem(trace.ConvertSystemError(err)) {
+		log.WarnContext(e.Context, "Server -> Client copy finished with unexpected error.", "error", err)
 	}
+
+	// We need to close the writer half of the pipe to notify the analysis
+	// goroutine that the connection is done. This will result in the goroutine
+	// receiving an io.ErrClosedPipe error, which will cause it to finish its
+	// execution. After that, wait until the closeChan is closed to ensure the
+	// goroutine is completed, avoiding data races.
+	copyWriter.Close()
+	<-closeChan
+
+	serverErrCh <- trace.Wrap(err)
+	log.DebugContext(e.Context, "Stopped receiving from server.", "total_bytes", total)
 }
 
-// getConnectConfig returns config that can be used to connect to the
-// database instance.
-func (e *Engine) getConnectConfig(ctx context.Context, sessionCtx *common.Session) (*pgconn.Config, error) {
-	// The driver requires the config to be built by parsing the connection
-	// string so parse the basic template and then fill in the rest of
-	// parameters such as TLS configuration.
+func (e *Engine) newConnector(sessionCtx *common.Session) *connector {
+	conn := &connector{
+		auth:       e.Auth,
+		gcpClients: e.GCPClients,
+		log:        e.Log,
+
+		certExpiry:    sessionCtx.GetExpiry(),
+		database:      sessionCtx.Database,
+		databaseUser:  sessionCtx.DatabaseUser,
+		databaseName:  sessionCtx.DatabaseName,
+		startupParams: sessionCtx.StartupParameters,
+	}
+	return conn
+}
+
+// handleCancelRequest handles a cancel request and returns immediately (closing the connection).
+func (e *Engine) handleCancelRequest(ctx context.Context, sessionCtx *common.Session) error {
 	config, err := pgconn.ParseConfig(fmt.Sprintf("postgres://%s", sessionCtx.Database.GetURI()))
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
-	// TLS config will use client certificate for an onprem database or
-	// will contain RDS root certificate for RDS/Aurora.
-	config.TLSConfig, err = e.Auth.GetTLSConfig(ctx, sessionCtx)
+	tlsConfig, err := e.Auth.GetTLSConfig(ctx, sessionCtx.GetExpiry(), sessionCtx.Database, sessionCtx.DatabaseUser)
 	if err != nil {
+		return trace.Wrap(err)
+	}
+	// We can't use pgconn in this case because it always sends a
+	// startup message.
+	// Instead, use the pgconn config string parser for convenience and dial
+	// db host:port ourselves.
+	network, address := pgconn.NetworkAddress(config.Host, config.Port)
+	dialer := net.Dialer{Timeout: defaults.DefaultIOTimeout}
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return common.ConvertConnectError(err, sessionCtx)
+	}
+	tlsConn, err := startPGWireTLS(conn, tlsConfig)
+	if err != nil {
+		return common.ConvertConnectError(err, sessionCtx)
+	}
+	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(tlsConn), tlsConn)
+	if err = frontend.Send(e.cancelReq); err != nil {
+		return trace.Wrap(err)
+	}
+	response := make([]byte, 1)
+	if _, err := tlsConn.Read(response); !errors.Is(err, io.EOF) {
+		// server should close the connection after receiving cancel request.
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+// startPGWireTLS is a helper func that upgrades upstream connection to TLS.
+// copied from github.com/jackc/pgconn.startTLS.
+func startPGWireTLS(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
+	frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(conn), conn)
+	if err := frontend.Send(&pgproto3.SSLRequest{}); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	config.User = sessionCtx.DatabaseUser
-	config.Database = sessionCtx.DatabaseName
-	// Pgconn adds fallbacks to retry connection without TLS if the TLS
-	// attempt fails. Reset the fallbacks to avoid retries, otherwise
-	// it's impossible to debug TLS connection errors.
-	config.Fallbacks = nil
-	// Set startup parameters that the client sent us.
-	config.RuntimeParams = sessionCtx.StartupParameters
-	// AWS RDS/Aurora and GCP Cloud SQL use IAM authentication so request an
-	// auth token and use it as a password.
-	switch sessionCtx.Database.GetType() {
-	case types.DatabaseTypeRDS:
-		config.Password, err = e.Auth.GetRDSAuthToken(sessionCtx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	case types.DatabaseTypeRedshift:
-		config.User, config.Password, err = e.Auth.GetRedshiftAuthToken(sessionCtx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-	case types.DatabaseTypeCloudSQL:
-		config.Password, err = e.Auth.GetCloudSQLAuthToken(ctx, sessionCtx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		// Get the client once for subsequent calls (it acquires a read lock).
-		gcpClient, err := e.CloudClients.GetGCPSQLAdminClient(ctx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		// Detect whether the instance is set to require SSL.
-		// Fallback to not requiring SSL for access denied errors.
-		requireSSL, err := cloud.GetGCPRequireSSL(ctx, sessionCtx, gcpClient)
-		if err != nil && !trace.IsAccessDenied(err) {
-			return nil, trace.Wrap(err)
-		}
-		// Create ephemeral certificate and append to TLS config when
-		// the instance requires SSL.
-		if requireSSL {
-			err = cloud.AppendGCPClientCert(ctx, sessionCtx, gcpClient, config.TLSConfig)
-			if err != nil {
-				return nil, trace.Wrap(err)
-			}
-		}
-	case types.DatabaseTypeAzure:
-		config.Password, err = e.Auth.GetAzureAccessToken(ctx, sessionCtx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		// Azure requires database login to be <user>@<server-name> e.g.
-		// alice@postgres-server-name.
-		config.User = fmt.Sprintf("%v@%v", config.User, sessionCtx.Database.GetAzure().Name)
+	response := make([]byte, 1)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return config, nil
+	if response[0] != 'S' {
+		return nil, trace.Errorf("server refused TLS connection")
+	}
+	return tls.Client(conn, tlsConfig), nil
 }
 
 // formatParameters converts parameters from the Postgres wire message into
@@ -473,34 +578,45 @@ func formatParameters(parameters [][]byte, formatCodes []int16) (formatted []str
 	// by "parameter format codes" in the Bind message (0 - text, 1 - binary).
 	//
 	// Be a bit paranoid and make sure that number of format codes matches the
-	// number of parameters, or there are no format codes in which case all
-	// parameters will be text.
-	if len(formatCodes) != 0 && len(formatCodes) != len(parameters) {
-		logrus.Warnf("Postgres parameter format codes and parameters don't match: %#v %#v.",
-			parameters, formatCodes)
+	// number of parameters, or there are zero or one format codes.
+	// zero format codes applies text format to all params.
+	// one format code applies the same format code to all params.
+	// https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-BIND
+	// https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-FUNCTIONCALL
+	if len(formatCodes) > 1 && len(formatCodes) != len(parameters) {
+		slog.WarnContext(context.Background(), "Postgres parameter format codes and parameters don't match",
+			"parameters", parameters,
+			"format_codes", formatCodes,
+		)
 		return formatted
 	}
 	for i, p := range parameters {
 		// According to Bind message documentation, if there are no parameter
 		// format codes, it may mean that either there are no parameters, or
 		// that all parameters use default text format.
-		if len(formatCodes) == 0 {
-			formatted = append(formatted, string(p))
-			continue
+		var formatCode int16
+		switch len(formatCodes) {
+		case 0:
+			// use default 0 (text) format for all params.
+		case 1:
+			// apply the same format code to all params.
+			formatCode = formatCodes[0]
+		default:
+			// apply format code corresponding to this param.
+			formatCode = formatCodes[i]
 		}
-		switch formatCodes[i] {
+
+		switch formatCode {
 		case parameterFormatCodeText:
 			// Text parameters can just be converted to their string
 			// representation.
 			formatted = append(formatted, string(p))
 		case parameterFormatCodeBinary:
-			// For binary parameters, just put a placeholder to avoid
-			// spamming the audit log with unreadable info.
-			formatted = append(formatted, "<binary>")
+			// For binary parameters, encode the parameter as a base64 string.
+			formatted = append(formatted, base64.StdEncoding.EncodeToString(p))
 		default:
 			// Should never happen but...
-			logrus.Warnf("Unknown Postgres parameter format code: %#v.",
-				formatCodes[i])
+			slog.WarnContext(context.Background(), "Unknown Postgres parameter format code", "format_code", formatCode)
 			formatted = append(formatted, "<unknown>")
 		}
 	}

@@ -1,36 +1,50 @@
-// S3 bucket is used to distribute letsencrypt certificates
+// S3 bucket is used to distribute Let's Encrypt certificates
+// For demo purposes, don't need bucket logging
+// tfsec:ignore:aws-s3-enable-bucket-logging
 resource "aws_s3_bucket" "certs" {
   bucket        = var.s3_bucket_name
-  acl           = "private"
   force_destroy = true
-  server_side_encryption_configuration {
-    rule {
-      apply_server_side_encryption_by_default {
-        sse_algorithm = "AES256"
-      }
+}
+
+resource "aws_s3_bucket_acl" "certs" {
+  depends_on = [aws_s3_bucket_ownership_controls.certs]
+  bucket     = aws_s3_bucket.certs.bucket
+  acl        = "private"
+}
+
+// For demo purposes, CMK is not needed
+// tfsec:ignore:aws-s3-encryption-customer-key
+resource "aws_s3_bucket_server_side_encryption_configuration" "certs" {
+  bucket = aws_s3_bucket.certs.bucket
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
     }
   }
 }
 
-resource "aws_s3_bucket_object" "grafana_teleport_dashboard" {
-  bucket = aws_s3_bucket.certs.bucket
-  key    = "health-dashboard.json"
-  source = "./assets/health-dashboard.json"
+resource "aws_s3_bucket_ownership_controls" "certs" {
+  bucket = aws_s3_bucket.certs.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
 }
 
-// Grafana nginx config (letsencrypt)
-resource "aws_s3_bucket_object" "grafana_teleport_nginx" {
+resource "aws_s3_bucket_versioning" "certs" {
   bucket = aws_s3_bucket.certs.bucket
-  key    = "grafana-nginx.conf"
-  source = "./assets/grafana-nginx.conf"
-  count  = var.use_acm ? 0 : 1
+
+  versioning_configuration {
+    status = "Enabled"
+  }
 }
 
-// Grafana nginx config (ACM)
-resource "aws_s3_bucket_object" "grafana_teleport_nginx_acm" {
+resource "aws_s3_bucket_public_access_block" "certs" {
   bucket = aws_s3_bucket.certs.bucket
-  key    = "grafana-nginx.conf"
-  source = "./assets/grafana-nginx-acm.conf"
-  count  = var.use_acm ? 1 : 0
-}
 
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}

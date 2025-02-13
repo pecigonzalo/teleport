@@ -17,12 +17,13 @@ limitations under the License.
 package types
 
 import (
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/gravitational/teleport/api/utils"
-
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/utils"
 )
 
 // SessionRecordingConfig defines session recording configuration. This is
@@ -41,10 +42,13 @@ type SessionRecordingConfig interface {
 
 	// SetProxyChecksHostKeys sets if the proxy will check host keys.
 	SetProxyChecksHostKeys(bool)
+
+	// Clone returns a copy of the resource.
+	Clone() SessionRecordingConfig
 }
 
 // NewSessionRecordingConfigFromConfigFile is a convenience method to create
-// SessionRecordingConfigV2 labelled as originating from config file.
+// SessionRecordingConfigV2 labeled as originating from config file.
 func NewSessionRecordingConfigFromConfigFile(spec SessionRecordingConfigSpecV2) (SessionRecordingConfig, error) {
 	return newSessionRecordingConfigWithLabels(spec, map[string]string{
 		OriginLabel: OriginConfigFile,
@@ -104,14 +108,14 @@ func (c *SessionRecordingConfigV2) GetMetadata() Metadata {
 	return c.Metadata
 }
 
-// GetResourceID returns resource ID.
-func (c *SessionRecordingConfigV2) GetResourceID() int64 {
-	return c.Metadata.ID
+// GetRevision returns the revision
+func (c *SessionRecordingConfigV2) GetRevision() string {
+	return c.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID.
-func (c *SessionRecordingConfigV2) SetResourceID(id int64) {
-	c.Metadata.ID = id
+// SetRevision sets the revision
+func (c *SessionRecordingConfigV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // Origin returns the origin value of the resource.
@@ -159,6 +163,11 @@ func (c *SessionRecordingConfigV2) SetProxyChecksHostKeys(t bool) {
 	c.Spec.ProxyChecksHostKeys = NewBoolOption(t)
 }
 
+// Clone returns a copy of the resource.
+func (c *SessionRecordingConfigV2) Clone() SessionRecordingConfig {
+	return utils.CloneProtoMsg(c)
+}
+
 // setStaticFields sets static resource header and metadata fields.
 func (c *SessionRecordingConfigV2) setStaticFields() {
 	c.Kind = KindSessionRecordingConfig
@@ -186,7 +195,7 @@ func (c *SessionRecordingConfigV2) CheckAndSetDefaults() error {
 	}
 
 	// Check that the session recording mode is set to a valid value.
-	if !utils.SliceContainsStr(SessionRecordingModes, c.Spec.Mode) {
+	if !slices.Contains(SessionRecordingModes, c.Spec.Mode) {
 		return trace.BadParameter("session recording mode must be one of %v; got %q", strings.Join(SessionRecordingModes, ","), c.Spec.Mode)
 	}
 

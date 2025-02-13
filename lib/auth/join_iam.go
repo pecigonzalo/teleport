@@ -1,18 +1,20 @@
 /*
-Copyright 2021-2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -20,25 +22,23 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"regexp"
-	"strings"
+	"slices"
 
+	"github.com/coreos/go-semver/semver"
+	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
+	workloadidentityv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/workloadidentity/v1"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/lib/auth/join/iam"
+	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/aws"
-
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/gravitational/trace"
 )
 
 const (
@@ -47,19 +47,47 @@ const (
 	// update our AWS SDK dependency. Since Auth should always be upgraded
 	// before nodes, we will have a chance to update the check on Auth if we
 	// ever have a need to allow a newer API version.
-	expectedStsIdentityRequestBody = "Action=GetCallerIdentity&Version=2011-06-15"
-
-	// Only allowing the global sts endpoint here, Teleport nodes will only send
-	// requests for this endpoint. If we want to start using regional endpoints
-	// we can update this check before updating the nodes.
-	stsHost = "sts.amazonaws.com"
+	expectedSTSIdentityRequestBody = "Action=GetCallerIdentity&Version=2011-06-15"
 
 	// AWS SignedHeaders will always be lowercase
 	// https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-auth-using-authorization-header.html#sigv4-auth-header-overview
 	challengeHeaderKey = "x-teleport-challenge"
 )
 
-// validateStsIdentityRequest checks that a received sts:GetCallerIdentity
+// validateSTSHost returns an error if the given stsHost is not a valid regional
+// endpoint for the AWS STS service, or nil if it is valid. If fips is true, the
+// endpoint must be a valid FIPS endpoint.
+//
+// This is a security-critical check: we are allowing the client to tell us
+// which URL we should use to validate their identity. If the client could pass
+// off an attacker-controlled URL as the STS endpoint, the entire security
+// mechanism of the IAM join method would be compromised.
+//
+// To keep this validation simple and secure, we check the given endpoint
+// against a static list of known valid endpoints. We will need to update this
+// list as AWS adds new regions.
+func validateSTSHost(stsHost string, cfg *iamRegisterConfig) error {
+	valid := slices.Contains(iam.ValidSTSEndpoints(), stsHost)
+	if !valid {
+		return trace.AccessDenied("IAM join request uses unknown STS host %q. "+
+			"This could mean that the Teleport Node attempting to join the cluster is "+
+			"running in a new AWS region which is unknown to this Teleport auth server. "+
+			"Alternatively, if this URL looks suspicious, an attacker may be attempting to "+
+			"join your Teleport cluster. "+
+			"Following is the list of valid STS endpoints known to this auth server. "+
+			"If a legitimate STS endpoint is not included, please file an issue at "+
+			"https://github.com/gravitational/teleport. %v",
+			stsHost, iam.ValidSTSEndpoints())
+	}
+
+	if cfg.fips && !slices.Contains(iam.FIPSSTSEndpoints(), stsHost) {
+		return trace.AccessDenied("node selected non-FIPS STS endpoint (%s) for the IAM join method", stsHost)
+	}
+
+	return nil
+}
+
+// validateSTSIdentityRequest checks that a received sts:GetCallerIdentity
 // request is valid and includes the challenge as a signed header. An example
 // valid request looks like:
 // ```
@@ -76,9 +104,18 @@ const (
 //
 // Action=GetCallerIdentity&Version=2011-06-15
 // ```
-func validateStsIdentityRequest(req *http.Request, challenge string) error {
-	if req.Host != stsHost {
-		return trace.AccessDenied("sts identity request is for unknown host %q", req.Host)
+func validateSTSIdentityRequest(req *http.Request, challenge string, cfg *iamRegisterConfig) (err error) {
+	defer func() {
+		// Always log a warning on the Auth server if the function detects an
+		// invalid sts:GetCallerIdentity request, it's either going to be caused
+		// by a node in a unknown region or an attacker.
+		if err != nil {
+			logger.WarnContext(req.Context(), "Detected an invalid sts:GetCallerIdentity used by a client attempting to use the IAM join method", "error", err)
+		}
+	}()
+
+	if err := validateSTSHost(req.Host, cfg); err != nil {
+		return trace.Wrap(err)
 	}
 
 	if req.Method != http.MethodPost {
@@ -95,17 +132,17 @@ func validateStsIdentityRequest(req *http.Request, challenge string) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if !utils.SliceContainsStr(sigV4.SignedHeaders, challengeHeaderKey) {
+	if !slices.Contains(sigV4.SignedHeaders, challengeHeaderKey) {
 		return trace.AccessDenied("sts identity request auth header %q does not include "+
 			challengeHeaderKey+" as a signed header", authHeader)
 	}
 
-	body, err := aws.GetAndReplaceReqBody(req)
+	body, err := utils.GetAndReplaceRequestBody(req)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if !bytes.Equal([]byte(expectedStsIdentityRequestBody), body) {
-		return trace.BadParameter("sts request body %q does not equal expected %q", string(body), expectedStsIdentityRequestBody)
+	if !bytes.Equal([]byte(expectedSTSIdentityRequestBody), body) {
+		return trace.BadParameter("sts request body %q does not equal expected %q", string(body), expectedSTSIdentityRequestBody)
 	}
 
 	return nil
@@ -125,7 +162,7 @@ func parseSTSRequest(req []byte) (*http.Request, error) {
 	httpReq.RequestURI = ""
 	httpReq.URL = &url.URL{
 		Scheme: "https",
-		Host:   stsHost,
+		Host:   httpReq.Host,
 	}
 	return httpReq, nil
 }
@@ -134,6 +171,18 @@ func parseSTSRequest(req []byte) (*http.Request, error) {
 type awsIdentity struct {
 	Account string `json:"Account"`
 	Arn     string `json:"Arn"`
+}
+
+// JoinAttrs returns the protobuf representation of the attested identity.
+// This is used for auditing and for evaluation of WorkloadIdentity rules and
+// templating.
+func (c *awsIdentity) JoinAttrs() *workloadidentityv1pb.JoinAttrsAWSIAM {
+	attrs := &workloadidentityv1pb.JoinAttrsAWSIAM{
+		Account: c.Account,
+		Arn:     c.Arn,
+	}
+
+	return attrs
 }
 
 // getCallerIdentityReponse is used for JSON parsing
@@ -146,27 +195,14 @@ type stsIdentityResponse struct {
 	GetCallerIdentityResponse getCallerIdentityResponse `json:"GetCallerIdentityResponse"`
 }
 
-type stsClient interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-type stsClientKey struct{}
-
-// stsClientFromContext allows the default http client to be overridden for tests
-func stsClientFromContext(ctx context.Context) stsClient {
-	client, ok := ctx.Value(stsClientKey{}).(stsClient)
-	if ok {
-		return client
-	}
-	return http.DefaultClient
-}
-
-// executeStsIdentityRequest sends the sts:GetCallerIdentity HTTP request to the
+// executeSTSIdentityRequest sends the sts:GetCallerIdentity HTTP request to the
 // AWS API, parses the response, and returns the awsIdentity
-func executeStsIdentityRequest(ctx context.Context, req *http.Request) (*awsIdentity, error) {
-	client := stsClientFromContext(ctx)
+func executeSTSIdentityRequest(ctx context.Context, client utils.HTTPDoClient, req *http.Request) (*awsIdentity, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
 
-	// set the http request context so it can be cancelled
+	// set the http request context so it can be canceled
 	req = req.WithContext(ctx)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -174,7 +210,7 @@ func executeStsIdentityRequest(ctx context.Context, req *http.Request) (*awsIden
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := utils.ReadAtMost(resp.Body, teleport.MaxHTTPResponseSize)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -204,17 +240,12 @@ func executeStsIdentityRequest(ctx context.Context, req *http.Request) (*awsIden
 // of zero or more characters and "?" to match any single character.
 // See https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_resource.html
 func arnMatches(pattern, arn string) (bool, error) {
-	pattern = regexp.QuoteMeta(pattern)
-	pattern = strings.ReplaceAll(pattern, `\*`, ".*")
-	pattern = strings.ReplaceAll(pattern, `\?`, ".")
-	pattern = "^" + pattern + "$"
-	matched, err := regexp.MatchString(pattern, arn)
-	return matched, trace.Wrap(err)
+	return globMatch(pattern, arn)
 }
 
 // checkIAMAllowRules checks if the given identity matches any of the given
 // allowRules.
-func checkIAMAllowRules(identity *awsIdentity, allowRules []*types.TokenRule) error {
+func checkIAMAllowRules(identity *awsIdentity, token string, allowRules []*types.TokenRule) error {
 	for _, rule := range allowRules {
 		// if this rule specifies an AWS account, the identity must match
 		if len(rule.AWSAccount) > 0 {
@@ -237,57 +268,158 @@ func checkIAMAllowRules(identity *awsIdentity, allowRules []*types.TokenRule) er
 		// node identity matches this allow rule
 		return nil
 	}
-	return trace.AccessDenied("instance did not match any allow rules")
+	return trace.AccessDenied("instance %v did not match any allow rules in token %v", identity.Arn, token)
 }
 
 // checkIAMRequest checks if the given request satisfies the token rules and
 // included the required challenge.
-func (a *Server) checkIAMRequest(ctx context.Context, challenge string, req *proto.RegisterUsingIAMMethodRequest) error {
+//
+// If the joining entity presents a valid IAM identity, this will be returned,
+// even if the identity does not match the token's allow rules. This is to
+// support inclusion in audit logs.
+func (a *Server) checkIAMRequest(ctx context.Context, challenge string, req *proto.RegisterUsingIAMMethodRequest, cfg *iamRegisterConfig) (*awsIdentity, error) {
 	tokenName := req.RegisterUsingTokenRequest.Token
 	provisionToken, err := a.GetToken(ctx, tokenName)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err, "getting token")
 	}
 	if provisionToken.GetJoinMethod() != types.JoinMethodIAM {
-		return trace.AccessDenied("this token does not support the IAM join method")
+		return nil, trace.AccessDenied("this token does not support the IAM join method")
 	}
 
 	// parse the incoming http request to the sts:GetCallerIdentity endpoint
 	identityRequest, err := parseSTSRequest(req.StsIdentityRequest)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err, "parsing STS request")
 	}
 
 	// validate that the host, method, and headers are correct and the expected
 	// challenge is included in the signed portion of the request
-	if err := validateStsIdentityRequest(identityRequest, challenge); err != nil {
-		return trace.Wrap(err)
+	if err := validateSTSIdentityRequest(identityRequest, challenge, cfg); err != nil {
+		return nil, trace.Wrap(err, "validating STS request")
 	}
 
 	// send the signed request to the public AWS API and get the node identity
 	// from the response
-	identity, err := executeStsIdentityRequest(ctx, identityRequest)
+	identity, err := executeSTSIdentityRequest(ctx, a.httpClientForAWSSTS, identityRequest)
 	if err != nil {
-		return trace.Wrap(err)
+		return nil, trace.Wrap(err, "executing STS request")
 	}
 
 	// check that the node identity matches an allow rule for this token
-	if err := checkIAMAllowRules(identity, provisionToken.GetAllowRules()); err != nil {
-		return trace.Wrap(err)
+	if err := checkIAMAllowRules(identity, provisionToken.GetName(), provisionToken.GetAllowRules()); err != nil {
+		// We return the identity since it's "validated" but does not match the
+		// rules. This allows us to include it in a failed join audit event
+		// as additional context to help the user understand why the join failed.
+		return identity, trace.Wrap(err, "checking allow rules")
 	}
 
-	return nil
+	return identity, nil
 }
 
-func generateChallenge() (string, error) {
-	// read 32 crypto-random bytes to generate the challenge
-	challengeRawBytes := make([]byte, 32)
-	if _, err := rand.Read(challengeRawBytes); err != nil {
-		return "", trace.Wrap(err)
+func generateIAMChallenge() (string, error) {
+	challenge, err := generateChallenge(base64.RawStdEncoding, 32)
+	return challenge, trace.Wrap(err)
+}
+
+type iamRegisterConfig struct {
+	authVersion *semver.Version
+	fips        bool
+}
+
+func defaultIAMRegisterConfig(fips bool) *iamRegisterConfig {
+	return &iamRegisterConfig{
+		authVersion: teleport.SemVersion,
+		fips:        fips,
+	}
+}
+
+type iamRegisterOption func(cfg *iamRegisterConfig)
+
+func withAuthVersion(v *semver.Version) iamRegisterOption {
+	return func(cfg *iamRegisterConfig) {
+		cfg.authVersion = v
+	}
+}
+
+func withFips(fips bool) iamRegisterOption {
+	return func(cfg *iamRegisterConfig) {
+		cfg.fips = fips
+	}
+}
+
+// RegisterUsingIAMMethodWithOpts registers the caller using the IAM join method and
+// returns signed certs to join the cluster.
+//
+// The caller must provide a ChallengeResponseFunc which returns a
+// *types.RegisterUsingTokenRequest with a signed sts:GetCallerIdentity request
+// including the challenge as a signed header.
+func (a *Server) RegisterUsingIAMMethodWithOpts(
+	ctx context.Context,
+	challengeResponse client.RegisterIAMChallengeResponseFunc,
+	opts ...iamRegisterOption,
+) (certs *proto.Certs, err error) {
+	var provisionToken types.ProvisionToken
+	var joinRequest *types.RegisterUsingTokenRequest
+	var joinFailureMetadata any
+	defer func() {
+		// Emit a log message and audit event on join failure.
+		if err != nil {
+			a.handleJoinFailure(
+				ctx, err, provisionToken, joinFailureMetadata, joinRequest,
+			)
+		}
+	}()
+
+	cfg := defaultIAMRegisterConfig(a.fips)
+	for _, opt := range opts {
+		opt(cfg)
 	}
 
-	// encode the challenge to base64 so it can be sent in an HTTP header
-	return base64.RawStdEncoding.EncodeToString(challengeRawBytes), nil
+	challenge, err := generateIAMChallenge()
+	if err != nil {
+		return nil, trace.Wrap(err, "generating IAM challenge")
+	}
+
+	req, err := challengeResponse(challenge)
+	if err != nil {
+		return nil, trace.Wrap(err, "getting challenge response")
+	}
+	joinRequest = req.RegisterUsingTokenRequest
+
+	if err := req.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err, "validating request parameters")
+	}
+
+	// perform common token checks
+	provisionToken, err = a.checkTokenJoinRequestCommon(ctx, req.RegisterUsingTokenRequest)
+	if err != nil {
+		return nil, trace.Wrap(err, "completing common token checks")
+	}
+
+	// check that the GetCallerIdentity request is valid and matches the token
+	verifiedIdentity, err := a.checkIAMRequest(ctx, challenge, req, cfg)
+	if verifiedIdentity != nil {
+		joinFailureMetadata = verifiedIdentity
+	}
+	if err != nil {
+		return nil, trace.Wrap(err, "checking iam request")
+	}
+
+	if req.RegisterUsingTokenRequest.Role == types.RoleBot {
+		certs, err := a.generateCertsBot(
+			ctx,
+			provisionToken,
+			req.RegisterUsingTokenRequest,
+			verifiedIdentity,
+			&workloadidentityv1pb.JoinAttrs{
+				Iam: verifiedIdentity.JoinAttrs(),
+			},
+		)
+		return certs, trace.Wrap(err, "generating bot certs")
+	}
+	certs, err = a.generateCerts(ctx, provisionToken, req.RegisterUsingTokenRequest, verifiedIdentity)
+	return certs, trace.Wrap(err, "generating certs")
 }
 
 // RegisterUsingIAMMethod registers the caller using the IAM join method and
@@ -296,67 +428,9 @@ func generateChallenge() (string, error) {
 // The caller must provide a ChallengeResponseFunc which returns a
 // *types.RegisterUsingTokenRequest with a signed sts:GetCallerIdentity request
 // including the challenge as a signed header.
-func (a *Server) RegisterUsingIAMMethod(ctx context.Context, challengeResponse client.RegisterChallengeResponseFunc) (*proto.Certs, error) {
-	clientAddr, ok := ctx.Value(ContextClientAddr).(net.Addr)
-	if !ok {
-		return nil, trace.BadParameter("logic error: client address was not set")
-	}
-
-	challenge, err := generateChallenge()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	req, err := challengeResponse(challenge)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// fill in the client remote addr to the register request
-	req.RegisterUsingTokenRequest.RemoteAddr = clientAddr.String()
-	if err := req.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// perform common token checks
-	provisionToken, err := a.checkTokenJoinRequestCommon(ctx, req.RegisterUsingTokenRequest)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// check that the GetCallerIdentity request is valid and matches the token
-	if err := a.checkIAMRequest(ctx, challenge, req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	certs, err := a.generateCerts(ctx, provisionToken, req.RegisterUsingTokenRequest)
-	return certs, trace.Wrap(err)
-}
-
-// createSignedStsIdentityRequest is called on the client side and returns an
-// sts:GetCallerIdentity request signed with the local AWS credentials
-func createSignedStsIdentityRequest(challenge string) ([]byte, error) {
-	// use the aws sdk to generate the request
-	sess, err := session.NewSessionWithOptions(session.Options{
-		SharedConfigState: session.SharedConfigEnable,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	stsService := sts.New(sess)
-	req, _ := stsService.GetCallerIdentityRequest(&sts.GetCallerIdentityInput{})
-	// set challenge header
-	req.HTTPRequest.Header.Set(challengeHeaderKey, challenge)
-	// request json for simpler parsing
-	req.HTTPRequest.Header.Set("Accept", "application/json")
-	// sign the request, including headers
-	if err := req.Sign(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	// write the signed HTTP request to a buffer
-	var signedRequest bytes.Buffer
-	if err := req.HTTPRequest.Write(&signedRequest); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return signedRequest.Bytes(), nil
+func (a *Server) RegisterUsingIAMMethod(
+	ctx context.Context,
+	challengeResponse client.RegisterIAMChallengeResponseFunc,
+) (certs *proto.Certs, err error) {
+	return a.RegisterUsingIAMMethodWithOpts(ctx, challengeResponse)
 }

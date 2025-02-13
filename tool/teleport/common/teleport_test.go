@@ -1,35 +1,40 @@
 /*
-Copyright 2016-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/config"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
-
-	log "github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/require"
-
-	"github.com/gravitational/trace"
 )
 
 func TestMain(m *testing.M) {
@@ -79,8 +84,7 @@ func TestTeleportMain(t *testing.T) {
 		require.True(t, conf.Auth.Enabled)
 		require.True(t, conf.SSH.Enabled)
 		require.True(t, conf.Proxy.Enabled)
-		require.Equal(t, os.Stdout, conf.Console)
-		require.Equal(t, log.ErrorLevel, log.GetLevel())
+		require.True(t, slog.Default().Handler().Enabled(context.Background(), slog.LevelError))
 	})
 
 	t.Run("RolesFlag", func(t *testing.T) {
@@ -121,9 +125,12 @@ func TestTeleportMain(t *testing.T) {
 		require.True(t, conf.SSH.Enabled)
 		require.False(t, conf.Auth.Enabled)
 		require.False(t, conf.Proxy.Enabled)
-		require.Equal(t, log.DebugLevel, conf.Log.GetLevel())
+		require.True(t, slog.Default().Handler().Enabled(context.Background(), slog.LevelDebug))
 		require.Equal(t, "hvostongo.example.org", conf.Hostname)
-		require.Equal(t, "xxxyyy", conf.Token)
+
+		token, err := conf.Token()
+		require.NoError(t, err)
+		require.Equal(t, "xxxyyy", token)
 		require.Equal(t, "10.5.5.5", conf.AdvertiseIP)
 		require.Equal(t, map[string]string{"a": "a1", "b": "b1"}, conf.SSH.Labels)
 	})
@@ -134,11 +141,24 @@ func TestTeleportMain(t *testing.T) {
 			InitOnly: true,
 		})
 		require.Equal(t, "start", cmd)
-		require.Equal(t, len(bootstrapEntries), len(conf.Auth.Resources))
+		require.Equal(t, len(bootstrapEntries), len(conf.Auth.BootstrapResources))
 		for i, entry := range bootstrapEntries {
-			require.Equal(t, entry.kind, conf.Auth.Resources[i].GetKind(), entry.fileName)
-			require.Equal(t, entry.name, conf.Auth.Resources[i].GetName(), entry.fileName)
-			require.NoError(t, conf.Auth.Resources[i].CheckAndSetDefaults(), entry.fileName)
+			require.Equal(t, entry.kind, conf.Auth.BootstrapResources[i].GetKind(), entry.fileName)
+			require.Equal(t, entry.name, conf.Auth.BootstrapResources[i].GetName(), entry.fileName)
+			require.NoError(t, services.CheckAndSetDefaults(conf.Auth.BootstrapResources[i]), entry.fileName)
+		}
+	})
+	t.Run("ApplyOnStartup", func(t *testing.T) {
+		_, cmd, conf := Run(Options{
+			Args:     []string{"start", "--apply-on-startup", bootstrapFile},
+			InitOnly: true,
+		})
+		require.Equal(t, "start", cmd)
+		require.Equal(t, len(bootstrapEntries), len(conf.Auth.ApplyOnStartupResources))
+		for i, entry := range bootstrapEntries {
+			require.Equal(t, entry.kind, conf.Auth.ApplyOnStartupResources[i].GetKind(), entry.fileName)
+			require.Equal(t, entry.name, conf.Auth.ApplyOnStartupResources[i].GetName(), entry.fileName)
+			require.NoError(t, services.CheckAndSetDefaults(conf.Auth.ApplyOnStartupResources[i]), entry.fileName)
 		}
 	})
 }
@@ -171,14 +191,56 @@ func TestConfigure(t *testing.T) {
 		err := flags.CheckAndSetDefaults()
 		require.NoError(t, err)
 	})
+
+	t.Run("Suppress output", func(t *testing.T) {
+		tempDir := t.TempDir()
+		var stdout bytes.Buffer
+		err := onConfigDump(dumpFlags{
+			SampleFlags: config.SampleFlags{
+				Silent: true,
+			},
+			output: filepath.Join(tempDir, "teleport.yaml"),
+			stdout: &stdout,
+		})
+		require.NoError(t, err)
+		require.Empty(t, stdout.Bytes())
+	})
+}
+
+func TestDumpConfigFile(t *testing.T) {
+	tt := []struct {
+		name      string
+		outputURI string
+		contents  string
+		comment   string
+		assert    require.ErrorAssertionFunc
+	}{
+		{
+			name:      "errors on relative path",
+			assert:    require.Error,
+			outputURI: "../",
+		},
+		{
+			name:      "doesn't error on unexisting config path",
+			assert:    require.NoError,
+			outputURI: fmt.Sprintf("%s/unexisting/dir/%s", t.TempDir(), "config.yaml"),
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := dumpConfigFile(tc.outputURI, tc.contents, tc.comment)
+			tc.assert(t, err)
+		})
+	}
 }
 
 const configData = `
+version: v3
 teleport:
   advertise_ip: 10.5.5.5
   nodename: hvostongo.example.org
-  auth_servers:
-    - auth.server.example.org:3024
+  auth_server: auth.server.example.org:3024
   auth_token: xxxyyy
   log:
     output: stderr

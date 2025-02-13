@@ -101,14 +101,14 @@ func (r *PluginDataV3) GetMetadata() Metadata {
 	return r.Metadata
 }
 
-// GetResourceID returns resource ID
-func (r *PluginDataV3) GetResourceID() int64 {
-	return r.Metadata.GetID()
+// GetRevision returns the revision
+func (r *PluginDataV3) GetRevision() string {
+	return r.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (r *PluginDataV3) SetResourceID(id int64) {
-	r.Metadata.SetID(id)
+// SetRevision sets the revision
+func (r *PluginDataV3) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
 }
 
 func (r *PluginDataV3) String() string {

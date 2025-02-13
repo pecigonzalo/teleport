@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package x11
 
@@ -148,26 +152,46 @@ func (x *XAuthCommand) GenerateUntrustedCookie(display Display, timeout time.Dur
 	return trace.Wrap(x.run())
 }
 
-// run Run and wrap error with stderr.
+// run the command and return stderr if there is an error.
 func (x *XAuthCommand) run() error {
-	err := x.Cmd.Run()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return trace.Wrap(err, "stderr: %q", exitErr.Stderr)
-		}
-	}
+	_, err := x.output()
 	return trace.Wrap(err)
 }
 
-// run Output and wrap error with stderr.
+// run the command and return stdout or stderr if there is an error.
 func (x *XAuthCommand) output() ([]byte, error) {
-	out, err := x.Cmd.Output()
+	stdout, err := x.Cmd.StdoutPipe()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, trace.Wrap(err, "stderr: %q", exitErr.Stderr)
-		}
+		return nil, trace.Wrap(err)
 	}
-	return out, trace.Wrap(err)
+
+	stderr, err := x.Cmd.StderrPipe()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := x.Cmd.Start(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	// We add a conservative peak length of 10 KB to prevent potential
+	// output spam from the client provided `xauth` binary
+	var peakLength int64 = 10000
+	out, err := io.ReadAll(io.LimitReader(stdout, peakLength))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	errOut, err := io.ReadAll(io.LimitReader(stderr, peakLength))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if err := x.Wait(); err != nil {
+		return nil, trace.Wrap(err, "command \"%s\" failed with stderr: \"%s\"", strings.Join(x.Cmd.Args, " "), errOut)
+	}
+
+	return out, nil
 }
 
 // CheckXAuthPath checks if xauth is runnable in the current environment.
@@ -242,7 +266,7 @@ func readXauthPacketInitBuf(initBuf []byte) (protoLen int, dataLen int, err erro
 	// The first byte in the packet determines the
 	// byte order of the initial buffer's bytes.
 	var e binary.ByteOrder
-	binary.BigEndian.GoString()
+
 	switch initBuf[0] {
 	case bigEndian:
 		e = binary.BigEndian

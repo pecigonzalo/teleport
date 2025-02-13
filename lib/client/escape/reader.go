@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package escape implements client-side escape character logic.
 // This logic mimics OpenSSH: https://man.openbsd.org/ssh#ESCAPE_CHARACTERS.
@@ -62,11 +64,11 @@ type Reader struct {
 // NewReader creates a new Reader to catch escape sequences from 'in'.
 //
 // Two sequences are supported:
-// - "~?": prints help text to 'out' listing supported sequences
-// - "~.": disconnect stops any future reads from in; after this sequence,
-//   callers can still read any unread data up to this sequence from Reader but
-//   all future Read calls will return ErrDisconnect; onDisconnect will also be
-//   called with ErrDisconnect immediately
+//   - "~?": prints help text to 'out' listing supported sequences
+//   - "~.": disconnect stops any future reads from in; after this sequence,
+//     callers can still read any unread data up to this sequence from Reader but
+//     all future Read calls will return ErrDisconnect; onDisconnect will also be
+//     called with ErrDisconnect immediately
 //
 // NewReader starts consuming 'in' immediately in the background. This allows
 // Reader to detect sequences without the caller actively calling Read (such as
@@ -209,7 +211,7 @@ func (r *Reader) setErr(err error) {
 	r.err = err
 	r.cond.Broadcast()
 	// Skip EOF, it's a normal clean exit.
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		r.onDisconnect(err)
 	}
 	r.cond.L.Unlock()

@@ -2,20 +2,22 @@
 // +build pam,cgo
 
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package pam
 
@@ -45,6 +47,7 @@ import "C"
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -54,10 +57,11 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/gravitational/teleport"
 	"github.com/gravitational/trace"
 
-	"github.com/sirupsen/logrus"
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 func init() {
@@ -98,9 +102,7 @@ func init() {
 	runtime.LockOSThread()
 }
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentPAM,
-})
+var logger = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentPAM)
 
 const (
 	// maxMessageSize is the maximum size of a message to accept from PAM. In
@@ -145,7 +147,7 @@ var handlers map[int]handler = make(map[int]handler)
 func writeCallback(index C.int, stream C.int, s *C.char) {
 	handle, err := lookupHandler(int(index))
 	if err != nil {
-		log.Errorf("Unable to write to output stream: %v", err)
+		logger.ErrorContext(context.Background(), "Unable to write to output stream", "error", err)
 		return
 	}
 
@@ -161,7 +163,7 @@ func writeCallback(index C.int, stream C.int, s *C.char) {
 func readCallback(index C.int, e C.int) *C.char {
 	handle, err := lookupHandler(int(index))
 	if err != nil {
-		log.Errorf("Unable to read from input stream: %v", err)
+		logger.ErrorContext(context.Background(), "Unable to read from input stream", "error", err)
 		return nil
 	}
 
@@ -173,7 +175,7 @@ func readCallback(index C.int, e C.int) *C.char {
 	// Read from the stream (typically stdin or equivalent).
 	s, err := handle.readStream(echo)
 	if err != nil {
-		log.Errorf("Unable to read from input stream: %v", err)
+		logger.ErrorContext(context.Background(), "Unable to read from input stream", "error", err)
 		return nil
 	}
 
@@ -286,7 +288,7 @@ type PAM struct {
 
 // Open creates a PAM context and initiates a PAM transaction to check the
 // account and then opens a session.
-func Open(config *Config) (*PAM, error) {
+func Open(config *servicecfg.PAMConfig) (*PAM, error) {
 	if config == nil {
 		return nil, trace.BadParameter("PAM configuration is required.")
 	}
@@ -402,9 +404,9 @@ func (p *PAM) Close() error {
 // variables and it is the responsibility of the caller to free that memory.
 // From http://man7.org/linux/man-pages/man3/pam_getenvlist.3.html:
 //
-//   It should be noted that this memory will never be free()'d by libpam.
-//   Once obtained by a call to pam_getenvlist, it is the responsibility
-//   of the calling application to free() this memory.
+//	It should be noted that this memory will never be free()'d by libpam.
+//	Once obtained by a call to pam_getenvlist, it is the responsibility
+//	of the calling application to free() this memory.
 func (p *PAM) Environment() []string {
 	// Get list of additional environment variables requested from PAM.
 	pam_envlist := C._pam_getenvlist(pamHandle, p.pamh)
@@ -435,7 +437,7 @@ func (p *PAM) free() {
 		// Terminate the PAM transaction.
 		retval := C._pam_end(pamHandle, p.pamh, p.retval)
 		if retval != C.PAM_SUCCESS {
-			log.Warnf("Failed to end PAM transaction: %v.\n", p.codeToError(retval))
+			logger.WarnContext(context.Background(), "Failed to end PAM transaction", "error", p.codeToError(retval))
 		}
 
 		// Release the memory allocated for the conversation function.
@@ -489,7 +491,7 @@ func (p *PAM) codeToError(returnValue C.int) error {
 	// released.
 	err := C._pam_strerror(pamHandle, p.pamh, returnValue)
 	if err != nil {
-		return trace.BadParameter(C.GoString(err))
+		return trace.BadParameter("%s", C.GoString(err))
 	}
 
 	return nil
