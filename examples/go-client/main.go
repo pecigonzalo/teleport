@@ -23,8 +23,6 @@ import (
 
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/types"
-
-	"github.com/google/uuid"
 )
 
 func main() {
@@ -50,11 +48,11 @@ func main() {
 
 func demoClient(ctx context.Context, clt *client.Client) (err error) {
 	// Create a new access request for the `access-admin` user to use the `admin` role.
-	accessReq, err := types.NewAccessRequest(uuid.New().String(), "access-admin", "admin")
+	accessReq, err := types.NewAccessRequest("", "access-admin", "admin")
 	if err != nil {
 		return fmt.Errorf("failed to make new access request: %w", err)
 	}
-	if err = clt.CreateAccessRequest(ctx, accessReq); err != nil {
+	if _, err = clt.CreateAccessRequestV2(ctx, accessReq); err != nil {
 		return fmt.Errorf("failed to create access request: %w", err)
 	}
 	log.Printf("Created access request: %v", accessReq)

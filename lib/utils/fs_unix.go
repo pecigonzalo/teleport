@@ -2,65 +2,41 @@
 // +build !windows
 
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"os"
 	"syscall"
-
-	"github.com/gravitational/trace"
 )
 
-// FSWriteLock grabs Flock-style filesystem lock on an open file
-// in exclusive mode.
-func FSWriteLock(f *os.File) error {
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	return nil
+// On non-windows we just lock the target file itself.
+func getPlatformLockFilePath(path string) string {
+	return path
 }
 
-// FSTryWriteLock tries to grab write lock, returns CompareFailed
-// if lock is already acquired
-func FSTryWriteLock(f *os.File) error {
-	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-	if err != nil {
-		if err == syscall.EWOULDBLOCK {
-			return trace.CompareFailed("lock %v is acquired by another process", f.Name())
-		}
-		return trace.ConvertSystemError(err)
+func getHardLinkCount(fi os.FileInfo) (uint64, bool) {
+	if statT, ok := fi.Sys().(*syscall.Stat_t); ok {
+		// we must do a cast here because this will be uint16 on OSX
+		//nolint:unconvert // the cast is only necessary for macOS
+		return uint64(statT.Nlink), true
+	} else {
+		return 0, false
 	}
-	return nil
-}
-
-// FSReadLock grabs Flock-style filesystem lock on an open file
-// in read (shared) mode
-func FSReadLock(f *os.File) error {
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	return nil
-}
-
-// FSUnlock unlcocks Flock-style filesystem lock
-func FSUnlock(f *os.File) error {
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	return nil
 }

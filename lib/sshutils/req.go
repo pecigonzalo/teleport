@@ -1,29 +1,30 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package sshutils
 
 import (
 	"encoding/binary"
 
+	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport"
-
-	"github.com/gravitational/trace"
 )
 
 // EnvReqParams are parameters for env request
@@ -50,25 +51,50 @@ type PTYReqParams struct {
 	Modes string
 }
 
+// ForwardedTCPIPRequest specifies parameters for opening a port forwarding
+// channel from the server.
+type ForwardedTCPIPRequest struct {
+	Addr     string
+	Port     uint32
+	OrigAddr string
+	OrigPort uint32
+}
+
+// CheckAndSetDefaults checks and sets default values.
+func (req *ForwardedTCPIPRequest) CheckAndSetDefaults() error {
+	if req.Addr == "" {
+		return trace.BadParameter("missing field Addr")
+	}
+	if req.Port == 0 {
+		return trace.BadParameter("missing field Port")
+	}
+	if req.OrigAddr == "" {
+		return trace.BadParameter("missing field OrigAddr")
+	}
+	if req.OrigPort == 0 {
+		return trace.BadParameter("missing field OrigPort")
+	}
+	return nil
+}
+
 // TerminalModes converts encoded terminal modes into a ssh.TerminalModes map.
 // The encoding is described in: https://tools.ietf.org/html/rfc4254#section-8
 //
-//   All 'encoded terminal modes' (as passed in a pty request) are encoded
-//   into a byte stream.  It is intended that the coding be portable
-//   across different environments.  The stream consists of opcode-
-//   argument pairs wherein the opcode is a byte value.  Opcodes 1 to 159
-//   have a single uint32 argument.  Opcodes 160 to 255 are not yet
-//   defined, and cause parsing to stop (they should only be used after
-//   any other data).  The stream is terminated by opcode TTY_OP_END
-//   (0x00).
+//	All 'encoded terminal modes' (as passed in a pty request) are encoded
+//	into a byte stream.  It is intended that the coding be portable
+//	across different environments.  The stream consists of opcode-
+//	argument pairs wherein the opcode is a byte value.  Opcodes 1 to 159
+//	have a single uint32 argument.  Opcodes 160 to 255 are not yet
+//	defined, and cause parsing to stop (they should only be used after
+//	any other data).  The stream is terminated by opcode TTY_OP_END
+//	(0x00).
 //
 // In practice, this means encoded terminal modes get translated like below:
 //
-//  0x80 0x00 0x00 0x38 0x40  0x81 0x00 0x00 0x38 0x40  0x35 0x00 0x00 0x00 0x00  0x00
-//  |___|__________________|  |___|__________________|  |___|__________________|  |__|
-//         0x80: 0x3840              0x81: 0x3840              0x35: 0x00         0x00
-//  ssh.TTY_OP_ISPEED: 14400  ssh.TTY_OP_OSPEED: 14400         ssh.ECHO:0
-//
+//	0x80 0x00 0x00 0x38 0x40  0x81 0x00 0x00 0x38 0x40  0x35 0x00 0x00 0x00 0x00  0x00
+//	|___|__________________|  |___|__________________|  |___|__________________|  |__|
+//	       0x80: 0x3840              0x81: 0x3840              0x35: 0x00         0x00
+//	ssh.TTY_OP_ISPEED: 14400  ssh.TTY_OP_OSPEED: 14400         ssh.ECHO:0
 func (p *PTYReqParams) TerminalModes() (ssh.TerminalModes, error) {
 	terminalModes := ssh.TerminalModes{}
 
@@ -166,6 +192,14 @@ const (
 
 	// X11ChannelRequest is the type of an X11 forwarding channel.
 	X11ChannelRequest = "x11"
+
+	// PuTTYSimpleRequest is a PuTTY-specific channel name which it automatically requests when it proxies
+	// connections. Teleport does not support this channel type, so deliberately ignores requests for it.
+	PuTTYSimpleRequest = "simple@putty.projects.tartarus.org"
+
+	// PuTTYWinadjRequest is a PuTTY-specific channel name which it automatically requests to measure window
+	// size on active connections, expecting a failure response from the server.
+	PuTTYWinadjRequest = "winadj@putty.projects.tartarus.org"
 )
 
 const (

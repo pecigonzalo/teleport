@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
@@ -22,25 +24,27 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/backend"
-	"github.com/gravitational/teleport/lib/backend/lite"
-
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/backend"
+	"github.com/gravitational/teleport/lib/backend/memory"
 )
 
 func TestListWindowsDesktops(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
-	liteBackend, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:  t.TempDir(),
-		Clock: clockwork.NewFakeClock(),
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
-	service := NewWindowsDesktopService(liteBackend)
+	service := NewWindowsDesktopService(bk)
 
 	// Initially we expect no desktops.
 	out, err := service.ListWindowsDesktops(ctx, types.ListWindowsDesktopsRequest{
@@ -74,7 +78,7 @@ func TestListWindowsDesktops(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, out.NextKey)
 	require.Empty(t, cmp.Diff([]types.WindowsDesktop{d1, d2, d3}, out.Desktops,
-		cmpopts.IgnoreFields(types.Metadata{}, "ID"),
+		cmpopts.IgnoreFields(types.Metadata{}, "Revision"),
 	))
 
 	// Test pagination.
@@ -111,15 +115,17 @@ func TestListWindowsDesktops(t *testing.T) {
 
 func TestListWindowsDesktops_Filters(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
 
-	liteBackend, err := lite.NewWithConfig(ctx, lite.Config{
-		Path:  t.TempDir(),
-		Clock: clockwork.NewFakeClock(),
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+
+	bk, err := memory.New(memory.Config{
+		Context: ctx,
+		Clock:   clock,
 	})
 	require.NoError(t, err)
 
-	service := NewWindowsDesktopService(liteBackend)
+	service := NewWindowsDesktopService(bk)
 
 	// Upsert some windows desktops.
 

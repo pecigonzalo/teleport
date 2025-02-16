@@ -1,36 +1,40 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package multiplexer
 
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
+	"log/slog"
 	"net"
-	"sync/atomic"
 	"time"
-
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/lib/defaults"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // TLSListenerConfig specifies listener configuration
@@ -70,9 +74,7 @@ func NewTLSListener(cfg TLSListenerConfig) (*TLSListener, error) {
 	}
 	context, cancel := context.WithCancel(context.TODO())
 	return &TLSListener{
-		log: log.WithFields(log.Fields{
-			trace.Component: teleport.Component("mxtls", cfg.ID),
-		}),
+		log:           slog.With(teleport.ComponentKey, teleport.Component("mxtls", cfg.ID)),
 		cfg:           cfg,
 		http2Listener: newListener(context, cfg.Listener.Addr()),
 		httpListener:  newListener(context, cfg.Listener.Addr()),
@@ -86,13 +88,12 @@ func NewTLSListener(cfg TLSListenerConfig) (*TLSListener, error) {
 // and forwards the appropriate responses to either HTTP/1.1 or HTTP/2
 // listeners
 type TLSListener struct {
-	log           *log.Entry
+	log           *slog.Logger
 	cfg           TLSListenerConfig
 	http2Listener *Listener
 	httpListener  *Listener
 	cancel        context.CancelFunc
 	context       context.Context
-	isClosed      int32
 }
 
 // HTTP2 returns HTTP2 listener
@@ -107,27 +108,30 @@ func (l *TLSListener) HTTP() net.Listener {
 
 // Serve accepts and forwards tls.Conn connections
 func (l *TLSListener) Serve() error {
-	backoffTimer := time.NewTicker(5 * time.Second)
-	defer backoffTimer.Stop()
 	for {
 		conn, err := l.cfg.Listener.Accept()
 		if err == nil {
 			tlsConn, ok := conn.(*tls.Conn)
 			if !ok {
 				conn.Close()
-				log.Errorf("Expected tls.Conn, got %T, internal usage error.", conn)
+				l.log.LogAttrs(l.context, slog.LevelError, "Received a non-TLS connection",
+					slog.Any("src_addr", logutils.StringerAttr(conn.RemoteAddr())),
+					slog.Any("dst_addr", logutils.StringerAttr(conn.LocalAddr())),
+					slog.Any("conn_type", logutils.TypeAttr(conn)),
+				)
 				continue
 			}
 			go l.detectAndForward(tlsConn)
 			continue
 		}
-		if atomic.LoadInt32(&l.isClosed) == 1 {
-			return trace.ConnectionProblem(nil, "listener is closed")
+		if utils.IsUseOfClosedNetworkError(err) {
+			<-l.context.Done()
+			return nil
 		}
 		select {
-		case <-backoffTimer.C:
 		case <-l.context.Done():
-			return trace.ConnectionProblem(nil, "listener is closed")
+			return nil
+		case <-time.After(5 * time.Second):
 		}
 	}
 }
@@ -135,15 +139,21 @@ func (l *TLSListener) Serve() error {
 func (l *TLSListener) detectAndForward(conn *tls.Conn) {
 	err := conn.SetReadDeadline(l.cfg.Clock.Now().Add(l.cfg.ReadDeadline))
 	if err != nil {
-		l.log.WithError(err).Debugf("Failed to set connection deadline.")
+		l.log.LogAttrs(l.context, slog.LevelDebug, "Failed to set connection deadline",
+			slog.Any("error", err),
+		)
 		conn.Close()
 		return
 	}
 
 	start := l.cfg.Clock.Now()
-	if err := conn.Handshake(); err != nil {
-		if trace.Unwrap(err) != io.EOF {
-			l.log.WithError(err).Warning("Handshake failed.")
+	if err := conn.HandshakeContext(l.context); err != nil {
+		if !errors.Is(trace.Unwrap(err), io.EOF) {
+			l.log.LogAttrs(l.context, slog.LevelWarn, "Handshake failed",
+				slog.Any("src_addr", logutils.StringerAttr(conn.RemoteAddr())),
+				slog.Any("dst_addr", logutils.StringerAttr(conn.LocalAddr())),
+				slog.Any("error", err),
+			)
 		}
 		conn.Close()
 		return
@@ -152,35 +162,33 @@ func (l *TLSListener) detectAndForward(conn *tls.Conn) {
 	// Log warning if TLS handshake takes more than one second to help debug
 	// latency issues.
 	if elapsed := time.Since(start); elapsed > 1*time.Second {
-		l.log.Warnf("Slow TLS handshake from %v, took %v.", conn.RemoteAddr(), time.Since(start))
+		l.log.LogAttrs(l.context, slog.LevelWarn, "Slow TLS handshake",
+			slog.Any("src_addr", logutils.StringerAttr(conn.RemoteAddr())),
+			slog.Any("dst_addr", logutils.StringerAttr(conn.LocalAddr())),
+			slog.Duration("handshake_duration", time.Since(start)),
+		)
 	}
 
 	err = conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		l.log.WithError(err).Warning("Failed to reset read deadline")
+		l.log.WarnContext(l.context, "Failed to reset read deadline", "error", err)
 		conn.Close()
 		return
 	}
 
 	switch conn.ConnectionState().NegotiatedProtocol {
 	case http2.NextProtoTLS:
-		select {
-		case l.http2Listener.connC <- conn:
-		case <-l.context.Done():
-			conn.Close()
-			return
-		}
+		l.http2Listener.HandleConnection(l.context, conn)
 	case teleport.HTTPNextProtoTLS, "":
-		select {
-		case l.httpListener.connC <- conn:
-		case <-l.context.Done():
-			conn.Close()
-			return
-		}
+		l.httpListener.HandleConnection(l.context, conn)
 	default:
 		conn.Close()
-		l.log.WithError(err).Errorf("unsupported protocol: %v", conn.ConnectionState().NegotiatedProtocol)
-		return
+		l.log.LogAttrs(l.context, slog.LevelError, "rejecting connection with unsupported protocol",
+			slog.Any("error", err),
+			slog.String("protocol", conn.ConnectionState().NegotiatedProtocol),
+			slog.Any("src_addr", logutils.StringerAttr(conn.RemoteAddr())),
+			slog.Any("dst_addr", logutils.StringerAttr(conn.LocalAddr())),
+		)
 	}
 }
 
@@ -188,7 +196,6 @@ func (l *TLSListener) detectAndForward(conn *tls.Conn) {
 // Any blocked Accept operations will be unblocked and return errors.
 func (l *TLSListener) Close() error {
 	defer l.cancel()
-	atomic.StoreInt32(&l.isClosed, 1)
 	return l.cfg.Listener.Close()
 }
 

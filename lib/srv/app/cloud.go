@@ -1,47 +1,52 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/gravitational/teleport/lib/tlsca"
-
-	"github.com/aws/aws-sdk-go/aws/arn"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/credentials/ssocreds"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	awssession "github.com/aws/aws-sdk-go/aws/session"
-
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/lib/tlsca"
+	awsutils "github.com/gravitational/teleport/lib/utils/aws"
+	"github.com/gravitational/teleport/lib/utils/aws/stsutils"
 )
 
 // Cloud provides cloud provider access related methods such as generating
 // sign in URLs for management consoles.
 type Cloud interface {
 	// GetAWSSigninURL generates AWS management console federation sign-in URL.
-	GetAWSSigninURL(AWSSigninRequest) (*AWSSigninResponse, error)
+	GetAWSSigninURL(context.Context, AWSSigninRequest) (*AWSSigninResponse, error)
 }
 
 // AWSSigninRequest is a request to generate AWS console signin URL.
@@ -52,6 +57,11 @@ type AWSSigninRequest struct {
 	TargetURL string
 	// Issuer is the application public URL.
 	Issuer string
+	// ExternalID is the AWS external ID.
+	ExternalID string
+	// Integration is the Integration name to use to generate credentials.
+	// If empty, it will use ambient credentials
+	Integration string
 }
 
 // CheckAndSetDefaults validates the request.
@@ -59,12 +69,12 @@ func (r *AWSSigninRequest) CheckAndSetDefaults() error {
 	if r.Identity == nil {
 		return trace.BadParameter("missing Identity")
 	}
-	_, err := arn.Parse(r.Identity.RouteToApp.AWSRoleARN)
+	_, err := awsutils.ParseRoleARN(r.Identity.RouteToApp.AWSRoleARN)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	if r.TargetURL == "" {
-		r.TargetURL = consoleURL
+		return trace.BadParameter("missing TargetURL")
 	}
 	if r.Issuer == "" {
 		return trace.BadParameter("missing Issuer")
@@ -80,22 +90,16 @@ type AWSSigninResponse struct {
 
 // CloudConfig is the configuration for cloud service.
 type CloudConfig struct {
-	// Session is AWS session.
-	Session *awssession.Session
+	// SessionGetter returns an AWS session.
+	SessionGetter awsutils.AWSSessionProvider
 	// Clock is used to override time in tests.
 	Clock clockwork.Clock
 }
 
 // CheckAndSetDefaults validates the config.
 func (c *CloudConfig) CheckAndSetDefaults() error {
-	if c.Session == nil {
-		session, err := awssession.NewSessionWithOptions(awssession.Options{
-			SharedConfigState: awssession.SharedConfigEnable,
-		})
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		c.Session = session
+	if c.SessionGetter == nil {
+		return trace.BadParameter("missing session getter")
 	}
 	if c.Clock == nil {
 		c.Clock = clockwork.NewRealClock()
@@ -105,7 +109,6 @@ func (c *CloudConfig) CheckAndSetDefaults() error {
 
 type cloud struct {
 	cfg CloudConfig
-	log logrus.FieldLogger
 }
 
 // NewCloud creates a new cloud service.
@@ -115,20 +118,20 @@ func NewCloud(cfg CloudConfig) (Cloud, error) {
 	}
 	return &cloud{
 		cfg: cfg,
-		log: logrus.WithField(trace.Component, "cloud"),
 	}, nil
 }
 
 // GetAWSSigninURL generates AWS management console federation sign-in URL.
 //
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_enable-console-custom-url.html
-func (c *cloud) GetAWSSigninURL(req AWSSigninRequest) (*AWSSigninResponse, error) {
+func (c *cloud) GetAWSSigninURL(ctx context.Context, req AWSSigninRequest) (*AWSSigninResponse, error) {
 	err := req.CheckAndSetDefaults()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	signinToken, err := c.getAWSSigninToken(&req, federationURL)
+	federationURL := getFederationURL(req.TargetURL)
+	signinToken, err := c.getAWSSigninToken(ctx, &req, federationURL)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -153,7 +156,7 @@ func (c *cloud) GetAWSSigninURL(req AWSSigninRequest) (*AWSSigninResponse, error
 // getAWSSigninToken gets the signin token required for the AWS sign in URL.
 //
 // https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_enable-console-custom-url.html
-func (c *cloud) getAWSSigninToken(req *AWSSigninRequest, endpoint string, options ...func(*stscreds.AssumeRoleProvider)) (string, error) {
+func (c *cloud) getAWSSigninToken(ctx context.Context, req *AWSSigninRequest, endpoint string, options ...func(*stscreds.AssumeRoleProvider)) (string, error) {
 	// It is stated in the user guide linked above:
 	// When you use DurationSeconds in an AssumeRole* operation, you must call
 	// it as an IAM user with long-term credentials. Otherwise, the call to the
@@ -164,7 +167,15 @@ func (c *cloud) getAWSSigninToken(req *AWSSigninRequest, endpoint string, option
 	// the AWS session is using temporary credentials. However, when the
 	// "SessionDuration" is not provided, the web console session duration will
 	// be bound to the duration used in the next AssumeRole call.
-	temporarySession, err := isSessionUsingTemporaryCredentials(c.cfg.Session)
+
+	// Sign In requests target IAM endpoints which don't require a region.
+	region := ""
+	session, err := c.cfg.SessionGetter(ctx, region, req.Integration)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+
+	temporarySession, err := isSessionUsingTemporaryCredentials(session)
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
@@ -177,7 +188,7 @@ func (c *cloud) getAWSSigninToken(req *AWSSigninRequest, endpoint string, option
 	options = append(options, func(creds *stscreds.AssumeRoleProvider) {
 		// Setting role session name to Teleport username will allow to
 		// associate CloudTrail events with the Teleport user.
-		creds.RoleSessionName = req.Identity.Username
+		creds.RoleSessionName = awsutils.MaybeHashRoleSessionName(req.Identity.Username)
 
 		// Setting web console session duration through AssumeRole call for AWS
 		// sessions with temporary credentials.
@@ -193,8 +204,12 @@ func (c *cloud) getAWSSigninToken(req *AWSSigninRequest, endpoint string, option
 		if temporarySession {
 			creds.Duration = duration
 		}
+
+		if req.ExternalID != "" {
+			creds.ExternalID = aws.String(req.ExternalID)
+		}
 	})
-	stsCredentials, err := stscreds.NewCredentials(c.cfg.Session, req.Identity.RouteToApp.AWSRoleARN, options...).Get()
+	stsCredentials, err := stsutils.NewCredentialsV1(session, req.Identity.RouteToApp.AWSRoleARN, options...).Get()
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
@@ -326,11 +341,29 @@ type federationResponse struct {
 	SigninToken string `json:"SigninToken"`
 }
 
+// getFederationURL picks the AWS federation endpoint based on the AWS
+// partition of the target URL.
+//
+// https://docs.aws.amazon.com/general/latest/gr/signin-service.html
+// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Beijing.html
+func getFederationURL(targetURL string) string {
+	// TODO(greedy52) support region based sign-in.
+	switch {
+	// AWS GovCloud (US) Partition.
+	case strings.HasPrefix(targetURL, constants.AWSUSGovConsoleURL):
+		return "https://signin.amazonaws-us-gov.com/federation"
+
+	// AWS China Partition.
+	case strings.HasPrefix(targetURL, constants.AWSCNConsoleURL):
+		return "https://signin.amazonaws.cn/federation"
+
+	// AWS Standard Partition.
+	default:
+		return "https://signin.aws.amazon.com/federation"
+	}
+}
+
 const (
-	// federationURL is the AWS federation endpoint.
-	federationURL = "https://signin.aws.amazon.com/federation"
-	// consoleURL is the default AWS console destination.
-	consoleURL = "https://console.aws.amazon.com/ec2/v2/home"
 	// maxSessionDuration is the max federation session duration, which is 12
 	// hours. The federation endpoint will error out if we request more.
 	//

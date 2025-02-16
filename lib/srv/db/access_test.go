@@ -1,74 +1,112 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"database/sql"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
-	mssql "github.com/denisenkom/go-mssqldb"
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/fixtures"
-	"github.com/gravitational/teleport/lib/limiter"
-	"github.com/gravitational/teleport/lib/modules"
-	"github.com/gravitational/teleport/lib/multiplexer"
-	"github.com/gravitational/teleport/lib/reversetunnel"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/srv/alpnproxy"
-	alpncommon "github.com/gravitational/teleport/lib/srv/alpnproxy/common"
-	"github.com/gravitational/teleport/lib/srv/db/cloud"
-	"github.com/gravitational/teleport/lib/srv/db/common"
-	"github.com/gravitational/teleport/lib/srv/db/mongodb"
-	"github.com/gravitational/teleport/lib/srv/db/mysql"
-	"github.com/gravitational/teleport/lib/srv/db/postgres"
-	"github.com/gravitational/teleport/lib/srv/db/redis"
-	"github.com/gravitational/teleport/lib/srv/db/sqlserver"
-	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/teleport/lib/utils"
-
-	goredis "github.com/go-redis/redis/v8"
+	"github.com/ClickHouse/ch-go"
+	cqlclient "github.com/datastax/go-cassandra-native-protocol/client"
+	elastic "github.com/elastic/go-elasticsearch/v8"
+	mysqlclient "github.com/go-mysql-org/go-mysql/client"
+	mysqllib "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jackc/pgconn"
 	"github.com/jonboulle/clockwork"
-	mysqlclient "github.com/siddontang/go-mysql/client"
-	mysqllib "github.com/siddontang/go-mysql/mysql"
+	mssql "github.com/microsoft/go-mssqldb"
+	opensearchclt "github.com/opensearch-project/opensearch-go/v2"
+	goredis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/entitlements"
+	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/authz"
+	clients "github.com/gravitational/teleport/lib/cloud"
+	"github.com/gravitational/teleport/lib/cloud/awsconfig"
+	"github.com/gravitational/teleport/lib/cloud/mocks"
+	"github.com/gravitational/teleport/lib/cryptosuites"
+	"github.com/gravitational/teleport/lib/defaults"
+	libevents "github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/fixtures"
+	"github.com/gravitational/teleport/lib/inventory"
+	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/multiplexer"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv"
+	"github.com/gravitational/teleport/lib/srv/alpnproxy"
+	alpncommon "github.com/gravitational/teleport/lib/srv/alpnproxy/common"
+	"github.com/gravitational/teleport/lib/srv/db/cassandra"
+	"github.com/gravitational/teleport/lib/srv/db/clickhouse"
+	"github.com/gravitational/teleport/lib/srv/db/cloud"
+	"github.com/gravitational/teleport/lib/srv/db/common"
+	dbconnect "github.com/gravitational/teleport/lib/srv/db/common/connect"
+	"github.com/gravitational/teleport/lib/srv/db/dynamodb"
+	"github.com/gravitational/teleport/lib/srv/db/elasticsearch"
+	"github.com/gravitational/teleport/lib/srv/db/mongodb"
+	"github.com/gravitational/teleport/lib/srv/db/mongodb/protocol"
+	"github.com/gravitational/teleport/lib/srv/db/mysql"
+	"github.com/gravitational/teleport/lib/srv/db/opensearch"
+	"github.com/gravitational/teleport/lib/srv/db/postgres"
+	"github.com/gravitational/teleport/lib/srv/db/redis"
+	redisprotocol "github.com/gravitational/teleport/lib/srv/db/redis/protocol"
+	"github.com/gravitational/teleport/lib/srv/db/snowflake"
+	"github.com/gravitational/teleport/lib/srv/db/spanner"
+	"github.com/gravitational/teleport/lib/srv/db/sqlserver"
+	"github.com/gravitational/teleport/lib/srv/discovery/fetchers/db"
+	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/cert"
 )
 
 func TestMain(m *testing.M) {
 	utils.InitLoggerForTests()
+	cryptosuites.PrecomputeRSATestKeys(m)
+	modules.SetInsecureTestMode(true)
+	registerTestSnowflakeEngine()
+	registerTestElasticsearchEngine()
+	registerTestSQLServerEngine()
 	os.Exit(m.Run())
 }
 
@@ -76,18 +114,23 @@ func TestMain(m *testing.M) {
 // on the configured RBAC rules.
 func TestAccessPostgres(t *testing.T) {
 	ctx := context.Background()
-	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres"))
+	testCtx := setupTestContext(ctx, t, withSelfHostedPostgres("postgres", func(db *types.DatabaseV3) {
+		db.SetStaticLabels(map[string]string{"foo": "bar"})
+	}))
 	go testCtx.startHandlingConnections()
 
+	dynamicDBLabels := types.Labels{"echo": {"test"}}
+	staticDBLabels := types.Labels{"foo": {"bar"}}
 	tests := []struct {
-		desc         string
-		user         string
-		role         string
-		allowDbNames []string
-		allowDbUsers []string
-		dbName       string
-		dbUser       string
-		err          string
+		desc          string
+		user          string
+		role          string
+		allowDbNames  []string
+		allowDbUsers  []string
+		extraRoleOpts []roleOptFn
+		dbName        string
+		dbUser        string
+		err           string
 	}{
 		{
 			desc:         "has access to all database names and users",
@@ -147,12 +190,84 @@ func TestAccessPostgres(t *testing.T) {
 			dbUser:       "postgres",
 			err:          "access to db denied",
 		},
+		{
+			desc:         "access allowed to specific user/database by static label",
+			user:         "alice",
+			role:         "admin",
+			allowDbNames: []string{"metrics"},
+			allowDbUsers: []string{"alice"},
+			// The default test role created has wildcard labels allowed.
+			// This tests that specific allowed database labels matching the
+			// test database's static labels allows access.
+			extraRoleOpts: []roleOptFn{withAllowedDBLabels(staticDBLabels)},
+			dbName:        "metrics",
+			dbUser:        "alice",
+		},
+		{
+			desc:         "access allowed to specific user/database by dynamic label",
+			user:         "alice",
+			role:         "admin",
+			allowDbNames: []string{"metrics"},
+			allowDbUsers: []string{"alice"},
+			// The default test role created has wildcard labels allowed.
+			// This tests that specific allowed database labels matching the
+			// test database's dynamic labels allows access, to ensure
+			// that RBAC checks against dynamic labels are working.
+			extraRoleOpts: []roleOptFn{withAllowedDBLabels(dynamicDBLabels)},
+			dbName:        "metrics",
+			dbUser:        "alice",
+		},
+		{
+			desc:         "access denied by dynamic label",
+			user:         "alice",
+			role:         "admin",
+			allowDbNames: []string{"metrics"},
+			allowDbUsers: []string{"alice"},
+			// The default test role created has wildcard labels allowed.
+			// This tests that specific denied database labels matching the
+			// test database's dynamic labels denies access, to ensure
+			// that RBAC checks against dynamic labels are working.
+			extraRoleOpts: []roleOptFn{withDeniedDBLabels(dynamicDBLabels)},
+			dbName:        "metrics",
+			dbUser:        "alice",
+			err:           "access to db denied",
+		},
+		{
+			desc:         "empty username is not allowed",
+			user:         "alice",
+			role:         "admin",
+			allowDbNames: []string{types.Wildcard},
+			allowDbUsers: []string{"postgres"},
+			dbName:       "postgres",
+			dbUser:       "",
+			err:          "user name must not be empty",
+		},
+		{
+			desc:         "empty DB name is set to allowed user name",
+			user:         "alice",
+			role:         "admin",
+			allowDbNames: []string{"postgres"},
+			allowDbUsers: []string{"postgres"},
+			dbName:       "",
+			dbUser:       "postgres",
+		},
+		{
+			desc:         "empty DB name is set to disallowed user name",
+			user:         "alice",
+			role:         "admin",
+			allowDbNames: []string{"non-existent"},
+			allowDbUsers: []string{"postgres"},
+			dbName:       "",
+			dbUser:       "postgres",
+			err:          "access to db denied",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
 			// Create user/role with the requested permissions.
-			testCtx.createUserAndRole(ctx, t, test.user, test.role, test.allowDbUsers, test.allowDbNames)
+			testCtx.createUserAndRole(ctx, t, test.user, test.role,
+				test.allowDbUsers, test.allowDbNames, test.extraRoleOpts...)
 
 			// Try to connect to the database as this user.
 			pgConn, err := testCtx.postgresClient(ctx, test.user, "postgres", test.dbUser, test.dbName)
@@ -256,16 +371,54 @@ func TestAccessMySQL(t *testing.T) {
 	}
 }
 
+func TestMySQLServerVersionUpdateOnConnection(t *testing.T) {
+	ctx := context.Background()
+	testCtx := setupTestContext(
+		ctx,
+		t,
+		withSelfHostedMySQL("mysql",
+			// Set an older version in DB spec.
+			withMySQLServerVersionInDBSpec("6.6.6-before"),
+			// Set a newer version in TestServer.
+			withMySQLServerVersion("8.8.8-after"),
+		),
+	)
+	go testCtx.startHandlingConnections()
+
+	// Confirm the server version configured in the spec.
+	db, err := testCtx.server.getProxiedDatabase("mysql")
+	require.NoError(t, err)
+	require.Equal(t, "6.6.6-before", db.GetMySQLServerVersion())
+
+	// Connect.
+	testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{"alice"}, []string{types.Wildcard})
+	mysqlConn, err := testCtx.mysqlClient("alice", "mysql", "alice")
+	require.NoError(t, err)
+	defer mysqlConn.Close()
+	_, err = mysqlConn.Execute("select 1")
+	require.NoError(t, err)
+
+	// Check if proxied database is updated.
+	updatedDB, err := testCtx.server.getProxiedDatabase("mysql")
+	require.NoError(t, err)
+	require.Equal(t, "8.8.8-after", updatedDB.GetMySQLServerVersion())
+}
+
 // TestAccessRedis verifies access scenarios to a Redis database based
 // on the configured RBAC rules.
 func TestAccessRedis(t *testing.T) {
-	ctx := context.Background()
-	testCtx := setupTestContext(ctx, t, withSelfHostedRedis("redis"))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	testCtx := setupTestContext(ctx, t,
+		withSelfHostedRedis("redis"),
+		withAzureRedis("azure-redis", azureRedisToken))
 	go testCtx.startHandlingConnections()
 
 	tests := []struct {
 		// desc is the test case description.
 		desc string
+		// dbService is the name of the database service to connect to.
+		dbService string
 		// user is the Teleport local username the test will use.
 		user string
 		// role is the Teleport role name to create and assign to the user.
@@ -279,6 +432,7 @@ func TestAccessRedis(t *testing.T) {
 	}{
 		{
 			desc:         "has access to all database users",
+			dbService:    "redis",
 			user:         "alice",
 			role:         "admin",
 			allowDbUsers: []string{types.Wildcard},
@@ -286,6 +440,7 @@ func TestAccessRedis(t *testing.T) {
 		},
 		{
 			desc:         "has access to nothing",
+			dbService:    "redis",
 			user:         "alice",
 			role:         "admin",
 			allowDbUsers: []string{},
@@ -294,6 +449,7 @@ func TestAccessRedis(t *testing.T) {
 		},
 		{
 			desc:         "access allowed to specific user",
+			dbService:    "redis",
 			user:         "alice",
 			role:         "admin",
 			allowDbUsers: []string{"alice"},
@@ -301,11 +457,29 @@ func TestAccessRedis(t *testing.T) {
 		},
 		{
 			desc:         "access denied to specific user",
+			dbService:    "redis",
 			user:         "alice",
 			role:         "admin",
 			allowDbUsers: []string{"alice"},
 			dbUser:       "root",
 			err:          "access to db denied",
+		},
+		{
+			desc:         "azure access allowed to default user",
+			dbService:    "azure-redis",
+			user:         "alice",
+			role:         "admin",
+			allowDbUsers: []string{"default"},
+			dbUser:       "default",
+		},
+		{
+			desc:         "azure access denied to non-default user",
+			dbService:    "azure-redis",
+			user:         "alice",
+			role:         "admin",
+			allowDbUsers: []string{"alice"},
+			dbUser:       "alice",
+			err:          "access denied to non-default db user",
 		},
 	}
 
@@ -314,9 +488,8 @@ func TestAccessRedis(t *testing.T) {
 			// Create user/role with the requested permissions.
 			testCtx.createUserAndRole(ctx, t, test.user, test.role, test.allowDbUsers, []string{types.Wildcard})
 
-			ctx := context.Background()
 			// Try to connect to the database as this user.
-			redisClient, err := testCtx.redisClient(ctx, test.user, "redis", test.dbUser)
+			redisClient, err := testCtx.redisClient(ctx, test.user, test.dbService, test.dbUser)
 			if test.err != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), test.err)
@@ -335,6 +508,54 @@ func TestAccessRedis(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+// TestRedisCommandDocs is a regression test to verify if simple/status strings
+// (+<string>) are returned to Redis client for "COMMAND DOCS" command.
+//
+// "redis-cli" expects command info flags in simple/status strings (+<string>),
+// not regular ones ($<string>). An error is thrown by "redis-cli" if +<string>
+// is not received.
+func TestRedisCommandDocs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	testCtx := setupTestContext(ctx, t, withSelfHostedRedis("redis"))
+	go testCtx.startHandlingConnections()
+
+	// Create user/role with the requested permissions.
+	testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{types.Wildcard}, []string{types.Wildcard})
+
+	// Try to connect to the database as this user.
+	redisClient, err := testCtx.redisClient(ctx, "alice", "redis", "default")
+	require.NoError(t, err)
+
+	// Miniredis returns a sample command result:
+	// https://github.com/alicebob/miniredis/blob/master/cmd_command.go
+	//
+	// Unlike "redis-cli", redisClient.Command accepts any kind of string
+	// regardless whether the flag is in +<flag> or in $<flag>. This should
+	// always succeeds but it will be used as a reference to test the raw
+	// output.
+	parsedCommandInfos := redisClient.Command(ctx)
+	require.NoError(t, parsedCommandInfos.Err())
+
+	// Capture the raw bytes.
+	rawCommandInfos := goredis.NewCmd(ctx, "COMMAND", "DOCS")
+	require.NoError(t, redisClient.Process(ctx, rawCommandInfos))
+	rawCommandInfosBuffer := &bytes.Buffer{}
+	require.NoError(t, redisprotocol.WriteCmd(goredis.NewWriter(rawCommandInfosBuffer), rawCommandInfos.Val()))
+
+	// Loop each flag to make sure +<flag> is written to the raw bytes.
+	rawCommandInfosOutput := rawCommandInfosBuffer.String()
+	var flagsVerified int
+	for _, commandInfo := range parsedCommandInfos.Val() {
+		for _, flag := range commandInfo.Flags {
+			require.Contains(t, rawCommandInfosOutput, "+"+flag)
+			flagsVerified += 1
+		}
+	}
+	// Just to make sure miniredis is returning a command info with some flags.
+	require.Greater(t, flagsVerified, 0)
 }
 
 // TestMySQLBadHandshake verifies MySQL proxy can gracefully handle truncated
@@ -538,6 +759,10 @@ func TestGCPRequireSSL(t *testing.T) {
 		Username:   user,
 	})
 	require.NoError(t, err)
+	certPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: ephemeralCert.Certificate[0],
+	})
 
 	// Setup database servers for Postgres and MySQL with a mock GCP API that
 	// will require SSL and return the ephemeral certificate created above.
@@ -546,8 +771,8 @@ func TestGCPRequireSSL(t *testing.T) {
 			withCloudSQLPostgres("postgres", cloudSQLAuthToken)(t, ctx, testCtx),
 			withCloudSQLMySQLTLS("mysql", user, cloudSQLPassword)(t, ctx, testCtx),
 		},
-		GCPSQL: &cloud.GCPSQLAdminClientMock{
-			EphemeralCert: ephemeralCert,
+		GCPSQL: &mocks.GCPSQLAdminClientMock{
+			EphemeralCert: string(certPEM),
 			DatabaseInstance: &sqladmin.DatabaseInstance{
 				Settings: &sqladmin.Settings{
 					IpConfiguration: &sqladmin.IpConfiguration{
@@ -586,7 +811,7 @@ func TestGCPRequireSSL(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func init() {
+func registerTestSQLServerEngine() {
 	// Override SQL Server engine that is used normally with the test one
 	// that mocks connection dial and Kerberos auth.
 	common.RegisterEngine(newTestSQLServerEngine, defaults.ProtocolSQLServer)
@@ -760,13 +985,15 @@ func TestAccessMongoDB(t *testing.T) {
 		opts []mongodb.TestServerOption
 	}{
 		{
-			name: "new server",
-			opts: []mongodb.TestServerOption{},
+			name: "current server",
+			opts: []mongodb.TestServerOption{
+				mongodb.TestServerWireVersion(protocol.OpmsgWireVersion),
+			},
 		},
 		{
-			name: "old server",
+			name: "mongodb 3.6 server",
 			opts: []mongodb.TestServerOption{
-				mongodb.TestServerWireVersion(wiremessage.OpmsgWireVersion - 1),
+				mongodb.TestServerWireVersion(6),
 			},
 		},
 	}
@@ -777,52 +1004,107 @@ func TestAccessMongoDB(t *testing.T) {
 	}{
 		{
 			name: "client without compression",
-			opts: options.Client(),
+			opts: options.Client().
+				// Add extra time so the test won't time out when running in parallel.
+				SetServerSelectionTimeout(10 * time.Second),
 		},
 		{
 			name: "client with compression",
-			opts: options.Client().SetCompressors([]string{"zlib"}),
+			opts: options.Client().
+				// Add extra time so the test won't time out when running in parallel.
+				SetServerSelectionTimeout(10 * time.Second).
+				SetCompressors([]string{"zlib"}),
 		},
 	}
 
 	// Execute each scenario on both modern and legacy Mongo servers
 	// to make sure legacy messages are also subject to RBAC.
 	for _, test := range tests {
-		for _, serverOpt := range serverOpts {
-			for _, clientOpt := range clientOpts {
-				t.Run(fmt.Sprintf("%v/%v/%v", serverOpt.name, clientOpt.name, test.desc), func(t *testing.T) {
-					testCtx := setupTestContext(ctx, t, withSelfHostedMongo("mongo", serverOpt.opts...))
-					go testCtx.startHandlingConnections()
+		test := test
+		t.Run(fmt.Sprintf("%v", test.desc), func(t *testing.T) {
+			t.Parallel()
 
-					// Create user/role with the requested permissions.
-					testCtx.createUserAndRole(ctx, t, test.user, test.role, test.allowDbUsers, test.allowDbNames)
+			for _, serverOpt := range serverOpts {
+				testCtx := setupTestContext(ctx, t, withSelfHostedMongo("mongo", serverOpt.opts...))
+				go testCtx.startHandlingConnections()
 
-					// Try to connect to the database as this user.
-					mongoClient, err := testCtx.mongoClient(ctx, test.user, "mongo", test.dbUser, clientOpt.opts)
-					t.Cleanup(func() {
-						if mongoClient != nil {
-							require.NoError(t, mongoClient.Disconnect(ctx))
+				// Create user/role with the requested permissions.
+				testCtx.createUserAndRole(ctx, t, test.user, test.role, test.allowDbUsers, test.allowDbNames)
+
+				for _, clientOpt := range clientOpts {
+					clientOpt := clientOpt
+
+					t.Run(fmt.Sprintf("%v/%v", serverOpt.name, clientOpt.name), func(t *testing.T) {
+						t.Parallel()
+
+						// Try to connect to the database as this user.
+						mongoClient, err := testCtx.mongoClient(ctx, test.user, "mongo", test.dbUser, clientOpt.opts)
+						t.Cleanup(func() {
+							if mongoClient != nil {
+								require.NoError(t, mongoClient.Disconnect(ctx))
+							}
+						})
+						if test.connectErr != "" {
+							require.Error(t, err)
+							require.Contains(t, err.Error(), test.connectErr)
+							return
 						}
-					})
-					if test.connectErr != "" {
-						require.Error(t, err)
-						require.Contains(t, err.Error(), test.connectErr)
-						return
-					}
-					require.NoError(t, err)
+						require.NoError(t, err)
 
-					// Execute a "find" command. Collection name doesn't matter currently.
-					records, err := mongoClient.Database(test.dbName).Collection("test").Find(ctx, bson.M{})
-					if test.queryErr != "" {
-						require.Error(t, err)
-						require.Contains(t, err.Error(), test.queryErr)
-						return
-					}
-					require.NoError(t, err)
-					require.NoError(t, records.Close(ctx))
-				})
+						// Execute a "find" command. Collection name doesn't matter currently.
+						records, err := mongoClient.Database(test.dbName).Collection("test").Find(ctx, bson.M{})
+						if test.queryErr != "" {
+							require.Error(t, err)
+							require.Contains(t, err.Error(), test.queryErr)
+							return
+						}
+						require.NoError(t, err)
+						require.NoError(t, records.Close(ctx))
+					})
+				}
 			}
-		}
+		})
+	}
+}
+
+func TestMongoDBMaxMessageSize(t *testing.T) {
+	ctx := context.Background()
+
+	for name, tt := range map[string]struct {
+		maxMessageSize     uint32
+		messageSize        int
+		expectedQueryError bool
+	}{
+		"default message size": {
+			messageSize: 400,
+		},
+		"message size exceeded": {
+			// Set a value that will enable handshake message to complete
+			// successfully.
+			maxMessageSize:     400,
+			messageSize:        500,
+			expectedQueryError: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tt := tt
+			t.Parallel()
+
+			testCtx := setupTestContext(ctx, t, withSelfHostedMongo("mongo", mongodb.TestServerMaxMessageSize(tt.maxMessageSize)))
+			testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{"admin"}, []string{"admin"})
+			go testCtx.startHandlingConnections()
+
+			mongoClient, err := testCtx.mongoClient(ctx, "alice", "mongo", "admin")
+			require.NoError(t, err)
+			defer mongoClient.Disconnect(ctx)
+
+			_, err = mongoClient.Database("admin").Collection("test").Find(ctx, bson.M{"largevalue": make([]byte, tt.messageSize)})
+			if tt.expectedQueryError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
 	}
 }
 
@@ -830,7 +1112,9 @@ func TestAccessMongoDB(t *testing.T) {
 func TestAccessDisabled(t *testing.T) {
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			DB: false,
+			Entitlements: map[entitlements.EntitlementKind]modules.EntitlementInfo{
+				entitlements.DB: {Enabled: false},
+			},
 		},
 	})
 
@@ -909,61 +1193,6 @@ func TestPostgresInjectionUser(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestCompatibilityWithOldAgents verifies that older database agents where
-// each database was represented as a DatabaseServer are supported.
-//
-// DELETE IN 9.0.
-func TestCompatibilityWithOldAgents(t *testing.T) {
-	ctx := context.Background()
-	testCtx := setupTestContext(ctx, t)
-	go testCtx.startProxy()
-
-	postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
-		Name:       "postgres",
-		AuthClient: testCtx.authClient,
-	})
-	require.NoError(t, err)
-	go postgresServer.Serve()
-	t.Cleanup(func() { postgresServer.Close() })
-
-	database, err := types.NewDatabaseV3(types.Metadata{
-		Name: "postgres",
-	}, types.DatabaseSpecV3{
-		Protocol: defaults.ProtocolPostgres,
-		URI:      net.JoinHostPort("localhost", postgresServer.Port()),
-	})
-	require.NoError(t, err)
-	databaseServer := testCtx.setupDatabaseServer(ctx, t, agentParams{
-		Databases: []types.Database{database},
-		GetServerInfoFn: func(database types.Database) func() (types.Resource, error) {
-			return func() (types.Resource, error) {
-				return types.NewDatabaseServerV3(types.Metadata{
-					Name: database.GetName(),
-				}, types.DatabaseServerSpecV3{
-					Protocol: database.GetProtocol(),
-					URI:      database.GetURI(),
-					HostID:   testCtx.hostID,
-					Hostname: constants.APIDomain,
-				})
-			}
-		},
-	})
-	go func() {
-		for conn := range testCtx.fakeRemoteSite.ProxyConn() {
-			go databaseServer.HandleConnection(conn)
-		}
-	}()
-
-	testCtx.createUserAndRole(ctx, t, "alice", "admin", []string{"postgres"}, []string{"postgres"})
-
-	// Make sure we can connect successfully.
-	psql, err := testCtx.postgresClient(ctx, "alice", "postgres", "postgres", "postgres")
-	require.NoError(t, err)
-
-	err = psql.Close(ctx)
-	require.NoError(t, err)
-}
-
 func TestRedisGetSet(t *testing.T) {
 	ctx := context.Background()
 	testCtx := setupTestContext(ctx, t, withSelfHostedRedis("redis"))
@@ -982,7 +1211,7 @@ func TestRedisGetSet(t *testing.T) {
 
 	getResult := redisClient.Get(ctx, "key1")
 	require.NoError(t, getResult.Err())
-	require.Equal(t, getResult.Val(), "123")
+	require.Equal(t, "123", getResult.Val())
 
 	// Disconnect.
 	err = redisClient.Close()
@@ -1034,7 +1263,7 @@ func TestRedisPubSub(t *testing.T) {
 			require.NoError(t, err)
 
 			var fooSub *goredis.PubSub
-			// Create a synchronisation channel between publisher and subscriber
+			// Create a synchronization channel between publisher and subscriber
 			syncChan := make(chan bool)
 
 			go func() {
@@ -1097,10 +1326,6 @@ func TestRedisPipeline(t *testing.T) {
 	})
 
 	pipeliner := redisClient.Pipeline()
-	t.Cleanup(func() {
-		err = pipeliner.Close()
-		require.NoError(t, err)
-	})
 
 	// Set multiple keys using pipelining.
 	for i := 0; i < 10; i++ {
@@ -1155,7 +1380,7 @@ func TestRedisTransaction(t *testing.T) {
 		txf := func(tx *goredis.Tx) error {
 			// Get current value or zero.
 			n, err := tx.Get(ctx, key).Int()
-			if err != nil && err != goredis.Nil {
+			if err != nil && !errors.Is(err, goredis.Nil) {
 				return err
 			}
 
@@ -1176,7 +1401,7 @@ func TestRedisTransaction(t *testing.T) {
 				// Success.
 				return nil
 			}
-			if err == goredis.TxFailedErr {
+			if errors.Is(err, goredis.TxFailedErr) {
 				// Optimistic lock lost. Retry.
 				continue
 			}
@@ -1188,7 +1413,7 @@ func TestRedisTransaction(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	// use just 2 concurrent connections as we want to test our proxy/protocol behaviour not Redis concurrency.
+	// use just 2 concurrent connections as we want to test our proxy/protocol behavior not Redis concurrency.
 	const concurrentConnections = 2
 
 	// Create a channel for potential transaction errors, as testify require package cannot be used from a goroutine.
@@ -1245,15 +1470,15 @@ type testContext struct {
 	clusterName    string
 	tlsServer      *auth.TestTLSServer
 	authServer     *auth.Server
-	authClient     *auth.Client
+	authClient     *authclient.Client
 	proxyServer    *ProxyServer
 	mux            *multiplexer.Mux
 	mysqlListener  net.Listener
 	webListener    *multiplexer.WebListener
-	fakeRemoteSite *reversetunnel.FakeRemoteSite
+	fakeRemoteSite *reversetunnelclient.FakeRemoteSite
 	server         *Server
-	emitter        *testEmitter
-	hostCA         types.CertAuthority
+	emitter        *eventstest.ChannelEmitter
+	databaseCA     types.CertAuthority
 	// postgres is a collection of Postgres databases the test uses.
 	postgres map[string]testPostgres
 	// mysql is a collection of MySQL databases the test uses.
@@ -1264,8 +1489,23 @@ type testContext struct {
 	redis map[string]testRedis
 	// sqlServer is a collection of SQL Server databases the test uses.
 	sqlServer map[string]testSQLServer
+	// snowflake is a collection of Snowflake databases the test uses.
+	snowflake map[string]testSnowflake
+	// cassandra is a collection of Cassandra databases the test uses.
+	cassandra map[string]testCassandra
+	// elasticsearch is a collection of Elasticsearch databases the test uses.
+	elasticsearch map[string]testElasticsearch
+	// opensearch is a collection of OpenSearch databases the test uses.
+	opensearch map[string]testOpenSearch
+	// dynamodb is a collection of DynamoDB databases the test uses.
+	dynamodb map[string]testDynamoDB
+	// clickHouse is a collection of ClickHouse databases the test uses.
+	clickHouse map[string]testClickHouse
+	// spanner is a collection of Spanner databases the test uses.
+	spanner map[string]testSpannerDB
+
 	// clock to override clock in tests.
-	clock clockwork.FakeClock
+	clock *clockwork.FakeClock
 }
 
 // testPostgres represents a single proxied Postgres database.
@@ -1302,7 +1542,61 @@ type testRedis struct {
 
 // testSQLServer represents a single proxied SQL Server database.
 type testSQLServer struct {
+	// db is the test SQLServer database server.
+	db *sqlserver.TestServer
 	// resource is the resource representing this SQL Server database
+	resource types.Database
+}
+
+type testSnowflake struct {
+	// db is the test Snowflake database server.
+	db *snowflake.TestServer
+	// resource is the resource representing this Snowflake database.
+	resource types.Database
+}
+
+// testCassandra represents a single proxied Cassandra database.
+type testCassandra struct {
+	// db is the test Cassandra database server.
+	db *cassandra.TestServer
+	// resource is the resource representing this Cassandra database.
+	resource types.Database
+}
+
+type testClickHouse struct {
+	// db is the test Clickhouse database server.
+	db *clickhouse.TestServer
+	// resource is the resource representing this ClickHouse database.
+	resource types.Database
+}
+
+type testElasticsearch struct {
+	// db is the test elasticsearch database server.
+	db *elasticsearch.TestServer
+	// resource is the resource representing this elasticsearch database.
+	resource types.Database
+}
+
+type testOpenSearch struct {
+	// db is the test OpenSearch database server.
+	db *opensearch.TestServer
+	// resource is the resource representing this OpenSearch database.
+	resource types.Database
+}
+
+// testDynamoDB represents a single proxied DynamoDB database.
+type testDynamoDB struct {
+	// db is the test Dynamodb database server.
+	db *dynamodb.TestServer
+	// resource is the resource representing this DynamoDB database.
+	resource types.Database
+}
+
+// testSpannerDB represents a single proxied Spanner database.
+type testSpannerDB struct {
+	// db is the test Spanner database server.
+	db *spanner.TestServer
+	// resource is the resource representing this Spanner database.
 	resource types.Database
 }
 
@@ -1334,13 +1628,13 @@ func (c *testContext) startHandlingConnections() {
 
 // postgresClient connects to test Postgres through database access as a
 // specified Teleport user and database account.
-func (c *testContext) postgresClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*pgconn.PgConn, error) {
-	return c.postgresClientWithAddr(ctx, c.mux.DB().Addr().String(), teleportUser, dbService, dbUser, dbName)
+func (c *testContext) postgresClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string, opts ...common.ClientOption) (*pgconn.PgConn, error) {
+	return c.postgresClientWithAddr(ctx, c.mux.DB().Addr().String(), teleportUser, dbService, dbUser, dbName, opts...)
 }
 
 // postgresClientWithAddr is like postgresClient but allows to override connection address.
-func (c *testContext) postgresClientWithAddr(ctx context.Context, address, teleportUser, dbService, dbUser, dbName string) (*pgconn.PgConn, error) {
-	return postgres.MakeTestClient(ctx, common.TestClientConfig{
+func (c *testContext) postgresClientWithAddr(ctx context.Context, address, teleportUser, dbService, dbUser, dbName string, opts ...common.ClientOption) (*pgconn.PgConn, error) {
+	cfg := common.TestClientConfig{
 		AuthClient: c.authClient,
 		AuthServer: c.authServer,
 		Address:    address,
@@ -1352,17 +1646,47 @@ func (c *testContext) postgresClientWithAddr(ctx context.Context, address, telep
 			Username:    dbUser,
 			Database:    dbName,
 		},
-	})
+	}
+
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	return postgres.MakeTestClient(ctx, cfg)
+}
+
+// postgresClientLocalProxy connects to test Postgres through local ALPN proxy.
+func (c *testContext) postgresClientLocalProxy(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*pgconn.PgConn, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolPostgres,
+		Username:    dbUser,
+		Database:    dbName,
+	}
+
+	// Start local proxy which client will connect to.
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	// Client connects to the local proxy without TLS.
+	conn, err := pgconn.Connect(ctx, fmt.Sprintf("postgres://%v@%v/%v", dbUser, proxy.GetAddr(), dbName))
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return conn, proxy, nil
 }
 
 // mysqlClient connects to test MySQL through database access as a specified
 // Teleport user and database account.
-func (c *testContext) mysqlClient(teleportUser, dbService, dbUser string) (*mysqlclient.Conn, error) {
+func (c *testContext) mysqlClient(teleportUser, dbService, dbUser string) (mysql.TestClientConn, error) {
 	return c.mysqlClientWithAddr(c.mysqlListener.Addr().String(), teleportUser, dbService, dbUser)
 }
 
 // mysqlClientWithAddr is like mysqlClient but allows to override connection address.
-func (c *testContext) mysqlClientWithAddr(address, teleportUser, dbService, dbUser string) (*mysqlclient.Conn, error) {
+func (c *testContext) mysqlClientWithAddr(address, teleportUser, dbService, dbUser string) (mysql.TestClientConn, error) {
 	return mysql.MakeTestClient(common.TestClientConfig{
 		AuthClient: c.authClient,
 		AuthServer: c.authServer,
@@ -1375,6 +1699,29 @@ func (c *testContext) mysqlClientWithAddr(address, teleportUser, dbService, dbUs
 			Username:    dbUser,
 		},
 	})
+}
+
+// mysqlClientLocalProxy connects to test MySQL through local ALPN proxy.
+func (c *testContext) mysqlClientLocalProxy(ctx context.Context, teleportUser, dbService, dbUser string) (mysql.TestClientConn, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolMySQL,
+		Username:    dbUser,
+	}
+
+	// Start local proxy which client will connect to.
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	// Client connects to the local proxy without TLS.
+	conn, err := mysqlclient.Connect(proxy.GetAddr(), dbUser, "", "")
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return conn, proxy, nil
 }
 
 // mongoClient connects to test MongoDB through database access as a
@@ -1399,6 +1746,41 @@ func (c *testContext) mongoClientWithAddr(ctx context.Context, address, teleport
 	}, opts...)
 }
 
+// mongoClientLocalProxy connects to test MongoDB through local ALPN proxy.
+func (c *testContext) mongoClientLocalProxy(ctx context.Context, teleportUser, dbService, dbUser string) (*mongo.Client, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolMongoDB,
+		Username:    dbUser,
+	}
+
+	// Start local proxy which client will connect to.
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	// Client connects to the local proxy without TLS.
+	client, err := mongo.Connect(ctx, options.Client().
+		ApplyURI("mongodb://"+proxy.GetAddr()).
+		SetHeartbeatInterval(500*time.Millisecond).
+		SetServerSelectionTimeout(5*time.Second))
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	// Ping to make sure it connected successfully.
+	errPing := client.Ping(ctx, nil)
+	if errPing != nil {
+		if err := client.Disconnect(ctx); err != nil {
+			return nil, nil, trace.NewAggregate(errPing, err)
+		}
+		return nil, nil, trace.Wrap(errPing)
+	}
+
+	return client, proxy, nil
+}
+
 // redisClient connects to test Redis through database access as a specified Teleport user and database account.
 func (c *testContext) redisClient(ctx context.Context, teleportUser, dbService, dbUser string, opts ...redis.ClientOptions) (*redis.Client, error) {
 	return c.redisClientWithAddr(ctx, c.webListener.Addr().String(), teleportUser, dbService, dbUser, opts...)
@@ -1418,6 +1800,37 @@ func (c *testContext) redisClientWithAddr(ctx context.Context, proxyAddress, tel
 			Username:    dbUser,
 		},
 	}, opts...)
+}
+
+// redisClientLocalProxy connects to test Redis through local ALPN proxy.
+func (c *testContext) redisClientLocalProxy(ctx context.Context, teleportUser, dbService, dbUser string) (*redis.Client, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolRedis,
+		Username:    dbUser,
+	}
+
+	// Start local proxy which client will connect to.
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	// Client connects to the local proxy without TLS.
+	client := goredis.NewClient(&goredis.Options{
+		Addr: proxy.GetAddr(),
+	})
+
+	// Ping to make sure connection is successful.
+	errPing := client.Ping(ctx).Err()
+	if errPing != nil {
+		if err := client.Close(); err != nil {
+			return nil, nil, trace.NewAggregate(errPing, err)
+		}
+		return nil, nil, trace.Wrap(errPing)
+	}
+
+	return client, proxy, nil
 }
 
 // sqlServerClient connects to the specified SQL Server address.
@@ -1451,16 +1864,139 @@ func (c *testContext) sqlServerClient(ctx context.Context, teleportUser, dbServi
 	return client, proxy, nil
 }
 
+// clickHouseNativeClient connects to the specified ClickHouse Server address.
+func (c *testContext) clickHouseNativeClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*ch.Client, *alpnproxy.LocalProxy, error) {
+	proxy, route, err := c.startLocalProxy(ctx, teleportUser, dbService, dbUser, dbName)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	client, err := clickhouse.MakeNativeTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		proxy.Close()
+		return nil, nil, trace.Wrap(err)
+	}
+	return client, proxy, nil
+}
+
+// clickHouseHTTPClient connects to the specified ClickHouse Server address.
+func (c *testContext) clickHouseHTTPClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*sql.DB, *alpnproxy.LocalProxy, error) {
+	proxy, route, err := c.startLocalProxy(ctx, teleportUser, dbService, dbUser, dbName)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	client, err := clickhouse.MakeDBTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		proxy.Close()
+		return nil, nil, trace.Wrap(err)
+	}
+	return client, proxy, nil
+}
+
+func (c *testContext) startLocalProxy(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*alpnproxy.LocalProxy, tlsca.RouteToDatabase, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolClickHouseHTTP,
+		Username:    dbUser,
+		Database:    dbName,
+	}
+
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, tlsca.RouteToDatabase{}, trace.Wrap(err)
+	}
+	return proxy, route, nil
+}
+
+// cassandraClient connects to test Cassandra through database access as a specified Teleport user and database account.
+func (c *testContext) cassandraClient(ctx context.Context, teleportUser, dbService, dbUser string, opts ...cassandra.ClientOptions) (*cassandra.Session, error) {
+	return c.cassandraClientWithAddr(ctx, c.webListener.Addr().String(), teleportUser, dbService, dbUser, opts...)
+}
+
+// cassandraRawClient connects to test Cassandra through using a raw connection that
+// allows to send/receive a native Cassandra protocol frames.
+func (c *testContext) cassandraRawClient(ctx context.Context, teleportUser, dbService, dbUser string, opts ...cassandra.ClientOptions) (*cqlclient.CqlClientConnection, error) {
+	options := cassandra.ClientOptionsParams{
+		Username: "cassandra",
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	cc := cqlclient.NewCqlClient(c.webListener.Addr().String(), &cqlclient.AuthCredentials{
+		Username: options.Username,
+		Password: "cassandra",
+	})
+	cc.ReadTimeout = time.Hour
+	cc.ConnectTimeout = time.Hour
+	tlsConfig, err := common.MakeTestClientTLSConfig(common.TestClientConfig{
+		AuthClient: c.authClient,
+		AuthServer: c.authServer,
+		Address:    c.webListener.Addr().String(),
+		Cluster:    c.clusterName,
+		Username:   teleportUser,
+		RouteToDatabase: tlsca.RouteToDatabase{
+			ServiceName: dbService,
+			Protocol:    defaults.ProtocolCassandra,
+			Username:    dbUser,
+		},
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	cc.TLSConfig = tlsConfig
+	pp, err := cc.Connect(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return pp, nil
+}
+
+// cassandraClientWithAddr is like cassandraClient but allows overriding connection address.
+func (c *testContext) cassandraClientWithAddr(ctx context.Context, proxyAddress, teleportUser, dbService, dbUser string, opts ...cassandra.ClientOptions) (*cassandra.Session, error) {
+	return cassandra.MakeTestClient(ctx, common.TestClientConfig{
+		AuthClient: c.authClient,
+		AuthServer: c.authServer,
+		Address:    proxyAddress,
+		Cluster:    c.clusterName,
+		Username:   teleportUser,
+		RouteToDatabase: tlsca.RouteToDatabase{
+			ServiceName: dbService,
+			Protocol:    defaults.ProtocolCassandra,
+			Username:    dbUser,
+		},
+	}, opts...)
+}
+
 // startLocalALPNProxy starts local ALPN proxy for the specified database.
 func (c *testContext) startLocalALPNProxy(ctx context.Context, proxyAddr, teleportUser string, route tlsca.RouteToDatabase) (*alpnproxy.LocalProxy, error) {
-	key, err := client.NewKey()
+	key, err := keys.ParsePrivateKey(fixtures.PEMBytes["rsa"])
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	publicKeyPEM, err := keys.MarshalPublicKey(key.Public())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	clientCert, err := c.authServer.GenerateDatabaseTestCert(
 		auth.DatabaseTestCertRequest{
-			PublicKey:       key.Pub,
+			PublicKey:       publicKeyPEM,
 			Cluster:         c.clusterName,
 			Username:        teleportUser,
 			RouteToDatabase: route,
@@ -1469,7 +2005,7 @@ func (c *testContext) startLocalALPNProxy(ctx context.Context, proxyAddr, telepo
 		return nil, trace.Wrap(err)
 	}
 
-	tlsCert, err := tls.X509KeyPair(clientCert, key.Priv)
+	tlsCert, err := key.TLSCertificate(clientCert)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1486,11 +2022,11 @@ func (c *testContext) startLocalALPNProxy(ctx context.Context, proxyAddr, telepo
 
 	proxy, err := alpnproxy.NewLocalProxy(alpnproxy.LocalProxyConfig{
 		RemoteProxyAddr:    proxyAddr,
-		Protocol:           proto,
+		Protocols:          []alpncommon.Protocol{proto},
 		InsecureSkipVerify: true,
 		Listener:           listener,
 		ParentContext:      ctx,
-		Certs:              []tls.Certificate{tlsCert},
+		Cert:               tlsCert,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -1501,28 +2037,206 @@ func (c *testContext) startLocalALPNProxy(ctx context.Context, proxyAddr, telepo
 	return proxy, nil
 }
 
+// snowflakeClient returns a Snowflake test DB client.
+func (c *testContext) snowflakeClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*sql.DB, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolSnowflake,
+		Username:    dbUser,
+		Database:    dbName,
+	}
+
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	db, err := snowflake.MakeTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return db, proxy, nil
+}
+
+// elasticsearchClient returns an Elasticsearch test DB client.
+func (c *testContext) elasticsearchClient(ctx context.Context, teleportUser, dbService, dbUser string) (*elastic.Client, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolElasticsearch,
+		Username:    dbUser,
+	}
+
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	db, err := elasticsearch.MakeTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return db, proxy, nil
+}
+
+// openSearchClient returns an OpenSearch test DB client.
+func (c *testContext) openSearchClient(ctx context.Context, teleportUser, dbService, dbUser string) (*opensearchclt.Client, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolOpenSearch,
+		Username:    dbUser,
+	}
+
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	db, err := opensearch.MakeTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return db, proxy, nil
+}
+
+// dynamodbClient returns a DynamoDB test client.
+func (c *testContext) dynamodbClient(ctx context.Context, teleportUser, dbService, dbUser string) (*dynamodb.Client, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolDynamoDB,
+		Username:    dbUser,
+	}
+
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	db, err := dynamodb.MakeTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return db, proxy, nil
+}
+
+func (c *testContext) spannerClient(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (*spanner.SpannerTestClient, *alpnproxy.LocalProxy, error) {
+	route := tlsca.RouteToDatabase{
+		ServiceName: dbService,
+		Protocol:    defaults.ProtocolSpanner,
+		Username:    dbUser,
+		Database:    dbName,
+	}
+
+	proxy, err := c.startLocalALPNProxy(ctx, c.webListener.Addr().String(), teleportUser, route)
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	clt, err := spanner.MakeTestClient(ctx, common.TestClientConfig{
+		AuthClient:      c.authClient,
+		AuthServer:      c.authServer,
+		Address:         proxy.GetAddr(),
+		Cluster:         c.clusterName,
+		Username:        teleportUser,
+		RouteToDatabase: route,
+	})
+	if err != nil {
+		return nil, nil, trace.Wrap(err)
+	}
+
+	return clt, proxy, nil
+}
+
+type roleOptFn func(types.Role)
+
+func withDeniedDatabaseUsers(users ...string) roleOptFn {
+	return func(role types.Role) {
+		role.SetDatabaseUsers(types.Deny, users)
+	}
+}
+
+func withDeniedDatabaseNames(names ...string) roleOptFn {
+	return func(role types.Role) {
+		role.SetDatabaseNames(types.Deny, names)
+	}
+}
+
+func withAllowedDBLabels(labels types.Labels) roleOptFn {
+	return func(role types.Role) {
+		role.SetDatabaseLabels(types.Allow, labels)
+	}
+}
+
+func withDeniedDBLabels(labels types.Labels) roleOptFn {
+	return func(role types.Role) {
+		role.SetDatabaseLabels(types.Deny, labels)
+	}
+}
+
+func withClientIdleTimeout(clientIdleTimeout time.Duration) roleOptFn {
+	return func(role types.Role) {
+		opts := role.GetOptions()
+		opts.ClientIdleTimeout = types.NewDuration(clientIdleTimeout)
+		role.SetOptions(opts)
+	}
+}
+
 // createUserAndRole creates Teleport user and role with specified names
 // and allowed database users/names properties.
-func (c *testContext) createUserAndRole(ctx context.Context, t *testing.T, userName, roleName string, dbUsers, dbNames []string) (types.User, types.Role) {
-	user, role, err := auth.CreateUserAndRole(c.tlsServer.Auth(), userName, []string{roleName})
+func (c *testContext) createUserAndRole(ctx context.Context, t testing.TB, userName, roleName string, dbUsers, dbNames []string, roleOpts ...roleOptFn) (types.User, types.Role) {
+	user, role, err := auth.CreateUserAndRole(c.tlsServer.Auth(), userName, []string{roleName}, nil)
 	require.NoError(t, err)
 	role.SetDatabaseUsers(types.Allow, dbUsers)
 	role.SetDatabaseNames(types.Allow, dbNames)
-	err = c.tlsServer.Auth().UpsertRole(ctx, role)
+	for _, roleOpt := range roleOpts {
+		roleOpt(role)
+	}
+	role, err = c.tlsServer.Auth().UpsertRole(ctx, role)
 	require.NoError(t, err)
 	return user, role
 }
 
 // makeTLSConfig returns tls configuration for the test's tls listener.
-func (c *testContext) makeTLSConfig(t *testing.T) *tls.Config {
-	creds, err := utils.GenerateSelfSignedCert([]string{"localhost"})
+func (c *testContext) makeTLSConfig(t testing.TB) *tls.Config {
+	creds, err := cert.GenerateSelfSignedCert([]string{"localhost"}, nil)
 	require.NoError(t, err)
 	cert, err := tls.X509KeyPair(creds.Cert, creds.PrivateKey)
 	require.NoError(t, err)
 	conf := utils.TLSConfig(nil)
 	conf.Certificates = append(conf.Certificates, cert)
 	conf.ClientAuth = tls.VerifyClientCertIfGiven
-	conf.ClientCAs, err = auth.ClientCertPool(c.authServer, c.clusterName)
+	conf.ClientCAs, _, _, err = authclient.DefaultClientCertPool(context.Background(), c.authServer, c.clusterName)
 	require.NoError(t, err)
 	return conf
 }
@@ -1548,27 +2262,37 @@ func (c *testContext) Close() error {
 func init() {
 	// Override database agents shuffle behavior to ensure they're always
 	// tried in the same order during tests. Used for HA tests.
-	SetShuffleFunc(ShuffleSort)
+	SetShuffleFunc(dbconnect.ShuffleSort)
 }
 
-func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDatabaseOption) *testContext {
+func setupTestContext(ctx context.Context, t testing.TB, withDatabases ...withDatabaseOption) *testContext {
 	testCtx := &testContext{
-		clusterName: "root.example.com",
-		hostID:      uuid.New().String(),
-		postgres:    make(map[string]testPostgres),
-		mysql:       make(map[string]testMySQL),
-		mongo:       make(map[string]testMongoDB),
-		redis:       make(map[string]testRedis),
-		sqlServer:   make(map[string]testSQLServer),
-		clock:       clockwork.NewFakeClockAt(time.Now()),
+		clusterName:   "root.example.com",
+		hostID:        uuid.New().String(),
+		postgres:      make(map[string]testPostgres),
+		mysql:         make(map[string]testMySQL),
+		mongo:         make(map[string]testMongoDB),
+		redis:         make(map[string]testRedis),
+		sqlServer:     make(map[string]testSQLServer),
+		snowflake:     make(map[string]testSnowflake),
+		elasticsearch: make(map[string]testElasticsearch),
+		opensearch:    make(map[string]testOpenSearch),
+		cassandra:     make(map[string]testCassandra),
+		dynamodb:      make(map[string]testDynamoDB),
+		clickHouse:    make(map[string]testClickHouse),
+		spanner:       make(map[string]testSpannerDB),
+		clock:         clockwork.NewFakeClockAt(time.Now()),
 	}
 	t.Cleanup(func() { testCtx.Close() })
 
 	// Create and start test auth server.
 	authServer, err := auth.NewTestAuthServer(auth.TestAuthServerConfig{
-		Clock:       clockwork.NewFakeClockAt(time.Now()),
+		Clock:       testCtx.clock,
 		ClusterName: testCtx.clusterName,
-		Dir:         t.TempDir(),
+		AuthPreferenceSpec: &types.AuthPreferenceSpecV2{
+			SignatureAlgorithmSuite: types.SignatureAlgorithmSuite_SIGNATURE_ALGORITHM_SUITE_BALANCED_V1,
+		},
+		Dir: t.TempDir(),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, authServer.Close()) })
@@ -1583,9 +2307,8 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
 	listener, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 	testCtx.mux, err = multiplexer.New(multiplexer.Config{
-		ID:                  "test",
-		Listener:            listener,
-		EnableProxyProtocol: true,
+		ID:       "test",
+		Listener: listener,
 	})
 	require.NoError(t, err)
 
@@ -1604,7 +2327,7 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
 	recConfig, err := authServer.AuthServer.GetSessionRecordingConfig(ctx)
 	require.NoError(t, err)
 	recConfig.SetMode(types.RecordAtNodeSync)
-	err = authServer.AuthServer.SetSessionRecordingConfig(ctx, recConfig)
+	_, err = authServer.AuthServer.UpsertSessionRecordingConfig(ctx, recConfig)
 	require.NoError(t, err)
 
 	// Auth client for database service.
@@ -1612,7 +2335,7 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, testCtx.authClient.Close()) })
 
-	testCtx.hostCA, err = testCtx.authClient.GetCertAuthority(ctx, types.CertAuthID{Type: types.HostCA, DomainName: testCtx.clusterName}, false)
+	testCtx.databaseCA, err = testCtx.authClient.GetCertAuthority(ctx, types.CertAuthID{Type: types.DatabaseCA, DomainName: testCtx.clusterName}, false)
 	require.NoError(t, err)
 
 	// Auth client, lock watcher and authorizer for database proxy.
@@ -1627,7 +2350,11 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
 		},
 	})
 	require.NoError(t, err)
-	proxyAuthorizer, err := auth.NewAuthorizer(testCtx.clusterName, proxyAuthClient, proxyLockWatcher)
+	proxyAuthorizer, err := authz.NewAuthorizer(authz.AuthorizerOpts{
+		ClusterName: testCtx.clusterName,
+		AccessPoint: proxyAuthClient,
+		LockWatcher: proxyLockWatcher,
+	})
 	require.NoError(t, err)
 
 	// TLS config for database proxy and database service.
@@ -1643,12 +2370,10 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
 	}
 
 	// Establish fake reversetunnel b/w database proxy and database service.
-	testCtx.fakeRemoteSite = reversetunnel.NewFakeRemoteSite(testCtx.clusterName, proxyAuthClient)
-	t.Cleanup(func() {
-		testCtx.fakeRemoteSite.Close()
-	})
-	tunnel := &reversetunnel.FakeServer{
-		Sites: []reversetunnel.RemoteSite{
+	testCtx.fakeRemoteSite = reversetunnelclient.NewFakeRemoteSite(testCtx.clusterName, proxyAuthClient)
+	t.Cleanup(func() { require.NoError(t, testCtx.fakeRemoteSite.Close()) })
+	tunnel := &reversetunnelclient.FakeServer{
+		Sites: []reversetunnelclient.RemoteSite{
 			testCtx.fakeRemoteSite,
 		},
 	}
@@ -1657,20 +2382,31 @@ func setupTestContext(ctx context.Context, t *testing.T, withDatabases ...withDa
 	require.NoError(t, err)
 
 	// Create test audit events emitter.
-	testCtx.emitter = newTestEmitter()
+	// NOTE(gavin): this emitter is just a buffered channel and it will block if
+	// a test does not consume the events, which can make your test fail
+	// mysteriously with a timeout.
+	testCtx.emitter = eventstest.NewChannelEmitter(100)
+
+	connMonitor, err := srv.NewConnectionMonitor(srv.ConnectionMonitorConfig{
+		AccessPoint:    proxyAuthClient,
+		LockWatcher:    proxyLockWatcher,
+		Clock:          testCtx.clock,
+		ServerID:       testCtx.hostID,
+		Emitter:        testCtx.emitter,
+		EmitterContext: ctx,
+		Logger:         utils.NewSlogLoggerForTests(),
+	})
+	require.NoError(t, err)
 
 	// Create database proxy server.
 	testCtx.proxyServer, err = NewProxyServer(ctx, ProxyServerConfig{
-		AuthClient:  proxyAuthClient,
-		AccessPoint: proxyAuthClient,
-		Authorizer:  proxyAuthorizer,
-		Tunnel:      tunnel,
-		TLSConfig:   tlsConfig,
-		Limiter:     connLimiter,
-		Emitter:     testCtx.emitter,
-		Clock:       testCtx.clock,
-		ServerID:    "proxy-server",
-		LockWatcher: proxyLockWatcher,
+		AuthClient:        proxyAuthClient,
+		AccessPoint:       proxyAuthClient,
+		Authorizer:        proxyAuthorizer,
+		Tunnel:            tunnel,
+		TLSConfig:         tlsConfig,
+		Limiter:           connLimiter,
+		ConnectionMonitor: connMonitor,
 	})
 	require.NoError(t, err)
 
@@ -1693,13 +2429,34 @@ type agentParams struct {
 	// ResourceMatchers are optional database resource matchers.
 	ResourceMatchers []services.ResourceMatcher
 	// GetServerInfoFn overrides heartbeat's server info function.
-	GetServerInfoFn func(database types.Database) func() (types.Resource, error)
+	GetServerInfoFn func(database types.Database) func(context.Context) (*types.DatabaseServerV3, error)
 	// OnReconcile sets database resource reconciliation callback.
 	OnReconcile func(types.Databases)
 	// NoStart indicates server should not be started.
 	NoStart bool
 	// GCPSQL defines the GCP Cloud SQL mock to use for GCP API calls.
-	GCPSQL *cloud.GCPSQLAdminClientMock
+	GCPSQL *mocks.GCPSQLAdminClientMock
+	// OnHeartbeat defines a heartbeat function that generates heartbeat events.
+	OnHeartbeat func(error)
+	// CADownloader defines the CA downloader.
+	CADownloader CADownloader
+	// CloudClients is the cloud API clients for database service.
+	CloudClients clients.Clients
+	// AWSConfigProvider provides [aws.Config] for AWS SDK service clients.
+	AWSConfigProvider awsconfig.Provider
+	// AWSDatabaseFetcherFactory provides AWS database fetchers
+	AWSDatabaseFetcherFactory *db.AWSFetcherFactory
+	// AWSMatchers is a list of AWS databases matchers.
+	AWSMatchers []types.AWSMatcher
+	// AzureMatchers is a list of Azure databases matchers.
+	AzureMatchers []types.AzureMatcher
+	// discoveryResourceChecker performs some pre-checks when creating databases
+	// discovered by the discovery service.
+	DiscoveryResourceChecker cloud.DiscoveryResourceChecker
+	// Recorder is the recorder used on sessions.
+	Recorder libevents.SessionRecorder
+	// GetEngineFn can be used to override the engine created in tests.
+	GetEngineFn func(types.Database, common.EngineConfig) (common.Engine, error)
 }
 
 func (p *agentParams) setDefaults(c *testContext) {
@@ -1707,7 +2464,7 @@ func (p *agentParams) setDefaults(c *testContext) {
 		p.HostID = c.hostID
 	}
 	if p.GCPSQL == nil {
-		p.GCPSQL = &cloud.GCPSQLAdminClientMock{
+		p.GCPSQL = &mocks.GCPSQLAdminClientMock{
 			DatabaseInstance: &sqladmin.DatabaseInstance{
 				Settings: &sqladmin.Settings{
 					IpConfiguration: &sqladmin.IpConfiguration{
@@ -1717,9 +2474,27 @@ func (p *agentParams) setDefaults(c *testContext) {
 			},
 		}
 	}
+	if p.CADownloader == nil {
+		p.CADownloader = &fakeDownloader{
+			cert: []byte(fixtures.TLSCACertPEM),
+		}
+	}
+
+	if p.CloudClients == nil {
+		p.CloudClients = &clients.TestCloudClients{
+			GCPSQL: p.GCPSQL,
+		}
+	}
+	if p.AWSConfigProvider == nil {
+		p.AWSConfigProvider = &mocks.AWSConfigProvider{Err: trace.AccessDenied("AWS SDK clients are disabled for tests by default")}
+	}
+
+	if p.DiscoveryResourceChecker == nil {
+		p.DiscoveryResourceChecker = &fakeDiscoveryResourceChecker{}
+	}
 }
 
-func (c *testContext) setupDatabaseServer(ctx context.Context, t *testing.T, p agentParams) *Server {
+func (c *testContext) setupDatabaseServer(ctx context.Context, t testing.TB, p agentParams) *Server {
 	p.setDefaults(c)
 
 	// Database service credentials.
@@ -1736,14 +2511,20 @@ func (c *testContext) setupDatabaseServer(ctx context.Context, t *testing.T, p a
 		},
 	})
 	require.NoError(t, err)
-	dbAuthorizer, err := auth.NewAuthorizer(c.clusterName, c.authClient, lockWatcher)
+	dbAuthorizer, err := authz.NewAuthorizer(authz.AuthorizerOpts{
+		ClusterName: c.clusterName,
+		AccessPoint: c.authClient,
+		LockWatcher: lockWatcher,
+	})
 	require.NoError(t, err)
 
 	// Create test database auth tokens generator.
 	testAuth, err := newTestAuth(common.AuthConfig{
-		AuthClient: c.authClient,
-		Clients:    &common.TestCloudClients{},
-		Clock:      c.clock,
+		AuthClient:        c.authClient,
+		AccessPoint:       c.authClient,
+		Clients:           &clients.TestCloudClients{},
+		Clock:             c.clock,
+		AWSConfigProvider: p.AWSConfigProvider,
 	})
 	require.NoError(t, err)
 
@@ -1751,62 +2532,195 @@ func (c *testContext) setupDatabaseServer(ctx context.Context, t *testing.T, p a
 	connLimiter, err := limiter.NewLimiter(limiter.Config{})
 	require.NoError(t, err)
 
+	connMonitor, err := srv.NewConnectionMonitor(srv.ConnectionMonitorConfig{
+		AccessPoint:    c.authClient,
+		LockWatcher:    lockWatcher,
+		Clock:          c.clock,
+		ServerID:       p.HostID,
+		Emitter:        c.emitter,
+		EmitterContext: context.Background(),
+		Logger:         utils.NewSlogLoggerForTests(),
+	})
+	require.NoError(t, err)
+
+	if p.Recorder == nil {
+		p.Recorder = libevents.NewDiscardRecorder()
+	}
+
+	// Auth client for this database server identity.
+	clt, err := c.tlsServer.NewClient(auth.TestServerID(types.RoleDatabase, p.HostID))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, clt.Close()) })
+
+	inventoryHandle := inventory.NewDownstreamHandle(clt.InventoryControlStream, proto.UpstreamInventoryHello{
+		ServerID: p.HostID,
+		Version:  teleport.Version,
+		Services: []types.SystemRole{types.RoleDatabase},
+		Hostname: "test",
+	})
+
 	// Create database server agent itself.
 	server, err := New(ctx, Config{
-		Clock:            clockwork.NewFakeClockAt(time.Now()),
+		Clock:            c.clock,
 		DataDir:          t.TempDir(),
 		AuthClient:       c.authClient,
 		AccessPoint:      c.authClient,
-		StreamEmitter:    c.authClient,
 		Authorizer:       dbAuthorizer,
 		Hostname:         constants.APIDomain,
 		HostID:           p.HostID,
 		TLSConfig:        tlsConfig,
 		Limiter:          connLimiter,
 		Auth:             testAuth,
+		Emitter:          c.emitter,
 		Databases:        p.Databases,
+		OnHeartbeat:      p.OnHeartbeat,
 		ResourceMatchers: p.ResourceMatchers,
 		GetServerInfoFn:  p.GetServerInfoFn,
 		GetRotation: func(types.SystemRole) (*types.Rotation, error) {
 			return &types.Rotation{}, nil
 		},
-		NewAudit: func(common.AuditConfig) (common.Audit, error) {
+		NewAudit: func(cfg common.AuditConfig) (common.Audit, error) {
 			// Use the same audit logger implementation but substitute the
 			// underlying emitter so events can be tracked in tests.
 			return common.NewAudit(common.AuditConfig{
-				Emitter: c.emitter,
+				Emitter:  c.emitter,
+				Recorder: libevents.WithNoOpPreparer(p.Recorder),
+				Database: cfg.Database,
+				Clock:    c.clock,
 			})
 		},
-		CADownloader: &fakeDownloader{
-			cert: []byte(fixtures.TLSCACertPEM),
-		},
-		OnReconcile: p.OnReconcile,
-		LockWatcher: lockWatcher,
-		CloudClients: &common.TestCloudClients{
-			STS:      &cloud.STSMock{},
-			RDS:      &cloud.RDSMock{},
-			Redshift: &cloud.RedshiftMock{},
-			IAM:      &cloud.IAMMock{},
-			GCPSQL:   p.GCPSQL,
-		},
+		CADownloader:              p.CADownloader,
+		OnReconcile:               p.OnReconcile,
+		ConnectionMonitor:         connMonitor,
+		CloudClients:              p.CloudClients,
+		AWSConfigProvider:         p.AWSConfigProvider,
+		AWSDatabaseFetcherFactory: p.AWSDatabaseFetcherFactory,
+		AWSMatchers:               p.AWSMatchers,
+		AzureMatchers:             p.AzureMatchers,
+		ShutdownPollPeriod:        100 * time.Millisecond,
+		InventoryHandle:           inventoryHandle,
+		discoveryResourceChecker:  p.DiscoveryResourceChecker,
+		getEngineFn:               p.GetEngineFn,
 	})
 	require.NoError(t, err)
 
 	if !p.NoStart {
 		require.NoError(t, server.Start(ctx))
-		require.NoError(t, server.ForceHeartbeat())
+
+		// Explicitly send a heartbeat for any statically defined dbs.
+		for _, db := range p.Databases {
+			select {
+			case sender := <-inventoryHandle.Sender():
+				dbServer, err := server.getServerInfo(ctx, db)
+				require.NoError(t, err)
+				require.NoError(t, sender.Send(ctx, proto.InventoryHeartbeat{
+					DatabaseServer: dbServer,
+				}))
+			case <-time.After(20 * time.Second):
+				t.Fatal("timed out waiting for inventory handle sender")
+			}
+		}
 	}
 
 	return server
 }
 
-type withDatabaseOption func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database
+// TestAccessClickHouse verifies access scenarios to a ClickHouse database.
+func TestAccessClickHouse(t *testing.T) {
+	const (
+		aliceUser = "alice"
+		adminRole = "admin"
+	)
 
-func withSelfHostedPostgres(name string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	ctx := context.Background()
+	testCtx := setupTestContext(ctx, t,
+		withClickhouseHTTP(defaults.ProtocolClickHouseHTTP),
+		withClickhouseNative(defaults.ProtocolClickHouse),
+	)
+	go testCtx.startHandlingConnections()
+
+	tests := []struct {
+		desc         string
+		allowDbUsers []string
+		dbUser       string
+		err          string
+	}{
+		{
+			desc:         "has access to all database users",
+			allowDbUsers: []string{types.Wildcard},
+			dbUser:       "root",
+		},
+		{
+			desc:         "has access to nothing",
+			allowDbUsers: []string{},
+			dbUser:       "root",
+			err:          "access to db denied",
+		},
+		{
+			desc:         "access allowed to specific user",
+			allowDbUsers: []string{aliceUser},
+			dbUser:       aliceUser,
+		},
+		{
+			desc:         "access denied to specific user",
+			allowDbUsers: []string{aliceUser},
+			dbUser:       "root",
+			err:          "access to db denied",
+		},
+	}
+
+	type connectFunc func(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (io.Closer, io.Closer, error)
+	connectMap := map[string]connectFunc{
+		defaults.ProtocolClickHouseHTTP: func(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (io.Closer, io.Closer, error) {
+			return testCtx.clickHouseHTTPClient(ctx, teleportUser, defaults.ProtocolClickHouseHTTP, dbUser, dbName)
+		},
+		defaults.ProtocolClickHouse: func(ctx context.Context, teleportUser, dbService, dbUser, dbName string) (io.Closer, io.Closer, error) {
+			return testCtx.clickHouseNativeClient(ctx, teleportUser, defaults.ProtocolClickHouse, dbUser, dbName)
+		},
+	}
+
+	for _, test := range tests {
+		for _, protocol := range []string{defaults.ProtocolClickHouse, defaults.ProtocolClickHouseHTTP} {
+			t.Run(protocol, func(t *testing.T) {
+				t.Run(test.desc, func(t *testing.T) {
+					// Create user/role with the requested permissions.
+					testCtx.createUserAndRole(ctx, t, aliceUser, adminRole, test.allowDbUsers, []string{types.Wildcard})
+
+					connectCall, ok := connectMap[protocol]
+					require.True(t, ok)
+
+					conn, proxy, err := connectCall(ctx, aliceUser, protocol, test.dbUser, "master")
+					if test.err != "" {
+						require.Error(t, err)
+						// Error message propagation is only implemented for HTTP Clickhouse protocol.
+						if protocol != defaults.ProtocolClickHouse {
+							require.Contains(t, err.Error(), test.err)
+						}
+						return
+					}
+					require.NoError(t, err)
+
+					// Close connection and proxy.
+					t.Cleanup(func() {
+						require.NoError(t, conn.Close())
+						require.NoError(t, proxy.Close())
+					})
+				})
+			})
+		}
+	}
+}
+
+type withDatabaseOption func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database
+
+type databaseOption func(*types.DatabaseV3)
+
+func withSelfHostedPostgres(name string, dbOpts ...databaseOption) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
+			ClientAuth: tls.RequireAndVerifyClientCert,
 		})
 		require.NoError(t, err)
 		go postgresServer.Serve()
@@ -1819,6 +2733,40 @@ func withSelfHostedPostgres(name string) withDatabaseOption {
 			DynamicLabels: dynamicLabels,
 		})
 		require.NoError(t, err)
+		for _, dbOpt := range dbOpts {
+			dbOpt(database)
+		}
+		testCtx.postgres[name] = testPostgres{
+			db:       postgresServer,
+			resource: database,
+		}
+		return database
+	}
+}
+
+func withSelfHostedPostgresUsers(name string, users []string, dbOpts ...databaseOption) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
+			Name:         name,
+			AuthClient:   testCtx.authClient,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			AllowAnyUser: false,
+			Users:        users,
+		})
+		require.NoError(t, err)
+		go postgresServer.Serve()
+		t.Cleanup(func() { postgresServer.Close() })
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+		}, types.DatabaseSpecV3{
+			Protocol:      defaults.ProtocolPostgres,
+			URI:           net.JoinHostPort("localhost", postgresServer.Port()),
+			DynamicLabels: dynamicLabels,
+		})
+		require.NoError(t, err)
+		for _, dbOpt := range dbOpts {
+			dbOpt(database)
+		}
 		testCtx.postgres[name] = testPostgres{
 			db:       postgresServer,
 			resource: database,
@@ -1828,7 +2776,7 @@ func withSelfHostedPostgres(name string) withDatabaseOption {
 }
 
 func withRDSPostgres(name, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -1847,7 +2795,9 @@ func withRDSPostgres(name, authToken string) withDatabaseOption {
 				Region: testAWSRegion,
 			},
 			// Set CA cert, otherwise we will attempt to download RDS roots.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
 		})
 		require.NoError(t, err)
 		testCtx.postgres[name] = testPostgres{
@@ -1859,7 +2809,7 @@ func withRDSPostgres(name, authToken string) withDatabaseOption {
 }
 
 func withRedshiftPostgres(name, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -1879,7 +2829,9 @@ func withRedshiftPostgres(name, authToken string) withDatabaseOption {
 				Redshift: types.Redshift{ClusterID: "redshift-cluster-1"},
 			},
 			// Set CA cert, otherwise we will attempt to download Redshift roots.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
 		})
 		require.NoError(t, err)
 		testCtx.postgres[name] = testPostgres{
@@ -1891,7 +2843,7 @@ func withRedshiftPostgres(name, authToken string) withDatabaseOption {
 }
 
 func withCloudSQLPostgres(name, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -1914,7 +2866,9 @@ func withCloudSQLPostgres(name, authToken string) withDatabaseOption {
 				InstanceID: "instance-1",
 			},
 			// Set CA cert to pass cert validation.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
 		})
 		require.NoError(t, err)
 		testCtx.postgres[name] = testPostgres{
@@ -1926,7 +2880,7 @@ func withCloudSQLPostgres(name, authToken string) withDatabaseOption {
 }
 
 func withAzurePostgres(name, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		postgresServer, err := postgres.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -1945,7 +2899,9 @@ func withAzurePostgres(name, authToken string) withDatabaseOption {
 				Name: name,
 			},
 			// Set CA cert, otherwise we will attempt to download RDS roots.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
 		})
 		require.NoError(t, err)
 		testCtx.postgres[name] = testPostgres{
@@ -1956,12 +2912,49 @@ func withAzurePostgres(name, authToken string) withDatabaseOption {
 	}
 }
 
-func withSelfHostedMySQL(name string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+type selfHostedMySQLOptions struct {
+	serverOptions   []mysql.TestServerOption
+	databaseOptions []databaseOption
+}
+
+type selfHostedMySQLOption func(*selfHostedMySQLOptions)
+
+func withMySQLServerVersion(version string) selfHostedMySQLOption {
+	return func(opts *selfHostedMySQLOptions) {
+		opts.serverOptions = append(opts.serverOptions, mysql.WithServerVersion(version))
+	}
+}
+
+func withMySQLServerVersionInDBSpec(version string) selfHostedMySQLOption {
+	return func(opts *selfHostedMySQLOptions) {
+		opts.databaseOptions = append(opts.databaseOptions, func(db *types.DatabaseV3) {
+			db.Spec.MySQL.ServerVersion = version
+		})
+	}
+}
+
+func withMySQLAdminUser(username string) selfHostedMySQLOption {
+	return func(opts *selfHostedMySQLOptions) {
+		opts.databaseOptions = append(opts.databaseOptions, func(db *types.DatabaseV3) {
+			db.Spec.AdminUser = &types.DatabaseAdminUser{
+				Name: username,
+			}
+		})
+	}
+}
+
+func withSelfHostedMySQL(name string, applyOpts ...selfHostedMySQLOption) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		opts := selfHostedMySQLOptions{}
+		for _, applyOpt := range applyOpts {
+			applyOpt(&opts)
+		}
+
 		mysqlServer, err := mysql.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
-		})
+			ClientAuth: tls.RequireAndVerifyClientCert,
+		}, opts.serverOptions...)
 		require.NoError(t, err)
 		go mysqlServer.Serve()
 		t.Cleanup(func() {
@@ -1975,6 +2968,11 @@ func withSelfHostedMySQL(name string) withDatabaseOption {
 			DynamicLabels: dynamicLabels,
 		})
 		require.NoError(t, err)
+
+		for _, applyDatabaseOpt := range opts.databaseOptions {
+			applyDatabaseOpt(database)
+		}
+
 		testCtx.mysql[name] = testMySQL{
 			db:       mysqlServer,
 			resource: database,
@@ -1984,7 +2982,7 @@ func withSelfHostedMySQL(name string) withDatabaseOption {
 }
 
 func withRDSMySQL(name, authUser, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		mysqlServer, err := mysql.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -2004,7 +3002,7 @@ func withRDSMySQL(name, authUser, authToken string) withDatabaseOption {
 				Region: testAWSRegion,
 			},
 			// Set CA cert, otherwise we will attempt to download RDS roots.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
 		})
 		require.NoError(t, err)
 		testCtx.mysql[name] = testMySQL{
@@ -2016,7 +3014,7 @@ func withRDSMySQL(name, authUser, authToken string) withDatabaseOption {
 }
 
 func withCloudSQLMySQL(name, authUser, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		mysqlServer, err := mysql.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -2040,7 +3038,7 @@ func withCloudSQLMySQL(name, authUser, authToken string) withDatabaseOption {
 				InstanceID: "instance-1",
 			},
 			// Set CA cert to pass cert validation.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
 		})
 		require.NoError(t, err)
 		testCtx.mysql[name] = testMySQL{
@@ -2054,7 +3052,7 @@ func withCloudSQLMySQL(name, authUser, authToken string) withDatabaseOption {
 // withCloudSQLMySQLTLS creates a test MySQL server that simulates GCP Cloud SQL
 // and requires client authentication using an ephemeral client certificate.
 func withCloudSQLMySQLTLS(name, authUser, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		mysqlServer, err := mysql.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -2080,7 +3078,7 @@ func withCloudSQLMySQLTLS(name, authUser, authToken string) withDatabaseOption {
 				InstanceID: "instance-1",
 			},
 			// Set CA cert to pass cert validation.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
 		})
 		require.NoError(t, err)
 		testCtx.mysql[name] = testMySQL{
@@ -2092,7 +3090,7 @@ func withCloudSQLMySQLTLS(name, authUser, authToken string) withDatabaseOption {
 }
 
 func withAzureMySQL(name, authUser, authToken string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		mysqlServer, err := mysql.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
@@ -2112,7 +3110,7 @@ func withAzureMySQL(name, authUser, authToken string) withDatabaseOption {
 				Name: name,
 			},
 			// Set CA cert, otherwise we will attempt to download RDS roots.
-			CACert: string(testCtx.hostCA.GetActiveKeys().TLS[0].Cert),
+			CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
 		})
 		require.NoError(t, err)
 		testCtx.mysql[name] = testMySQL{
@@ -2123,12 +3121,14 @@ func withAzureMySQL(name, authUser, authToken string) withDatabaseOption {
 	}
 }
 
-func withSelfHostedMongo(name string, opts ...mongodb.TestServerOption) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+func withAtlasMongo(name, authUser, authSession string) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		mongoServer, err := mongodb.NewTestServer(common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
-		}, opts...)
+			AuthUser:   authUser,
+			AuthToken:  authSession,
+		})
 		require.NoError(t, err)
 		go mongoServer.Serve()
 		t.Cleanup(func() { mongoServer.Close() })
@@ -2138,6 +3138,52 @@ func withSelfHostedMongo(name string, opts ...mongodb.TestServerOption) withData
 			Protocol:      defaults.ProtocolMongoDB,
 			URI:           net.JoinHostPort("localhost", mongoServer.Port()),
 			DynamicLabels: dynamicLabels,
+			AWS: types.AWS{
+				AccountID: "000000000000",
+			},
+			MongoAtlas: types.MongoAtlas{
+				Name: "test",
+			},
+			CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+		})
+		require.NoError(t, err)
+		testCtx.mongo[name] = testMongoDB{
+			db:       mongoServer,
+			resource: database,
+		}
+		return database
+	}
+}
+
+func withSelfHostedMongo(name string, opts ...mongodb.TestServerOption) withDatabaseOption {
+	return withSelfHostedMongoWithAdminUser(name, "", opts...)
+}
+
+func withSelfHostedMongoWithAdminUser(name, adminUsername string, opts ...mongodb.TestServerOption) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		mongoServer, err := mongodb.NewTestServer(common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+		}, opts...)
+		require.NoError(t, err)
+		go mongoServer.Serve()
+		t.Cleanup(func() { mongoServer.Close() })
+
+		var adminUser *types.DatabaseAdminUser
+		if adminUsername != "" {
+			adminUser = &types.DatabaseAdminUser{
+				Name: adminUsername,
+			}
+		}
+
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+		}, types.DatabaseSpecV3{
+			Protocol:      defaults.ProtocolMongoDB,
+			URI:           net.JoinHostPort("localhost", mongoServer.Port()),
+			DynamicLabels: dynamicLabels,
+			AdminUser:     adminUser,
 		})
 		require.NoError(t, err)
 		testCtx.mongo[name] = testMongoDB{
@@ -2149,10 +3195,11 @@ func withSelfHostedMongo(name string, opts ...mongodb.TestServerOption) withData
 }
 
 func withSelfHostedRedis(name string, opts ...redis.TestServerOption) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
 		redisServer, err := redis.NewTestServer(t, common.TestServerConfig{
 			Name:       name,
 			AuthClient: testCtx.authClient,
+			ClientAuth: tls.RequireAndVerifyClientCert,
 		}, opts...)
 		require.NoError(t, err)
 
@@ -2173,19 +3220,196 @@ func withSelfHostedRedis(name string, opts ...redis.TestServerOption) withDataba
 }
 
 func withSQLServer(name string) withDatabaseOption {
-	return func(t *testing.T, ctx context.Context, testCtx *testContext) types.Database {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		sqlServer, err := sqlserver.NewTestServer(common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+		})
+		require.NoError(t, err)
+		go sqlServer.Serve()
+		t.Cleanup(func() { sqlServer.Close() })
 		database, err := types.NewDatabaseV3(types.Metadata{
 			Name: name,
 		}, types.DatabaseSpecV3{
 			Protocol: defaults.ProtocolSQLServer,
-			URI:      "localhost:1433", // URI doesn't matter as tests aren't actually going to dial it.
+			URI:      net.JoinHostPort("localhost", sqlServer.Port()),
 		})
 		require.NoError(t, err)
 		testCtx.sqlServer[name] = testSQLServer{
+			db:       sqlServer,
 			resource: database,
 		}
 		return database
 	}
+}
+
+func withClickhouseNative(name string) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		server, err := clickhouse.NewTestServer(common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+		}, clickhouse.WithClickHouseNativeProtocol())
+		require.NoError(t, err)
+		go server.Serve()
+		t.Cleanup(func() {
+			server.Close()
+		})
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+		}, types.DatabaseSpecV3{
+			Protocol: defaults.ProtocolClickHouse,
+			URI:      fmt.Sprintf("clickhouse://%s", net.JoinHostPort("localhost", server.Port())),
+		})
+		require.NoError(t, err)
+		testCtx.clickHouse[name] = testClickHouse{
+			db:       server,
+			resource: database,
+		}
+		return database
+	}
+}
+
+func withClickhouseHTTP(name string) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		server, err := clickhouse.NewTestServer(common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+		}, clickhouse.WithClickHouseHTTPProtocol())
+		require.NoError(t, err)
+		go server.Serve()
+		t.Cleanup(func() { server.Close() })
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+		}, types.DatabaseSpecV3{
+			Protocol: defaults.ProtocolClickHouseHTTP,
+			URI:      fmt.Sprintf("https://%s", net.JoinHostPort("localhost", server.Port())),
+		})
+		require.NoError(t, err)
+		testCtx.clickHouse[name] = testClickHouse{
+			db:       server,
+			resource: database,
+		}
+		return database
+	}
+}
+
+func withElastiCacheRedis(name string, token, engineVersion string) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		redisServer, err := redis.NewTestServer(t, common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+		}, redis.TestServerPassword(token))
+		require.NoError(t, err)
+
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+			Labels: map[string]string{
+				"engine-version": engineVersion,
+			},
+		}, types.DatabaseSpecV3{
+			Protocol:      defaults.ProtocolRedis,
+			URI:           fmt.Sprintf("rediss://%s", net.JoinHostPort("localhost", redisServer.Port())),
+			DynamicLabels: dynamicLabels,
+			AWS: types.AWS{
+				Region: "us-west-1",
+				ElastiCache: types.ElastiCache{
+					ReplicationGroupID: "example-cluster",
+				},
+			},
+			// Set CA cert to pass cert validation.
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
+		})
+		require.NoError(t, err)
+		testCtx.redis[name] = testRedis{
+			db:       redisServer,
+			resource: database,
+		}
+		return database
+	}
+}
+
+func withMemoryDBRedis(name string, token, engineVersion string) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		redisServer, err := redis.NewTestServer(t, common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+		}, redis.TestServerPassword(token))
+		require.NoError(t, err)
+
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+			Labels: map[string]string{
+				"engine-version": engineVersion,
+			},
+		}, types.DatabaseSpecV3{
+			Protocol:      defaults.ProtocolRedis,
+			URI:           fmt.Sprintf("rediss://%s", net.JoinHostPort("localhost", redisServer.Port())),
+			DynamicLabels: dynamicLabels,
+			AWS: types.AWS{
+				Region: "us-west-1",
+				MemoryDB: types.MemoryDB{
+					ClusterName: "example-cluster",
+				},
+			},
+			// Set CA cert to pass cert validation.
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
+		})
+		require.NoError(t, err)
+		testCtx.redis[name] = testRedis{
+			db:       redisServer,
+			resource: database,
+		}
+		return database
+	}
+}
+
+func withAzureRedis(name string, token string) withDatabaseOption {
+	return func(t testing.TB, ctx context.Context, testCtx *testContext) types.Database {
+		redisServer, err := redis.NewTestServer(t, common.TestServerConfig{
+			Name:       name,
+			AuthClient: testCtx.authClient,
+		}, redis.TestServerPassword(token))
+		require.NoError(t, err)
+
+		database, err := types.NewDatabaseV3(types.Metadata{
+			Name: name,
+		}, types.DatabaseSpecV3{
+			Protocol:      defaults.ProtocolRedis,
+			URI:           fmt.Sprintf("rediss://%s", net.JoinHostPort("localhost", redisServer.Port())),
+			DynamicLabels: dynamicLabels,
+			Azure: types.Azure{
+				Name:       name,
+				ResourceID: "/subscriptions/sub-id/resourceGroups/group-name/providers/Microsoft.Cache/Redis/example-teleport",
+			},
+			// Set CA cert to pass cert validation.
+			TLS: types.DatabaseTLS{
+				CACert: string(testCtx.databaseCA.GetActiveKeys().TLS[0].Cert),
+			},
+		})
+		require.NoError(t, err)
+		testCtx.redis[name] = testRedis{
+			db:       redisServer,
+			resource: database,
+		}
+		return database
+	}
+}
+
+type fakeDiscoveryResourceChecker struct {
+	byName map[string]func(context.Context, types.Database) error
+}
+
+func (f *fakeDiscoveryResourceChecker) Check(ctx context.Context, database types.Database) error {
+	if len(f.byName) > 0 {
+		if check := f.byName[database.GetName()]; check != nil {
+			return trace.Wrap(check(ctx, database))
+		}
+	}
+	return nil
 }
 
 var dynamicLabels = types.LabelsToV2(map[string]types.CommandLabel{

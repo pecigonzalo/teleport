@@ -1,45 +1,58 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package suite
 
 import (
 	"context"
-	"crypto/rsa"
 	"crypto/x509/pkix"
+	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
+	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
+	protobuf "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/testing/protocmp"
+
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
+	clusterconfigpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/clusterconfig/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/clusterconfig"
+	"github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/lib/backend"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/fixtures"
-	"github.com/gravitational/teleport/lib/jwt"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh"
-	"gopkg.in/check.v1"
 )
 
 // NewTestCA returns new test authority with a test key as a public and
@@ -57,45 +70,66 @@ func NewTestCA(caType types.CertAuthType, clusterName string, privateKeys ...[]b
 // a test certificate authority
 type TestCAConfig struct {
 	Type        types.CertAuthType
-	ClusterName string
 	PrivateKeys [][]byte
 	Clock       clockwork.Clock
+	ClusterName string
+	// the below string fields default to ClusterName if left empty
+	ResourceName        string
+	SubjectOrganization string
 }
 
 // NewTestCAWithConfig generates a new certificate authority with the specified
 // configuration
+// Keep this function in-sync with lib/auth/auth.go:newKeySet().
+// TODO(jakule): reuse keystore.KeyStore interface to match newKeySet().
 func NewTestCAWithConfig(config TestCAConfig) *types.CertAuthorityV2 {
-	// privateKeys is to specify another RSA private key
-	if len(config.PrivateKeys) == 0 {
-		config.PrivateKeys = [][]byte{fixtures.PEMBytes["rsa"]}
+	var keyPEM []byte
+	var key *keys.PrivateKey
+
+	if config.ResourceName == "" {
+		config.ResourceName = config.ClusterName
 	}
-	keyBytes := config.PrivateKeys[0]
-	rsaKey, err := ssh.ParseRawPrivateKey(keyBytes)
-	if err != nil {
-		panic(err)
+	if config.SubjectOrganization == "" {
+		config.SubjectOrganization = config.ClusterName
 	}
 
-	signer, err := ssh.NewSignerFromKey(rsaKey)
-	if err != nil {
-		panic(err)
+	switch config.Type {
+	case types.DatabaseCA, types.SAMLIDPCA, types.OIDCIdPCA:
+		// These CAs only support RSA.
+		keyPEM = fixtures.PEMBytes["rsa"]
+	case types.DatabaseClientCA:
+		// The db client CA also only supports RSA, but some tests rely on it
+		// being different than the DB CA.
+		keyPEM = fixtures.PEMBytes["rsa-db-client"]
+	}
+	if len(config.PrivateKeys) > 0 {
+		// Allow test to override the private key.
+		keyPEM = config.PrivateKeys[0]
 	}
 
-	cert, err := tlsca.GenerateSelfSignedCAWithConfig(tlsca.GenerateCAConfig{
-		Signer: rsaKey.(*rsa.PrivateKey),
-		Entity: pkix.Name{
-			CommonName:   config.ClusterName,
-			Organization: []string{config.ClusterName},
-		},
-		TTL:   defaults.CATTL,
-		Clock: config.Clock,
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	publicKey, privateKey, err := jwt.GenerateKeyPair()
-	if err != nil {
-		panic(err)
+	if keyPEM != nil {
+		var err error
+		key, err = keys.ParsePrivateKey(keyPEM)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		// If config.PrivateKeys was not set and this CA does not exclusively
+		// support RSA, generate an ECDSA key. Signatures are ~10x faster than
+		// RSA and generating a new key is actually faster than parsing a PEM
+		// fixture.
+		signer, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.ECDSAP256)
+		if err != nil {
+			panic(err)
+		}
+		keyPEM, err = keys.MarshalPrivateKey(signer)
+		if err != nil {
+			panic(err)
+		}
+		key, err = keys.NewPrivateKey(signer, keyPEM)
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	ca := &types.CertAuthorityV2{
@@ -103,46 +137,82 @@ func NewTestCAWithConfig(config TestCAConfig) *types.CertAuthorityV2 {
 		SubKind: string(config.Type),
 		Version: types.V2,
 		Metadata: types.Metadata{
-			Name:      config.ClusterName,
+			Name:      config.ResourceName,
 			Namespace: apidefaults.Namespace,
 		},
 		Spec: types.CertAuthoritySpecV2{
 			Type:        config.Type,
 			ClusterName: config.ClusterName,
-			ActiveKeys: types.CAKeySet{
-				SSH: []*types.SSHKeyPair{{
-					PublicKey:  ssh.MarshalAuthorizedKey(signer.PublicKey()),
-					PrivateKey: keyBytes,
-				}},
-				TLS: []*types.TLSKeyPair{{Cert: cert, Key: keyBytes}},
-				JWT: []*types.JWTKeyPair{{
-					PublicKey:  publicKey,
-					PrivateKey: privateKey,
-				}},
-			},
 		},
 	}
-	if err := services.SyncCertAuthorityKeys(ca); err != nil {
-		panic(err)
+
+	// Add SSH keys if necessary.
+	switch config.Type {
+	case types.UserCA, types.HostCA, types.OpenSSHCA:
+		ca.Spec.ActiveKeys.SSH = []*types.SSHKeyPair{{
+			PrivateKey: keyPEM,
+			PublicKey:  key.MarshalSSHPublicKey(),
+		}}
 	}
+
+	// Add TLS keys if necessary.
+	switch config.Type {
+	case types.UserCA, types.HostCA, types.DatabaseCA, types.DatabaseClientCA, types.SAMLIDPCA, types.SPIFFECA:
+		cert, err := tlsca.GenerateSelfSignedCAWithConfig(tlsca.GenerateCAConfig{
+			Signer: key.Signer,
+			Entity: pkix.Name{
+				CommonName:   config.ClusterName,
+				Organization: []string{config.SubjectOrganization},
+			},
+			TTL:   defaults.CATTL,
+			Clock: config.Clock,
+		})
+		if err != nil {
+			panic(err)
+		}
+		ca.Spec.ActiveKeys.TLS = []*types.TLSKeyPair{{
+			Key:  keyPEM,
+			Cert: cert,
+		}}
+	}
+
+	// Add JWT keys if necessary.
+	switch config.Type {
+	case types.JWTSigner, types.OIDCIdPCA, types.SPIFFECA, types.OktaCA:
+		pubKeyPEM, err := keys.MarshalPublicKey(key.Public())
+		if err != nil {
+			panic(err)
+		}
+		ca.Spec.ActiveKeys.JWT = []*types.JWTKeyPair{{
+			PrivateKey: keyPEM,
+			PublicKey:  pubKeyPEM,
+		}}
+	}
+
 	return ca
 }
 
 // ServicesTestSuite is an acceptance test suite
 // for services. It is used for local implementations and implementations
-// using GRPC to guarantee consistency between local and remote services
+// using gRPC to guarantee consistency between local and remote services
 type ServicesTestSuite struct {
-	Access        services.Access
-	CAS           services.Trust
-	PresenceS     services.Presence
-	ProvisioningS services.Provisioner
-	WebS          services.Identity
-	ConfigS       services.ClusterConfiguration
+	Access         services.Access
+	TrustS         services.Trust
+	TrustInternalS services.TrustInternal
+	PresenceS      services.Presence
+	ProvisioningS  services.Provisioner
+	WebS           services.Identity
+	ConfigS        services.ClusterConfiguration
+	// LocalConfigS is used for local config which can only be
+	// managed by the Auth service directly (static tokens).
+	// Used by some tests to differentiate between a server
+	// and client interface.
+	LocalConfigS  services.ClusterConfiguration
 	EventsS       types.Events
 	UsersS        services.UsersService
 	RestrictionsS services.Restrictions
 	ChangesC      chan interface{}
-	Clock         clockwork.FakeClock
+	Clock         *clockwork.FakeClock
 }
 
 func (s *ServicesTestSuite) Users() services.UsersService {
@@ -152,19 +222,19 @@ func (s *ServicesTestSuite) Users() services.UsersService {
 	return s.UsersS
 }
 
-func userSlicesEqual(c *check.C, a []types.User, b []types.User) {
-	comment := check.Commentf("a: %#v b: %#v", a, b)
-	c.Assert(len(a), check.Equals, len(b), comment)
+func userSlicesEqual(t *testing.T, a []types.User, b []types.User) {
+	require.EqualValuesf(t, len(a), len(b), "a: %#v b: %#v", a, b)
+
 	sort.Sort(services.Users(a))
 	sort.Sort(services.Users(b))
+
 	for i := range a {
-		usersEqual(c, a[i], b[i])
+		usersEqual(t, a[i], b[i])
 	}
 }
 
-func usersEqual(c *check.C, a types.User, b types.User) {
-	comment := check.Commentf("a: %#v b: %#v", a, b)
-	c.Assert(services.UsersEquals(a, b), check.Equals, true, comment)
+func usersEqual(t *testing.T, a types.User, b types.User) {
+	require.True(t, services.UsersEquals(a, b), cmp.Diff(a, b))
 }
 
 func newUser(name string, roles []string) types.User {
@@ -181,52 +251,64 @@ func newUser(name string, roles []string) types.User {
 	}
 }
 
-func (s *ServicesTestSuite) UsersCRUD(c *check.C) {
+func (s *ServicesTestSuite) UsersCRUD(t *testing.T) {
 	ctx := context.Background()
-	u, err := s.WebS.GetUsers(false)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(u), check.Equals, 0)
 
-	c.Assert(s.WebS.UpsertPasswordHash("user1", []byte("hash")), check.IsNil)
-	c.Assert(s.WebS.UpsertPasswordHash("user2", []byte("hash2")), check.IsNil)
+	u, err := s.WebS.GetUsers(ctx, false)
+	require.NoError(t, err)
+	require.Empty(t, u)
 
-	u, err = s.WebS.GetUsers(false)
-	c.Assert(err, check.IsNil)
-	userSlicesEqual(c, u, []types.User{newUser("user1", nil), newUser("user2", nil)})
+	u1 := newUser("user1", nil)
+	u2 := newUser("user2", nil)
+	_, err = s.WebS.CreateUser(ctx, u1)
+	require.NoError(t, err)
+	_, err = s.WebS.CreateUser(ctx, u2)
+	require.NoError(t, err)
+	require.NoError(t, s.WebS.UpsertPassword("user1", []byte("secretpassword123")))
+	require.NoError(t, s.WebS.UpsertPassword("user2", []byte("secretpassword234")))
 
-	out, err := s.WebS.GetUser("user1", false)
-	c.Assert(err, check.IsNil)
-	usersEqual(c, out, u[0])
+	u1.SetPasswordState(types.PasswordState_PASSWORD_STATE_SET)
+	u2.SetPasswordState(types.PasswordState_PASSWORD_STATE_SET)
+
+	u, err = s.WebS.GetUsers(ctx, false)
+	require.NoError(t, err)
+	userSlicesEqual(t, u, []types.User{u1, u2})
+
+	out, err := s.WebS.GetUser(ctx, "user1", false)
+	require.NoError(t, err)
+	usersEqual(t, out, u[0])
 
 	user := newUser("user1", []string{"admin", "user"})
-	c.Assert(s.WebS.UpsertUser(user), check.IsNil)
+	user, err = s.WebS.UpsertUser(ctx, user)
+	require.NoError(t, err)
 
-	out, err = s.WebS.GetUser("user1", false)
-	c.Assert(err, check.IsNil)
-	usersEqual(c, out, user)
+	out, err = s.WebS.GetUser(ctx, "user1", false)
+	require.NoError(t, err)
+	usersEqual(t, out, user)
 
-	out, err = s.WebS.GetUser("user1", false)
-	c.Assert(err, check.IsNil)
-	usersEqual(c, out, user)
+	out, err = s.WebS.GetUser(ctx, "user1", false)
+	require.NoError(t, err)
+	usersEqual(t, out, user)
 
-	c.Assert(s.WebS.DeleteUser(ctx, "user1"), check.IsNil)
+	require.NoError(t, s.WebS.DeleteUser(ctx, "user1"))
 
-	u, err = s.WebS.GetUsers(false)
-	c.Assert(err, check.IsNil)
-	userSlicesEqual(c, u, []types.User{newUser("user2", nil)})
+	u, err = s.WebS.GetUsers(ctx, false)
+	require.NoError(t, err)
+	userSlicesEqual(t, u, []types.User{u2})
 
 	err = s.WebS.DeleteUser(ctx, "user1")
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 
 	// bad username
-	err = s.WebS.UpsertUser(newUser("", nil))
-	fixtures.ExpectBadParameter(c, err)
+	_, err = s.WebS.UpsertUser(ctx, newUser("", nil))
+	require.True(t, trace.IsBadParameter(err))
 }
 
-func (s *ServicesTestSuite) UsersExpiry(c *check.C) {
+func (s *ServicesTestSuite) UsersExpiry(t *testing.T) {
+	ctx := context.Background()
 	expiresAt := s.Clock.Now().Add(1 * time.Minute)
 
-	err := s.WebS.UpsertUser(&types.UserV2{
+	_, err := s.WebS.UpsertUser(ctx, &types.UserV2{
 		Kind:    types.KindUser,
 		Version: types.V2,
 		Metadata: types.Metadata{
@@ -236,79 +318,77 @@ func (s *ServicesTestSuite) UsersExpiry(c *check.C) {
 		},
 		Spec: types.UserSpecV2{},
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Make sure the user exists.
-	u, err := s.WebS.GetUser("foo", false)
-	c.Assert(err, check.IsNil)
-	c.Assert(u.GetName(), check.Equals, "foo")
+	u, err := s.WebS.GetUser(ctx, "foo", false)
+	require.NoError(t, err)
+	require.Equal(t, "foo", u.GetName())
 
 	s.Clock.Advance(2 * time.Minute)
 
 	// Make sure the user is now gone.
-	_, err = s.WebS.GetUser("foo", false)
-	c.Assert(err, check.NotNil)
+	_, err = s.WebS.GetUser(ctx, "foo", false)
+	require.Error(t, err)
 }
 
-func (s *ServicesTestSuite) LoginAttempts(c *check.C) {
-	user := newUser("user1", []string{"admin", "user"})
-	c.Assert(s.WebS.UpsertUser(user), check.IsNil)
+func (s *ServicesTestSuite) LoginAttempts(t *testing.T) {
+	user1 := uuid.NewString()
+
+	user := newUser(user1, []string{"admin", "user"})
+	user, err := s.WebS.UpsertUser(context.Background(), user)
+	require.NoError(t, err)
 
 	attempts, err := s.WebS.GetUserLoginAttempts(user.GetName())
-	c.Assert(err, check.IsNil)
-	c.Assert(len(attempts), check.Equals, 0)
+	require.NoError(t, err)
+	require.Empty(t, attempts)
 
 	clock := clockwork.NewFakeClock()
 	attempt1 := services.LoginAttempt{Time: clock.Now().UTC(), Success: false}
 	err = s.WebS.AddUserLoginAttempt(user.GetName(), attempt1, defaults.AttemptTTL)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	attempt2 := services.LoginAttempt{Time: clock.Now().UTC(), Success: false}
 	err = s.WebS.AddUserLoginAttempt(user.GetName(), attempt2, defaults.AttemptTTL)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	attempts, err = s.WebS.GetUserLoginAttempts(user.GetName())
-	c.Assert(err, check.IsNil)
-	c.Assert(attempts, check.DeepEquals, []services.LoginAttempt{attempt1, attempt2})
-	c.Assert(services.LastFailed(3, attempts), check.Equals, false)
-	c.Assert(services.LastFailed(2, attempts), check.Equals, true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(attempts, []services.LoginAttempt{attempt1, attempt2}))
+	require.False(t, services.LastFailed(3, attempts))
+	require.True(t, services.LastFailed(2, attempts))
 }
 
-func (s *ServicesTestSuite) CertAuthCRUD(c *check.C) {
+func (s *ServicesTestSuite) CertAuthCRUD(t *testing.T) {
 	ctx := context.Background()
 	ca := NewTestCA(types.UserCA, "example.com")
-	c.Assert(s.CAS.UpsertCertAuthority(ca), check.IsNil)
+	require.NoError(t, s.TrustS.UpsertCertAuthority(ctx, ca))
 
-	out, err := s.CAS.GetCertAuthority(ctx, ca.GetID(), true)
-	c.Assert(err, check.IsNil)
-	ca.SetResourceID(out.GetResourceID())
-	fixtures.DeepCompare(c, out, ca)
+	out, err := s.TrustS.GetCertAuthority(ctx, ca.GetID(), true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(out, ca, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	cas, err := s.CAS.GetCertAuthorities(ctx, types.UserCA, false)
-	c.Assert(err, check.IsNil)
+	cas, err := s.TrustS.GetCertAuthorities(ctx, types.UserCA, false)
+	require.NoError(t, err)
 	ca2 := ca.Clone().(*types.CertAuthorityV2)
 	ca2.Spec.ActiveKeys.SSH[0].PrivateKey = nil
-	ca2.Spec.SigningKeys = nil
 	ca2.Spec.ActiveKeys.TLS[0].Key = nil
-	ca2.Spec.TLSKeyPairs[0].Key = nil
-	ca2.Spec.ActiveKeys.JWT[0].PrivateKey = nil
-	ca2.Spec.JWTKeyPairs[0].PrivateKey = nil
-	fixtures.DeepCompare(c, cas[0], ca2)
+	require.Empty(t, cmp.Diff(cas[0], ca2, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	cas, err = s.CAS.GetCertAuthorities(ctx, types.UserCA, true)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, cas[0], ca)
+	cas, err = s.TrustS.GetCertAuthorities(ctx, types.UserCA, true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(cas[0], ca, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	cas, err = s.CAS.GetCertAuthorities(ctx, types.UserCA, true)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, cas[0], ca)
+	cas, err = s.TrustS.GetCertAuthorities(ctx, types.UserCA, true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(cas[0], ca, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	err = s.CAS.DeleteCertAuthority(*ca.ID())
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.DeleteCertAuthority(ctx, *ca.ID())
+	require.NoError(t, err)
 
 	// test compare and swap
 	ca = NewTestCA(types.UserCA, "example.com")
-	c.Assert(s.CAS.CreateCertAuthority(ca), check.IsNil)
+	require.NoError(t, s.TrustS.CreateCertAuthority(ctx, ca))
 
 	clock := clockwork.NewFakeClock()
 	newCA := *ca
@@ -320,13 +400,78 @@ func (s *ServicesTestSuite) CertAuthCRUD(c *check.C) {
 	}
 	newCA.SetRotation(rotation)
 
-	err = s.CAS.CompareAndSwapCertAuthority(&newCA, ca)
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.CompareAndSwapCertAuthority(&newCA, ca)
+	require.NoError(t, err)
 
-	out, err = s.CAS.GetCertAuthority(ctx, ca.GetID(), true)
-	c.Assert(err, check.IsNil)
-	newCA.SetResourceID(out.GetResourceID())
-	fixtures.DeepCompare(c, &newCA, out)
+	out, err = s.TrustS.GetCertAuthority(ctx, ca.GetID(), true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(&newCA, out, cmpopts.EquateApproxTime(time.Second), cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	// test conditional update
+	ca = NewTestCA(types.UserCA, "update.example.com")
+	rev, err := s.TrustInternalS.CreateCertAuthorities(ctx, ca)
+	require.NoError(t, err)
+
+	newCA = *ca
+	rotation = types.Rotation{
+		State:       types.RotationStateInProgress,
+		CurrentID:   "id1",
+		GracePeriod: types.NewDuration(time.Hour),
+		Started:     clock.Now(),
+	}
+	newCA.SetRotation(rotation)
+
+	// verify that mismatched revision does not work
+	_, err = s.TrustInternalS.UpdateCertAuthority(ctx, &newCA)
+	require.ErrorIs(t, err, backend.ErrIncorrectRevision)
+
+	// verify that revision returned by create causes update to succeed
+	newCA.SetRevision(rev)
+	_, err = s.TrustInternalS.UpdateCertAuthority(ctx, &newCA)
+	require.NoError(t, err)
+
+	out, err = s.TrustS.GetCertAuthority(ctx, ca.GetID(), true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(&newCA, out, cmpopts.EquateApproxTime(time.Second), cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	// verify 'bulk' ca operations
+
+	clusterNames := []string{
+		"foo.example.com",
+		"bar.example.com",
+		"bin.example.com",
+		"baz.example.com",
+	}
+
+	cas = nil
+	for _, cn := range clusterNames {
+		cas = append(cas, NewTestCA(types.UserCA, cn))
+	}
+
+	rev, err = s.TrustInternalS.CreateCertAuthorities(ctx, cas...)
+	require.NoError(t, err)
+
+	// verify that all CAs were created and that they all have the expected revision
+	for _, original := range cas {
+		ca, err := s.TrustS.GetCertAuthority(ctx, original.GetID(), true)
+		require.NoError(t, err)
+		require.Equal(t, rev, ca.GetRevision())
+		require.Empty(t, cmp.Diff(original, ca, cmpopts.EquateApproxTime(time.Second), cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	}
+
+	// set up bulk delete
+	var ids []types.CertAuthID
+	for _, ca := range cas {
+		ids = append(ids, ca.GetID())
+	}
+
+	require.NoError(t, s.TrustInternalS.DeleteCertAuthorities(ctx, ids...))
+
+	// verify that bulk deletion succeeded
+	for _, ca := range cas {
+		_, err := s.TrustS.GetCertAuthority(ctx, ca.GetID(), true)
+		require.True(t, trace.IsNotFound(err), "err: %v", err)
+	}
 }
 
 // NewServer creates a new server resource
@@ -339,159 +484,117 @@ func NewServer(kind, name, addr, namespace string) *types.ServerV2 {
 			Namespace: namespace,
 		},
 		Spec: types.ServerSpecV2{
-			Addr:       addr,
-			PublicAddr: addr,
+			Addr: addr,
 		},
 	}
 }
 
-func (s *ServicesTestSuite) ServerCRUD(c *check.C) {
+func (s *ServicesTestSuite) ServerCRUD(t *testing.T) {
 	ctx := context.Background()
+
 	// SSH service.
 	out, err := s.PresenceS.GetNodes(ctx, apidefaults.Namespace)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	srv := NewServer(types.KindNode, "srv1", "127.0.0.1:2022", apidefaults.Namespace)
+	srv.Spec.Hostname = "llama"
 	_, err = s.PresenceS.UpsertNode(ctx, srv)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	node, err := s.PresenceS.GetNode(ctx, srv.Metadata.Namespace, srv.GetName())
-	c.Assert(err, check.IsNil)
-	srv.SetResourceID(node.GetResourceID())
-	fixtures.DeepCompare(c, node, srv)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(node, srv, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	out, err = s.PresenceS.GetNodes(ctx, srv.Metadata.Namespace)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 1)
-	srv.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, out, []types.Server{srv})
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out, []types.Server{srv}, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	err = s.PresenceS.DeleteNode(ctx, srv.Metadata.Namespace, srv.GetName())
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	out, err = s.PresenceS.GetNodes(ctx, srv.Metadata.Namespace)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 0)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	// Proxy service.
 	out, err = s.PresenceS.GetProxies()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	proxy := NewServer(types.KindProxy, "proxy1", "127.0.0.1:2023", apidefaults.Namespace)
-	c.Assert(s.PresenceS.UpsertProxy(proxy), check.IsNil)
+	proxy.Spec.Hostname = "proxy.llama"
+	require.NoError(t, s.PresenceS.UpsertProxy(ctx, proxy))
 
 	out, err = s.PresenceS.GetProxies()
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 1)
-	proxy.SetResourceID(out[0].GetResourceID())
-	c.Assert(out, check.DeepEquals, []types.Server{proxy})
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out, []types.Server{proxy}, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	err = s.PresenceS.DeleteProxy(proxy.GetName())
-	c.Assert(err, check.IsNil)
+	err = s.PresenceS.DeleteProxy(ctx, proxy.GetName())
+	require.NoError(t, err)
 
 	out, err = s.PresenceS.GetProxies()
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 0)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	// Auth service.
 	out, err = s.PresenceS.GetAuthServers()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	auth := NewServer(types.KindAuthServer, "auth1", "127.0.0.1:2025", apidefaults.Namespace)
-	c.Assert(s.PresenceS.UpsertAuthServer(auth), check.IsNil)
+	auth.Spec.Hostname = "auth.llama"
+	require.NoError(t, s.PresenceS.UpsertAuthServer(ctx, auth))
 
 	out, err = s.PresenceS.GetAuthServers()
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 1)
-	auth.SetResourceID(out[0].GetResourceID())
-	c.Assert(out, check.DeepEquals, []types.Server{auth})
-
-	// Kubernetes service.
-	out, err = s.PresenceS.GetKubeServices(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
-
-	kube1 := NewServer(types.KindKubeService, "kube1", "10.0.0.1:3026", apidefaults.Namespace)
-	_, err = s.PresenceS.UpsertKubeServiceV2(ctx, kube1)
-	c.Assert(err, check.IsNil)
-	kube2 := NewServer(types.KindKubeService, "kube2", "10.0.0.2:3026", apidefaults.Namespace)
-	_, err = s.PresenceS.UpsertKubeServiceV2(ctx, kube2)
-	c.Assert(err, check.IsNil)
-
-	out, err = s.PresenceS.GetKubeServices(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 2)
-	kube1.SetResourceID(out[0].GetResourceID())
-	kube2.SetResourceID(out[1].GetResourceID())
-	c.Assert(out, check.DeepEquals, []types.Server{kube1, kube2})
-
-	c.Assert(s.PresenceS.DeleteKubeService(ctx, kube1.GetName()), check.IsNil)
-	out, err = s.PresenceS.GetKubeServices(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 1)
-	c.Assert(out, check.DeepEquals, []types.Server{kube2})
-
-	c.Assert(s.PresenceS.DeleteAllKubeServices(ctx), check.IsNil)
-	out, err = s.PresenceS.GetKubeServices(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 0)
-}
-
-// NewAppServer creates a new application server resource.
-func NewAppServer(name string, internalAddr string, publicAddr string) *types.ServerV2 {
-	return &types.ServerV2{
-		Kind:    types.KindAppServer,
-		Version: types.V2,
-		Metadata: types.Metadata{
-			Name:      uuid.New().String(),
-			Namespace: apidefaults.Namespace,
-		},
-		Spec: types.ServerSpecV2{
-			Apps: []*types.App{
-				{
-					Name:       name,
-					URI:        internalAddr,
-					PublicAddr: publicAddr,
-				},
-			},
-		},
-	}
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out, []types.Server{auth}, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 }
 
 // AppServerCRUD tests CRUD functionality for services.Server.
-func (s *ServicesTestSuite) AppServerCRUD(c *check.C) {
+func (s *ServicesTestSuite) AppServerCRUD(t *testing.T) {
 	ctx := context.Background()
 
-	// Create application.
-	server := NewAppServer("foo", "http://127.0.0.1:8080", "foo.example.com")
-
 	// Expect not to be returned any applications and trace.NotFound.
-	out, err := s.PresenceS.GetAppServers(ctx, apidefaults.Namespace)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	out, err := s.PresenceS.GetApplicationServers(ctx, apidefaults.Namespace)
+	require.NoError(t, err)
+	require.Empty(t, out)
+
+	// Make an app and an app server.
+	app, err := types.NewAppV3(types.Metadata{Name: "foo"},
+		types.AppSpecV3{URI: "http://127.0.0.1:8080", PublicAddr: "foo.example.com"})
+	require.NoError(t, err)
+	server, err := types.NewAppServerV3(types.Metadata{
+		Name:      app.GetName(),
+		Namespace: apidefaults.Namespace,
+	}, types.AppServerSpecV3{
+		Hostname: "localhost",
+		HostID:   uuid.New().String(),
+		App:      app,
+	})
+	require.NoError(t, err)
 
 	// Upsert application.
-	_, err = s.PresenceS.UpsertAppServer(ctx, server)
-	c.Assert(err, check.IsNil)
+	_, err = s.PresenceS.UpsertApplicationServer(ctx, server)
+	require.NoError(t, err)
 
 	// Check again, expect a single application to be found.
-	out, err = s.PresenceS.GetAppServers(ctx, server.GetNamespace())
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 1)
-	server.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, []types.Server{server}, out)
+	out, err = s.PresenceS.GetApplicationServers(ctx, server.GetNamespace())
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff([]types.AppServer{server}, out, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	// Remove the application.
-	err = s.PresenceS.DeleteAppServer(ctx, server.Metadata.Namespace, server.GetName())
-	c.Assert(err, check.IsNil)
+	err = s.PresenceS.DeleteApplicationServer(ctx, server.Metadata.Namespace, server.GetHostID(), server.GetName())
+	require.NoError(t, err)
 
 	// Now expect no applications to be returned.
-	out, err = s.PresenceS.GetAppServers(ctx, server.Metadata.Namespace)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 0)
+	out, err = s.PresenceS.GetApplicationServers(ctx, server.Metadata.Namespace)
+	require.NoError(t, err)
+	require.Empty(t, out)
 }
 
 func newReverseTunnel(clusterName string, dialAddrs []string) *types.ReverseTunnelV2 {
@@ -509,61 +612,70 @@ func newReverseTunnel(clusterName string, dialAddrs []string) *types.ReverseTunn
 	}
 }
 
-func (s *ServicesTestSuite) ReverseTunnelsCRUD(c *check.C) {
-	out, err := s.PresenceS.GetReverseTunnels()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+func (s *ServicesTestSuite) ReverseTunnelsCRUD(t *testing.T) {
+	ctx := context.Background()
+
+	out, err := s.PresenceS.GetReverseTunnels(ctx)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	tunnel := newReverseTunnel("example.com", []string{"example.com:2023"})
-	c.Assert(s.PresenceS.UpsertReverseTunnel(tunnel), check.IsNil)
+	require.NoError(t, s.PresenceS.UpsertReverseTunnel(ctx, tunnel))
 
-	out, err = s.PresenceS.GetReverseTunnels()
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.HasLen, 1)
-	tunnel.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, out, []types.ReverseTunnel{tunnel})
+	out, err = s.PresenceS.GetReverseTunnels(ctx)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out, []types.ReverseTunnel{tunnel}, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	err = s.PresenceS.DeleteReverseTunnel(tunnel.Spec.ClusterName)
-	c.Assert(err, check.IsNil)
+	err = s.PresenceS.DeleteReverseTunnel(ctx, tunnel.Spec.ClusterName)
+	require.NoError(t, err)
 
-	out, err = s.PresenceS.GetReverseTunnels()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	out, err = s.PresenceS.GetReverseTunnels(ctx)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
-	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("", []string{"127.0.0.1:1234"}))
-	fixtures.ExpectBadParameter(c, err)
+	err = s.PresenceS.UpsertReverseTunnel(ctx, newReverseTunnel("", []string{"127.0.0.1:1234"}))
+	require.True(t, trace.IsBadParameter(err))
 
-	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("example.com", []string{""}))
-	fixtures.ExpectBadParameter(c, err)
+	err = s.PresenceS.UpsertReverseTunnel(ctx, newReverseTunnel("example.com", []string{""}))
+	require.True(t, trace.IsBadParameter(err))
 
-	err = s.PresenceS.UpsertReverseTunnel(newReverseTunnel("example.com", []string{}))
-	fixtures.ExpectBadParameter(c, err)
+	err = s.PresenceS.UpsertReverseTunnel(ctx, newReverseTunnel("example.com", []string{}))
+	require.True(t, trace.IsBadParameter(err))
 }
 
-func (s *ServicesTestSuite) PasswordHashCRUD(c *check.C) {
-	_, err := s.WebS.GetPasswordHash("user1")
-	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("%#v", err))
+func (s *ServicesTestSuite) PasswordCRUD(t *testing.T) {
+	ctx := context.Background()
 
-	err = s.WebS.UpsertPasswordHash("user1", []byte("hello123"))
-	c.Assert(err, check.IsNil)
+	_, err := s.WebS.GetPasswordHash("user1")
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("%#v", err))
+
+	u1 := newUser("user1", nil)
+	_, err = s.WebS.CreateUser(ctx, u1)
+	require.NoError(t, err)
+
+	err = s.WebS.UpsertPassword("user1", []byte("secretpassword123"))
+	require.NoError(t, err)
 
 	hash, err := s.WebS.GetPasswordHash("user1")
-	c.Assert(err, check.IsNil)
-	c.Assert(hash, check.DeepEquals, []byte("hello123"))
+	require.NoError(t, err)
+	err = bcrypt.CompareHashAndPassword(hash, []byte("secretpassword123"))
+	require.NoError(t, err)
 
-	err = s.WebS.UpsertPasswordHash("user1", []byte("hello321"))
-	c.Assert(err, check.IsNil)
+	err = s.WebS.UpsertPassword("user1", []byte("secretpassword321"))
+	require.NoError(t, err)
 
 	hash, err = s.WebS.GetPasswordHash("user1")
-	c.Assert(err, check.IsNil)
-	c.Assert(hash, check.DeepEquals, []byte("hello321"))
+	require.NoError(t, err)
+	err = bcrypt.CompareHashAndPassword(hash, []byte("secretpassword321"))
+	require.NoError(t, err)
 }
 
-func (s *ServicesTestSuite) WebSessionCRUD(c *check.C) {
+func (s *ServicesTestSuite) WebSessionCRUD(t *testing.T) {
 	ctx := context.Background()
 	req := types.GetWebSessionRequest{User: "user1", SessionID: "sid1"}
 	_, err := s.WebS.WebSessions().Get(ctx, req)
-	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("%#v", err))
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("%#v", err))
 
 	dt := s.Clock.Now().Add(1 * time.Minute)
 	ws, err := types.NewWebSession("sid1", types.KindWebSession,
@@ -573,14 +685,14 @@ func (s *ServicesTestSuite) WebSessionCRUD(c *check.C) {
 			Priv:    []byte("priv123"),
 			Expires: dt,
 		})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = s.WebS.WebSessions().Upsert(ctx, ws)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	out, err := s.WebS.WebSessions().Get(ctx, req)
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, ws)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(out, ws, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	ws1, err := types.NewWebSession("sid1", types.KindWebSession,
 		types.WebSessionSpecV2{
@@ -589,48 +701,45 @@ func (s *ServicesTestSuite) WebSessionCRUD(c *check.C) {
 			Priv:    []byte("priv321"),
 			Expires: dt,
 		})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = s.WebS.WebSessions().Upsert(ctx, ws1)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	out2, err := s.WebS.WebSessions().Get(ctx, req)
-	c.Assert(err, check.IsNil)
-	c.Assert(out2, check.DeepEquals, ws1)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(out2, ws1, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	c.Assert(s.WebS.WebSessions().Delete(ctx, types.DeleteWebSessionRequest{
+	require.NoError(t, s.WebS.WebSessions().Delete(ctx, types.DeleteWebSessionRequest{
 		User:      req.User,
 		SessionID: req.SessionID,
-	}), check.IsNil)
+	}))
 
 	_, err = s.WebS.WebSessions().Get(ctx, req)
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 }
 
-func (s *ServicesTestSuite) TokenCRUD(c *check.C) {
+func (s *ServicesTestSuite) TokenCRUD(t *testing.T) {
 	ctx := context.Background()
 	_, err := s.ProvisioningS.GetToken(ctx, "token")
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 
-	t, err := types.NewProvisionToken("token", types.SystemRoles{types.RoleAuth, types.RoleNode}, time.Time{})
-	c.Assert(err, check.IsNil)
+	tok, err := types.NewProvisionToken("token", types.SystemRoles{types.RoleAuth, types.RoleNode}, time.Time{})
+	require.NoError(t, err)
 
-	c.Assert(s.ProvisioningS.UpsertToken(ctx, t), check.IsNil)
+	require.NoError(t, s.ProvisioningS.UpsertToken(ctx, tok))
 
 	token, err := s.ProvisioningS.GetToken(ctx, "token")
-	c.Assert(err, check.IsNil)
-	c.Assert(token.GetRoles().Include(types.RoleAuth), check.Equals, true)
-	c.Assert(token.GetRoles().Include(types.RoleNode), check.Equals, true)
-	c.Assert(token.GetRoles().Include(types.RoleProxy), check.Equals, false)
-	diff := s.Clock.Now().UTC().Add(defaults.ProvisioningTokenTTL).Second() - token.Expiry().Second()
-	if diff > 1 {
-		c.Fatalf("expected diff to be within one second, got %v instead", diff)
-	}
+	require.NoError(t, err)
+	require.True(t, token.GetRoles().Include(types.RoleAuth))
+	require.True(t, token.GetRoles().Include(types.RoleNode))
+	require.False(t, token.GetRoles().Include(types.RoleProxy))
+	require.Equal(t, time.Time{}, token.Expiry())
 
-	c.Assert(s.ProvisioningS.DeleteToken(ctx, "token"), check.IsNil)
+	require.NoError(t, s.ProvisioningS.DeleteToken(ctx, "token"))
 
 	_, err = s.ProvisioningS.GetToken(ctx, "token")
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 
 	// check tokens backwards compatibility and marshal/unmarshal
 	expiry := time.Now().UTC().Add(time.Hour)
@@ -640,57 +749,57 @@ func (s *ServicesTestSuite) TokenCRUD(c *check.C) {
 		Expires: expiry,
 	}
 	v2, err := types.NewProvisionToken(v1.Token, v1.Roles, expiry)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Tokens in different version formats are backwards and forwards
 	// compatible
-	fixtures.DeepCompare(c, v1.V2(), v2)
-	fixtures.DeepCompare(c, v2.V1(), v1)
+	require.Empty(t, cmp.Diff(v1.V2(), v2))
+	require.Empty(t, cmp.Diff(v2.V1(), v1))
 
 	// Marshal V1, unmarshal V2
 	data, err := services.MarshalProvisionToken(v2, services.WithVersion(types.V1))
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	out, err := services.UnmarshalProvisionToken(data)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, out, v2)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(out, v2))
 
 	// Test delete all tokens
-	t, err = types.NewProvisionToken("token1", types.SystemRoles{types.RoleAuth, types.RoleNode}, time.Time{})
-	c.Assert(err, check.IsNil)
-	c.Assert(s.ProvisioningS.UpsertToken(ctx, t), check.IsNil)
+	tok, err = types.NewProvisionToken("token1", types.SystemRoles{types.RoleAuth, types.RoleNode}, time.Time{})
+	require.NoError(t, err)
+	require.NoError(t, s.ProvisioningS.UpsertToken(ctx, tok))
 
-	t, err = types.NewProvisionToken("token2", types.SystemRoles{types.RoleAuth, types.RoleNode}, time.Time{})
-	c.Assert(err, check.IsNil)
-	c.Assert(s.ProvisioningS.UpsertToken(ctx, t), check.IsNil)
+	tok, err = types.NewProvisionToken("token2", types.SystemRoles{types.RoleAuth, types.RoleNode}, time.Time{})
+	require.NoError(t, err)
+	require.NoError(t, s.ProvisioningS.UpsertToken(ctx, tok))
 
 	tokens, err := s.ProvisioningS.GetTokens(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(tokens, check.HasLen, 2)
+	require.NoError(t, err)
+	require.Len(t, tokens, 2)
 
 	err = s.ProvisioningS.DeleteAllTokens()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	tokens, err = s.ProvisioningS.GetTokens(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(tokens, check.HasLen, 0)
+	require.NoError(t, err)
+	require.Empty(t, tokens)
 }
 
-func (s *ServicesTestSuite) RolesCRUD(c *check.C) {
+func (s *ServicesTestSuite) RolesCRUD(t *testing.T) {
 	ctx := context.Background()
 
 	out, err := s.Access.GetRoles(ctx)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
-	role := types.RoleV5{
+	role := types.RoleV6{
 		Kind:    types.KindRole,
-		Version: types.V3,
+		Version: types.V6,
 		Metadata: types.Metadata{
 			Name:      "role1",
 			Namespace: apidefaults.Namespace,
 		},
-		Spec: types.RoleSpecV5{
+		Spec: types.RoleSpecV6{
 			Options: types.RoleOptions{
 				MaxSessionTTL:     types.Duration(time.Hour),
 				PortForwarding:    types.NewBoolOption(true),
@@ -714,55 +823,27 @@ func (s *ServicesTestSuite) RolesCRUD(c *check.C) {
 		},
 	}
 
-	err = s.Access.UpsertRole(ctx, &role)
-	c.Assert(err, check.IsNil)
+	upserted, err := s.Access.UpsertRole(ctx, &role)
+	require.NoError(t, err)
 	rout, err := s.Access.GetRole(ctx, role.Metadata.Name)
-	c.Assert(err, check.IsNil)
-	role.SetResourceID(rout.GetResourceID())
-	fixtures.DeepCompare(c, rout, &role)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, rout, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	role.Spec.Allow.Logins = []string{"bob"}
-	err = s.Access.UpsertRole(ctx, &role)
-	c.Assert(err, check.IsNil)
+	upserted, err = s.Access.UpsertRole(ctx, &role)
+	require.NoError(t, err)
 	rout, err = s.Access.GetRole(ctx, role.Metadata.Name)
-	c.Assert(err, check.IsNil)
-	role.SetResourceID(rout.GetResourceID())
-	c.Assert(rout, check.DeepEquals, &role)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, rout, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	err = s.Access.DeleteRole(ctx, role.Metadata.Name)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	_, err = s.Access.GetRole(ctx, role.Metadata.Name)
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 }
 
-func (s *ServicesTestSuite) NamespacesCRUD(c *check.C) {
-	out, err := s.PresenceS.GetNamespaces()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
-
-	ns := types.Namespace{
-		Kind:    types.KindNamespace,
-		Version: types.V2,
-		Metadata: types.Metadata{
-			Name:      apidefaults.Namespace,
-			Namespace: apidefaults.Namespace,
-		},
-	}
-	err = s.PresenceS.UpsertNamespace(ns)
-	c.Assert(err, check.IsNil)
-	nsout, err := s.PresenceS.GetNamespace(ns.Metadata.Name)
-	c.Assert(err, check.IsNil)
-	c.Assert(nsout, check.DeepEquals, &ns)
-
-	err = s.PresenceS.DeleteNamespace(ns.Metadata.Name)
-	c.Assert(err, check.IsNil)
-
-	_, err = s.PresenceS.GetNamespace(ns.Metadata.Name)
-	fixtures.ExpectNotFound(c, err)
-}
-
-func (s *ServicesTestSuite) SAMLCRUD(c *check.C) {
+func (s *ServicesTestSuite) SAMLCRUD(t *testing.T) {
 	ctx := context.Background()
 	connector := &types.SAMLConnectorV2{
 		Kind:    types.KindSAML,
@@ -772,6 +853,7 @@ func (s *ServicesTestSuite) SAMLCRUD(c *check.C) {
 			Namespace: apidefaults.Namespace,
 		},
 		Spec: types.SAMLConnectorSpecV2{
+			Display:                  "SAML",
 			Issuer:                   "http://example.com",
 			SSO:                      "https://example.com/saml/sso",
 			AssertionConsumerService: "https://localhost/acs",
@@ -787,43 +869,158 @@ func (s *ServicesTestSuite) SAMLCRUD(c *check.C) {
 			},
 		},
 	}
-	err := services.ValidateSAMLConnector(connector)
-	c.Assert(err, check.IsNil)
-	err = s.WebS.UpsertSAMLConnector(ctx, connector)
-	c.Assert(err, check.IsNil)
-	out, err := s.WebS.GetSAMLConnector(ctx, connector.GetName(), true)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, out, connector)
+	err := services.ValidateSAMLConnector(connector, nil)
+	require.NoError(t, err)
+	upserted, err := s.WebS.UpsertSAMLConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, connector, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	connectors, err := s.WebS.GetSAMLConnectors(ctx, true)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, []types.SAMLConnector{connector}, connectors)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff([]types.SAMLConnector{connector}, connectors, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	out2, err := s.WebS.GetSAMLConnector(ctx, connector.GetName(), false)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	connectorNoSecrets := *connector
 	connectorNoSecrets.Spec.SigningKeyPair.PrivateKey = ""
-	fixtures.DeepCompare(c, out2, &connectorNoSecrets)
+	require.Empty(t, cmp.Diff(out2, &connectorNoSecrets, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	connectorsNoSecrets, err := s.WebS.GetSAMLConnectors(ctx, false)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, []types.SAMLConnector{&connectorNoSecrets}, connectorsNoSecrets)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff([]types.SAMLConnector{&connectorNoSecrets}, connectorsNoSecrets, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	err = s.WebS.DeleteSAMLConnector(ctx, connector.GetName())
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = s.WebS.DeleteSAMLConnector(ctx, connector.GetName())
-	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("expected not found, got %T", err))
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("expected not found, got %T", err))
 
 	_, err = s.WebS.GetSAMLConnector(ctx, connector.GetName(), true)
-	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("expected not found, got %T", err))
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("expected not found, got %T", err))
+
+	created, err := s.WebS.CreateSAMLConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, created, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, created.GetRevision())
+
+	connector = utils.CloneProtoMsg(connector)
+	connector.SetRevision(uuid.NewString())
+	connector.SetDisplay("not-saml")
+
+	updated, err := s.WebS.UpdateSAMLConnector(ctx, connector)
+	require.ErrorIs(t, err, backend.ErrIncorrectRevision)
+	require.Nil(t, updated)
+
+	connector.SetRevision(created.GetRevision())
+	updated, err = s.WebS.UpdateSAMLConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, updated, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, updated.GetRevision())
+	require.NotEqual(t, created.GetRevision(), updated.GetRevision())
+	require.NotEqual(t, created.GetDisplay(), updated.GetDisplay())
+
+	connector = utils.CloneProtoMsg(connector)
+	connector.SetRevision(uuid.NewString())
+	connector.SetDisplay("llama")
+
+	upserted, err = s.WebS.UpsertSAMLConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, upserted, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, upserted.GetRevision())
+	require.NotEqual(t, updated.GetRevision(), upserted.GetRevision())
+	require.NotEqual(t, updated.GetDisplay(), upserted.GetDisplay())
 }
 
-func (s *ServicesTestSuite) TunnelConnectionsCRUD(c *check.C) {
+func (s *ServicesTestSuite) OIDCCRUD(t *testing.T) {
+	ctx := context.Background()
+	connector := &types.OIDCConnectorV3{
+		Kind:    types.KindOIDC,
+		Version: types.V2,
+		Metadata: types.Metadata{
+			Name:      "oidc1",
+			Namespace: apidefaults.Namespace,
+		},
+		Spec: types.OIDCConnectorSpecV3{
+			Display:      "SAML",
+			IssuerURL:    "http://example.com",
+			ClientID:     "aaa",
+			ClientSecret: "bbb",
+			RedirectURLs: []string{"https://localhost:3080/v1/webapi/github/callback"},
+			ClaimsToRoles: []types.ClaimMapping{
+				{
+					Claim: "abc",
+					Value: "xyz",
+					Roles: []string{"admin"},
+				},
+			},
+		},
+	}
+
+	upserted, err := s.WebS.UpsertOIDCConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, connector, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	connectors, err := s.WebS.GetOIDCConnectors(ctx, true)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff([]types.OIDCConnector{connector}, connectors, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	out2, err := s.WebS.GetOIDCConnector(ctx, connector.GetName(), false)
+	require.NoError(t, err)
+	connectorNoSecrets := *connector
+	connectorNoSecrets.Spec.ClientSecret = ""
+	require.Empty(t, cmp.Diff(out2, &connectorNoSecrets, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	connectorsNoSecrets, err := s.WebS.GetOIDCConnectors(ctx, false)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff([]types.OIDCConnector{&connectorNoSecrets}, connectorsNoSecrets, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	err = s.WebS.DeleteOIDCConnector(ctx, connector.GetName())
+	require.NoError(t, err)
+
+	err = s.WebS.DeleteOIDCConnector(ctx, connector.GetName())
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("expected not found, got %T", err))
+
+	_, err = s.WebS.GetOIDCConnector(ctx, connector.GetName(), true)
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("expected not found, got %T", err))
+
+	created, err := s.WebS.CreateOIDCConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, created, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, created.GetRevision())
+
+	connector = utils.CloneProtoMsg(connector)
+	connector.SetRevision(uuid.NewString())
+	connector.SetDisplay("not-saml")
+
+	updated, err := s.WebS.UpdateOIDCConnector(ctx, connector)
+	require.ErrorIs(t, err, backend.ErrIncorrectRevision)
+	require.Nil(t, updated)
+
+	connector.SetRevision(created.GetRevision())
+	updated, err = s.WebS.UpdateOIDCConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, updated, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, updated.GetRevision())
+	require.NotEqual(t, created.GetRevision(), updated.GetRevision())
+	require.NotEqual(t, created.GetDisplay(), updated.GetDisplay())
+
+	connector = utils.CloneProtoMsg(connector)
+	connector.SetRevision(uuid.NewString())
+	connector.SetDisplay("llama")
+
+	upserted, err = s.WebS.UpsertOIDCConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, upserted, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, upserted.GetRevision())
+	require.NotEqual(t, updated.GetRevision(), upserted.GetRevision())
+	require.NotEqual(t, updated.GetDisplay(), upserted.GetDisplay())
+}
+
+func (s *ServicesTestSuite) TunnelConnectionsCRUD(t *testing.T) {
 	clusterName := "example.com"
-	out, err := s.PresenceS.GetTunnelConnections(clusterName)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	out, err := s.TrustS.GetTunnelConnections(clusterName)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
 	dt := s.Clock.Now()
 	conn, err := types.NewTunnelConnection("conn1", types.TunnelConnectionSpecV2{
@@ -831,63 +1028,60 @@ func (s *ServicesTestSuite) TunnelConnectionsCRUD(c *check.C) {
 		ProxyName:     "p1",
 		LastHeartbeat: dt,
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	err = s.PresenceS.UpsertTunnelConnection(conn)
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.UpsertTunnelConnection(conn)
+	require.NoError(t, err)
 
-	out, err = s.PresenceS.GetTunnelConnections(clusterName)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 1)
-	conn.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, out[0], conn)
+	out, err = s.TrustS.GetTunnelConnections(clusterName)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out[0], conn, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	out, err = s.PresenceS.GetAllTunnelConnections()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 1)
-	fixtures.DeepCompare(c, out[0], conn)
+	out, err = s.TrustS.GetAllTunnelConnections()
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out[0], conn, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	dt = dt.Add(time.Hour)
 	conn.SetLastHeartbeat(dt)
 
-	err = s.PresenceS.UpsertTunnelConnection(conn)
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.UpsertTunnelConnection(conn)
+	require.NoError(t, err)
 
-	out, err = s.PresenceS.GetTunnelConnections(clusterName)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 1)
-	conn.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, out[0], conn)
+	out, err = s.TrustS.GetTunnelConnections(clusterName)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out[0], conn, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	err = s.PresenceS.DeleteAllTunnelConnections()
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.DeleteAllTunnelConnections()
+	require.NoError(t, err)
 
-	out, err = s.PresenceS.GetTunnelConnections(clusterName)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	out, err = s.TrustS.GetTunnelConnections(clusterName)
+	require.NoError(t, err)
+	require.Empty(t, out)
 
-	err = s.PresenceS.DeleteAllTunnelConnections()
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.DeleteAllTunnelConnections()
+	require.NoError(t, err)
 
 	// test delete individual connection
-	err = s.PresenceS.UpsertTunnelConnection(conn)
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.UpsertTunnelConnection(conn)
+	require.NoError(t, err)
 
-	out, err = s.PresenceS.GetTunnelConnections(clusterName)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 1)
-	conn.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, out[0], conn)
+	out, err = s.TrustS.GetTunnelConnections(clusterName)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out[0], conn, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	err = s.PresenceS.DeleteTunnelConnection(clusterName, conn.GetName())
-	c.Assert(err, check.IsNil)
+	err = s.TrustS.DeleteTunnelConnection(clusterName, conn.GetName())
+	require.NoError(t, err)
 
-	out, err = s.PresenceS.GetTunnelConnections(clusterName)
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	out, err = s.TrustS.GetTunnelConnections(clusterName)
+	require.NoError(t, err)
+	require.Empty(t, out)
 }
 
-func (s *ServicesTestSuite) GithubConnectorCRUD(c *check.C) {
+func (s *ServicesTestSuite) GithubConnectorCRUD(t *testing.T) {
 	ctx := context.Background()
 	connector := &types.GithubConnectorV3{
 		Kind:    types.KindGithubConnector,
@@ -900,134 +1094,183 @@ func (s *ServicesTestSuite) GithubConnectorCRUD(c *check.C) {
 			ClientID:     "aaa",
 			ClientSecret: "bbb",
 			RedirectURL:  "https://localhost:3080/v1/webapi/github/callback",
-			Display:      "Github",
-			TeamsToLogins: []types.TeamMapping{
+			Display:      "GitHub",
+			TeamsToRoles: []types.TeamRolesMapping{
 				{
 					Organization: "gravitational",
 					Team:         "admins",
-					Logins:       []string{"admin"},
-					KubeGroups:   []string{"system:masters"},
+					Roles:        []string{"admin"},
 				},
 			},
 		},
 	}
 	err := connector.CheckAndSetDefaults()
-	c.Assert(err, check.IsNil)
-	err = s.WebS.UpsertGithubConnector(ctx, connector)
-	c.Assert(err, check.IsNil)
-	out, err := s.WebS.GetGithubConnector(ctx, connector.GetName(), true)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, out, connector)
+	require.NoError(t, err)
+	upserted, err := s.WebS.UpsertGithubConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, connector, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	connectors, err := s.WebS.GetGithubConnectors(ctx, true)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, []types.GithubConnector{connector}, connectors)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff([]types.GithubConnector{connector}, connectors, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	out2, err := s.WebS.GetGithubConnector(ctx, connector.GetName(), false)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	connectorNoSecrets := *connector
 	connectorNoSecrets.Spec.ClientSecret = ""
-	fixtures.DeepCompare(c, out2, &connectorNoSecrets)
+	require.Empty(t, cmp.Diff(out2, &connectorNoSecrets, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	connectorsNoSecrets, err := s.WebS.GetGithubConnectors(ctx, false)
-	c.Assert(err, check.IsNil)
-	fixtures.DeepCompare(c, []types.GithubConnector{&connectorNoSecrets}, connectorsNoSecrets)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff([]types.GithubConnector{&connectorNoSecrets}, connectorsNoSecrets, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	err = s.WebS.DeleteGithubConnector(ctx, connector.GetName())
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = s.WebS.DeleteGithubConnector(ctx, connector.GetName())
-	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("expected not found, got %T", err))
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("expected not found, got %T", err))
 
 	_, err = s.WebS.GetGithubConnector(ctx, connector.GetName(), true)
-	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("expected not found, got %T", err))
-}
+	require.True(t, trace.IsNotFound(err), fmt.Sprintf("expected not found, got %T", err))
 
-func (s *ServicesTestSuite) RemoteClustersCRUD(c *check.C) {
-	clusterName := "example.com"
-	out, err := s.PresenceS.GetRemoteClusters()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
+	created, err := s.WebS.CreateGithubConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, created, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, created.GetRevision())
 
-	rc, err := types.NewRemoteCluster(clusterName)
-	c.Assert(err, check.IsNil)
+	connector = utils.CloneProtoMsg(connector)
+	connector.SetRevision(uuid.NewString())
+	connector.SetDisplay("not-github")
 
-	rc.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
+	updated, err := s.WebS.UpdateGithubConnector(ctx, connector)
+	require.ErrorIs(t, err, backend.ErrIncorrectRevision)
+	require.Nil(t, updated)
 
-	err = s.PresenceS.CreateRemoteCluster(rc)
-	c.Assert(err, check.IsNil)
+	connector.SetRevision(created.GetRevision())
+	updated, err = s.WebS.UpdateGithubConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, updated, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, updated.GetRevision())
+	require.NotEqual(t, created.GetRevision(), updated.GetRevision())
+	require.NotEqual(t, created.GetDisplay(), updated.GetDisplay())
 
-	err = s.PresenceS.CreateRemoteCluster(rc)
-	fixtures.ExpectAlreadyExists(c, err)
+	connector = utils.CloneProtoMsg(connector)
+	connector.SetRevision(uuid.NewString())
+	connector.SetDisplay("llama")
 
-	out, err = s.PresenceS.GetRemoteClusters()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 1)
-	rc.SetResourceID(out[0].GetResourceID())
-	fixtures.DeepCompare(c, out[0], rc)
-
-	err = s.PresenceS.DeleteAllRemoteClusters()
-	c.Assert(err, check.IsNil)
-
-	out, err = s.PresenceS.GetRemoteClusters()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 0)
-
-	// test delete individual connection
-	err = s.PresenceS.CreateRemoteCluster(rc)
-	c.Assert(err, check.IsNil)
-
-	out, err = s.PresenceS.GetRemoteClusters()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(out), check.Equals, 1)
-	fixtures.DeepCompare(c, out[0], rc)
-
-	err = s.PresenceS.DeleteRemoteCluster(clusterName)
-	c.Assert(err, check.IsNil)
-
-	err = s.PresenceS.DeleteRemoteCluster(clusterName)
-	fixtures.ExpectNotFound(c, err)
+	upserted, err = s.WebS.UpsertGithubConnector(ctx, connector)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(connector, upserted, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+	require.NotEmpty(t, upserted.GetRevision())
+	require.NotEqual(t, updated.GetRevision(), upserted.GetRevision())
+	require.NotEqual(t, updated.GetDisplay(), upserted.GetDisplay())
 }
 
 // AuthPreference tests authentication preference service
-func (s *ServicesTestSuite) AuthPreference(c *check.C) {
+func (s *ServicesTestSuite) AuthPreference(t *testing.T) {
 	ctx := context.Background()
 	ap, err := types.NewAuthPreferenceFromConfigFile(types.AuthPreferenceSpecV2{
-		Type:                  "local",
-		SecondFactor:          "otp",
+		Type:                  constants.Local,
+		SecondFactor:          constants.SecondFactorOTP,
 		DisconnectExpiredCert: types.NewBoolOption(true),
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	err = s.ConfigS.SetAuthPreference(ctx, ap)
-	c.Assert(err, check.IsNil)
+	// Create a preference when one does not exist.
+	created, err := s.ConfigS.CreateAuthPreference(ctx, ap)
+	require.NoError(t, err)
+	require.NotEmpty(t, created.GetRevision())
 
+	// Validate the created preference matches the retrieve preference.
 	gotAP, err := s.ConfigS.GetAuthPreference(ctx)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(ap, gotAP), cmpopts.IgnoreFields(types.Metadata{}, "Revision"))
 
-	c.Assert(gotAP.GetType(), check.Equals, "local")
-	c.Assert(gotAP.GetSecondFactor(), check.Equals, constants.SecondFactorOTP)
-	c.Assert(gotAP.GetDisconnectExpiredCert(), check.Equals, true)
+	// Validate that update only works if the revision matches.
+	gotAP.SetRevision("123")
+	_, err = s.ConfigS.UpdateAuthPreference(ctx, gotAP)
+	require.True(t, trace.IsCompareFailed(err))
+
+	// Validate that upserting overwrites the value regardless of the revision.
+	upserted, err := s.ConfigS.UpsertAuthPreference(ctx, gotAP)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, gotAP), cmpopts.IgnoreFields(types.Metadata{}, "Revision"))
+}
+
+// AccessGraphSettings tests access graph settings service
+func (s *ServicesTestSuite) AccessGraphSettings(t *testing.T) {
+	ctx := context.Background()
+	ap, err := clusterconfig.NewAccessGraphSettings(
+		&clusterconfigpb.AccessGraphSettingsSpec{
+			SecretsScanConfig: clusterconfigpb.AccessGraphSecretsScanConfig_ACCESS_GRAPH_SECRETS_SCAN_CONFIG_DISABLED,
+		},
+	)
+	require.NoError(t, err)
+
+	created, err := s.ConfigS.CreateAccessGraphSettings(ctx, ap)
+	require.NoError(t, err)
+	require.NotEmpty(t, created.GetMetadata().GetRevision())
+
+	// Validate the created preference matches the retrieve preference.
+	got, err := s.ConfigS.GetAccessGraphSettings(ctx)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(ap, got, protocmp.Transform()))
+
+	// Validate that update only works if the revision matches.
+	got.Metadata.Revision = "123"
+	_, err = s.ConfigS.UpdateAccessGraphSettings(ctx, got)
+	require.True(t, trace.IsCompareFailed(err))
+
+	// Validate that upserting overwrites the value regardless of the revision.
+	upserted, err := s.ConfigS.UpsertAccessGraphSettings(ctx, protobuf.Clone(got).(*clusterconfigpb.AccessGraphSettings))
+	require.NoError(t, err)
+	require.NotEmpty(t, upserted.GetMetadata().GetRevision())
+	upserted.Metadata.Revision = ""
+	got.Metadata.Revision = ""
+	require.Empty(t, cmp.Diff(upserted, got, protocmp.Transform()))
 }
 
 // SessionRecordingConfig tests session recording configuration.
-func (s *ServicesTestSuite) SessionRecordingConfig(c *check.C) {
+func (s *ServicesTestSuite) SessionRecordingConfig(t *testing.T) {
 	ctx := context.Background()
 	recConfig, err := types.NewSessionRecordingConfigFromConfigFile(types.SessionRecordingConfigSpecV2{
 		Mode: types.RecordAtProxy,
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	err = s.ConfigS.SetSessionRecordingConfig(ctx, recConfig)
-	c.Assert(err, check.IsNil)
+	// Validate updating a non-existent config fails.
+	_, err = s.ConfigS.UpdateSessionRecordingConfig(ctx, recConfig)
+	require.True(t, trace.IsCompareFailed(err))
 
-	gotrecConfig, err := s.ConfigS.GetSessionRecordingConfig(ctx)
-	c.Assert(err, check.IsNil)
+	// Create a config when one does not exist.
+	created, err := s.ConfigS.CreateSessionRecordingConfig(ctx, recConfig)
+	require.NoError(t, err)
+	require.NotEmpty(t, created.GetRevision())
 
-	c.Assert(gotrecConfig.GetMode(), check.Equals, types.RecordAtProxy)
+	// Validate the created config matches the retrieve config.
+	gotRecConfig, err := s.ConfigS.GetSessionRecordingConfig(ctx)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(recConfig, gotRecConfig, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	// Validate that update only works if the revision matches.
+	gotRecConfig.SetRevision("123")
+	_, err = s.ConfigS.UpdateSessionRecordingConfig(ctx, gotRecConfig)
+	require.True(t, trace.IsCompareFailed(err))
+
+	created.SetMode(types.RecordAtNode)
+
+	updated, err := s.ConfigS.UpdateSessionRecordingConfig(ctx, created)
+	require.NoError(t, err)
+	require.Equal(t, types.RecordAtNode, updated.GetMode())
+
+	// Validate that upserting overwrites the value regardless of the revision.
+	upserted, err := s.ConfigS.UpsertSessionRecordingConfig(ctx, gotRecConfig)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, gotRecConfig, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
 }
 
-func (s *ServicesTestSuite) StaticTokens(c *check.C) {
+func (s *ServicesTestSuite) StaticTokens(t *testing.T) {
 	// set static tokens
 	staticTokens, err := types.NewStaticTokens(types.StaticTokensSpecV2{
 		StaticTokens: []types.ProvisionTokenV1{
@@ -1038,21 +1281,20 @@ func (s *ServicesTestSuite) StaticTokens(c *check.C) {
 			},
 		},
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = s.ConfigS.SetStaticTokens(staticTokens)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	out, err := s.ConfigS.GetStaticTokens()
-	c.Assert(err, check.IsNil)
-	staticTokens.SetResourceID(out.GetResourceID())
-	fixtures.DeepCompare(c, staticTokens, out)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(staticTokens, out, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	err = s.ConfigS.DeleteStaticTokens()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	_, err = s.ConfigS.GetStaticTokens()
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 }
 
 // Options provides functional arguments
@@ -1082,51 +1324,110 @@ func CollectOptions(opts ...Option) Options {
 }
 
 // ClusterName tests cluster name.
-func (s *ServicesTestSuite) ClusterName(c *check.C, opts ...Option) {
+func (s *ServicesTestSuite) ClusterName(t *testing.T, opts ...Option) {
 	clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 		ClusterName: "example.com",
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	err = s.ConfigS.SetClusterName(clusterName)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	gotName, err := s.ConfigS.GetClusterName()
-	c.Assert(err, check.IsNil)
-	clusterName.SetResourceID(gotName.GetResourceID())
-	fixtures.DeepCompare(c, clusterName, gotName)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(clusterName, gotName, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
 	err = s.ConfigS.DeleteClusterName()
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	_, err = s.ConfigS.GetClusterName()
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 
 	err = s.ConfigS.UpsertClusterName(clusterName)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	gotName, err = s.ConfigS.GetClusterName()
-	c.Assert(err, check.IsNil)
-	clusterName.SetResourceID(gotName.GetResourceID())
-	fixtures.DeepCompare(c, clusterName, gotName)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(clusterName, gotName, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 }
 
 // ClusterNetworkingConfig tests cluster networking configuration.
-func (s *ServicesTestSuite) ClusterNetworkingConfig(c *check.C) {
+func (s *ServicesTestSuite) ClusterNetworkingConfig(t *testing.T) {
 	ctx := context.Background()
 	netConfig, err := types.NewClusterNetworkingConfigFromConfigFile(types.ClusterNetworkingConfigSpecV2{
 		ClientIdleTimeout: types.NewDuration(17 * time.Second),
 		KeepAliveCountMax: 3000,
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	err = s.ConfigS.SetClusterNetworkingConfig(ctx, netConfig)
-	c.Assert(err, check.IsNil)
+	// Validate updating a non-existent config fails.
+	_, err = s.ConfigS.UpdateClusterNetworkingConfig(ctx, netConfig)
+	require.True(t, trace.IsCompareFailed(err))
 
+	// Create a config when one does not exist.
+	created, err := s.ConfigS.CreateClusterNetworkingConfig(ctx, netConfig)
+	require.NoError(t, err)
+	require.NotEmpty(t, created.GetRevision())
+
+	// Validate the created config matches the retrieve config.
 	gotNetConfig, err := s.ConfigS.GetClusterNetworkingConfig(ctx)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(netConfig, gotNetConfig, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 
-	c.Assert(gotNetConfig.GetClientIdleTimeout(), check.Equals, 17*time.Second)
-	c.Assert(gotNetConfig.GetKeepAliveCountMax(), check.Equals, int64(3000))
+	// Validate that update only works if the revision matches.
+	gotNetConfig.SetRevision("123")
+	_, err = s.ConfigS.UpdateClusterNetworkingConfig(ctx, gotNetConfig)
+	require.True(t, trace.IsCompareFailed(err))
+
+	created.SetKeepAliveCountMax(10)
+
+	updated, err := s.ConfigS.UpdateClusterNetworkingConfig(ctx, created)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), updated.GetKeepAliveCountMax())
+
+	// Validate that upserting overwrites the value regardless of the revision.
+	upserted, err := s.ConfigS.UpsertClusterNetworkingConfig(ctx, gotNetConfig)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, gotNetConfig, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+}
+
+// ClusterAuditConfig tests cluster audit configuration.
+func (s *ServicesTestSuite) ClusterAuditConfig(t *testing.T) {
+	ctx := context.Background()
+	auditConfig, err := types.NewClusterAuditConfig(types.ClusterAuditConfigSpecV2{
+		Region:                  "us-east-1",
+		EnableContinuousBackups: true,
+	})
+	require.NoError(t, err)
+
+	// Validate updating a non-existent config fails.
+	_, err = s.ConfigS.UpdateClusterAuditConfig(ctx, auditConfig)
+	require.True(t, trace.IsCompareFailed(err))
+
+	// Create a config when one does not exist.
+	created, err := s.ConfigS.CreateClusterAuditConfig(ctx, auditConfig)
+	require.NoError(t, err)
+	require.NotEmpty(t, created.GetRevision())
+
+	// Validate the created config matches the retrieve config.
+	gotAuditConfig, err := s.ConfigS.GetClusterAuditConfig(ctx)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(auditConfig, gotAuditConfig, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
+
+	// Validate that update only works if the revision matches.
+	gotAuditConfig.SetRevision("123")
+	_, err = s.ConfigS.UpdateClusterAuditConfig(ctx, gotAuditConfig)
+	require.True(t, trace.IsCompareFailed(err))
+
+	created.SetRegion("us-west-2")
+
+	updated, err := s.ConfigS.UpdateClusterAuditConfig(ctx, created)
+	require.NoError(t, err)
+	require.Equal(t, "us-west-2", updated.Region())
+
+	// Validate that upserting overwrites the value regardless of the revision.
+	upserted, err := s.ConfigS.UpsertClusterAuditConfig(ctx, gotAuditConfig)
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(upserted, gotAuditConfig, cmpopts.IgnoreFields(types.Metadata{}, "Revision")))
 }
 
 // sem wrapper is a helper for overriding the keepalive
@@ -1140,7 +1441,7 @@ func (w *semWrapper) KeepAliveSemaphoreLease(ctx context.Context, lease types.Se
 	return w.keepAlive(ctx, lease)
 }
 
-func (s *ServicesTestSuite) SemaphoreFlakiness(c *check.C) {
+func (s *ServicesTestSuite) SemaphoreFlakiness(t *testing.T) {
 	ctx := context.Background()
 	const renewals = 3
 	// wrap our services.Semaphores instance to cause two out of three lease
@@ -1161,7 +1462,7 @@ func (s *ServicesTestSuite) SemaphoreFlakiness(c *check.C) {
 
 	cfg := services.SemaphoreLockConfig{
 		Service:  wrapper,
-		Expiry:   time.Second,
+		Expiry:   time.Hour,
 		TickRate: time.Millisecond * 50,
 		Params: types.AcquireSemaphoreRequest{
 			SemaphoreKind: types.SemaphoreKindConnection,
@@ -1174,17 +1475,16 @@ func (s *ServicesTestSuite) SemaphoreFlakiness(c *check.C) {
 	defer cancel()
 
 	lock, err := services.AcquireSemaphoreLock(cancelCtx, cfg)
-	c.Assert(err, check.IsNil)
-	go lock.KeepAlive(cancelCtx)
+	require.NoError(t, err)
 
 	for i := 0; i < renewals; i++ {
 		select {
 		case <-lock.Renewed():
 			continue
 		case <-lock.Done():
-			c.Fatalf("Lost semaphore lock: %v", lock.Wait())
-		case <-time.After(time.Second):
-			c.Fatalf("Timeout waiting for renewals")
+			t.Fatalf("Lost semaphore lock: %v", lock.Wait())
+		case <-time.After(time.Second * 30):
+			t.Fatalf("Timeout waiting for renewals")
 		}
 	}
 }
@@ -1196,7 +1496,7 @@ func (s *ServicesTestSuite) SemaphoreFlakiness(c *check.C) {
 // fairly small.  Semaphores aren't cheap and the auth server is expected
 // to start returning "too much contention" errors at around 100 concurrent
 // attempts.
-func (s *ServicesTestSuite) SemaphoreContention(c *check.C) {
+func (s *ServicesTestSuite) SemaphoreContention(t *testing.T) {
 	ctx := context.Background()
 	const locks int64 = 50
 	const iters = 5
@@ -1206,7 +1506,7 @@ func (s *ServicesTestSuite) SemaphoreContention(c *check.C) {
 			Expiry:  time.Hour,
 			Params: types.AcquireSemaphoreRequest{
 				SemaphoreKind: types.SemaphoreKindConnection,
-				SemaphoreName: "alice",
+				SemaphoreName: fmt.Sprintf("sem-%d", i), // avoid overlap between iterations
 				MaxLeases:     locks,
 			},
 		}
@@ -1214,28 +1514,27 @@ func (s *ServicesTestSuite) SemaphoreContention(c *check.C) {
 		// context-based cancellation is needed to cleanup the
 		// background keepalive activity.
 		cancelCtx, cancel := context.WithCancel(ctx)
-		var wg sync.WaitGroup
+		acquireErrs := make(chan error, locks)
 		for i := int64(0); i < locks; i++ {
-			wg.Add(1)
 			go func() {
-				defer wg.Done()
-				lock, err := services.AcquireSemaphoreLock(cancelCtx, cfg)
-				c.Assert(err, check.IsNil)
-				go lock.KeepAlive(cancelCtx)
+				_, err := services.AcquireSemaphoreLock(cancelCtx, cfg)
+				acquireErrs <- err
 			}()
 		}
-		wg.Wait()
+		for i := int64(0); i < locks; i++ {
+			require.NoError(t, <-acquireErrs)
+		}
 		cancel()
-		c.Assert(s.PresenceS.DeleteSemaphore(ctx, types.SemaphoreFilter{
+		require.NoError(t, s.PresenceS.DeleteSemaphore(ctx, types.SemaphoreFilter{
 			SemaphoreKind: cfg.Params.SemaphoreKind,
 			SemaphoreName: cfg.Params.SemaphoreName,
-		}), check.IsNil)
+		}))
 	}
 }
 
 // SemaphoreConcurrency verifies that a large number of concurrent
 // acquisitions result in the correct number of successful acquisitions.
-func (s *ServicesTestSuite) SemaphoreConcurrency(c *check.C) {
+func (s *ServicesTestSuite) SemaphoreConcurrency(t *testing.T) {
 	ctx := context.Background()
 	const maxLeases int64 = 20
 	const attempts int64 = 200
@@ -1259,9 +1558,8 @@ func (s *ServicesTestSuite) SemaphoreConcurrency(c *check.C) {
 	for i := int64(0); i < attempts; i++ {
 		wg.Add(1)
 		go func() {
-			lock, err := services.AcquireSemaphoreLock(cancelCtx, cfg)
+			_, err := services.AcquireSemaphoreLock(cancelCtx, cfg)
 			if err == nil {
-				go lock.KeepAlive(cancelCtx)
 				atomic.AddInt64(&success, 1)
 			} else {
 				atomic.AddInt64(&failure, 1)
@@ -1270,14 +1568,15 @@ func (s *ServicesTestSuite) SemaphoreConcurrency(c *check.C) {
 		}()
 	}
 	wg.Wait()
-	c.Assert(atomic.LoadInt64(&success), check.Equals, maxLeases)
-	c.Assert(atomic.LoadInt64(&failure), check.Equals, attempts-maxLeases)
+	require.Equal(t, maxLeases, atomic.LoadInt64(&success))
+	require.Equal(t, attempts-maxLeases, atomic.LoadInt64(&failure))
 }
 
 // SemaphoreLock verifies correct functionality of the basic
 // semaphore lock scenarios.
-func (s *ServicesTestSuite) SemaphoreLock(c *check.C) {
+func (s *ServicesTestSuite) SemaphoreLock(t *testing.T) {
 	ctx := context.Background()
+
 	cfg := services.SemaphoreLockConfig{
 		Service: s.PresenceS,
 		Expiry:  time.Hour,
@@ -1290,53 +1589,51 @@ func (s *ServicesTestSuite) SemaphoreLock(c *check.C) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	lock, err := services.AcquireSemaphoreLock(cancelCtx, cfg)
-	c.Assert(err, check.IsNil)
-	go lock.KeepAlive(cancelCtx)
+	require.NoError(t, err)
 
 	// MaxLeases is 1, so second acquire op fails.
 	_, err = services.AcquireSemaphoreLock(cancelCtx, cfg)
-	fixtures.ExpectLimitExceeded(c, err)
+	require.True(t, trace.IsLimitExceeded(err))
 
 	// Lock is successfully released.
 	lock.Stop()
-	c.Assert(lock.Wait(), check.IsNil)
+	require.NoError(t, lock.Wait())
 
 	// Acquire new lock with short expiry
 	// and high tick rate to verify renewals.
 	cfg.Expiry = time.Second
 	cfg.TickRate = time.Millisecond * 50
 	lock, err = services.AcquireSemaphoreLock(cancelCtx, cfg)
-	c.Assert(err, check.IsNil)
-	go lock.KeepAlive(cancelCtx)
+	require.NoError(t, err)
 
 	timeout := time.After(time.Second)
 
 	for i := 0; i < 3; i++ {
 		select {
 		case <-lock.Done():
-			c.Fatalf("Unexpected lock failure: %v", lock.Wait())
+			t.Fatalf("Unexpected lock failure: %v", lock.Wait())
 		case <-timeout:
-			c.Fatalf("Timeout waiting for lock renewal %d", i)
+			t.Fatalf("Timeout waiting for lock renewal %d", i)
 		case <-lock.Renewed():
 		}
 	}
 
 	// forcibly delete the semaphore
-	c.Assert(s.PresenceS.DeleteSemaphore(ctx, types.SemaphoreFilter{
+	require.NoError(t, s.PresenceS.DeleteSemaphore(ctx, types.SemaphoreFilter{
 		SemaphoreKind: cfg.Params.SemaphoreKind,
 		SemaphoreName: cfg.Params.SemaphoreName,
-	}), check.IsNil)
+	}))
 
 	select {
 	case <-lock.Done():
-		fixtures.ExpectNotFound(c, lock.Wait())
+		require.True(t, trace.IsNotFound(lock.Wait()))
 	case <-time.After(time.Millisecond * 1500):
-		c.Errorf("timeout waiting for semaphore lock failure")
+		t.Errorf("timeout waiting for semaphore lock failure")
 	}
 }
 
 // Events tests various events variations
-func (s *ServicesTestSuite) Events(c *check.C) {
+func (s *ServicesTestSuite) Events(t *testing.T) {
 	ctx := context.Background()
 	testCases := []eventTest{
 		{
@@ -1347,17 +1644,17 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 			},
 			crud: func(context.Context) types.Resource {
 				ca := NewTestCA(types.UserCA, "example.com")
-				c.Assert(s.CAS.UpsertCertAuthority(ca), check.IsNil)
+				require.NoError(t, s.TrustS.UpsertCertAuthority(ctx, ca))
 
-				out, err := s.CAS.GetCertAuthority(ctx, *ca.ID(), true)
-				c.Assert(err, check.IsNil)
+				out, err := s.TrustS.GetCertAuthority(ctx, *ca.ID(), true)
+				require.NoError(t, err)
 
-				c.Assert(s.CAS.DeleteCertAuthority(*ca.ID()), check.IsNil)
+				require.NoError(t, s.TrustS.DeleteCertAuthority(ctx, *ca.ID()))
 				return out
 			},
 		},
 	}
-	s.runEventsTests(c, testCases)
+	s.runEventsTests(t, testCases, types.Watch{Kinds: eventsTestKinds(testCases)})
 
 	testCases = []eventTest{
 		{
@@ -1368,17 +1665,17 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 			},
 			crud: func(context.Context) types.Resource {
 				ca := NewTestCA(types.UserCA, "example.com")
-				c.Assert(s.CAS.UpsertCertAuthority(ca), check.IsNil)
+				require.NoError(t, s.TrustS.UpsertCertAuthority(ctx, ca))
 
-				out, err := s.CAS.GetCertAuthority(ctx, *ca.ID(), false)
-				c.Assert(err, check.IsNil)
+				out, err := s.TrustS.GetCertAuthority(ctx, *ca.ID(), false)
+				require.NoError(t, err)
 
-				c.Assert(s.CAS.DeleteCertAuthority(*ca.ID()), check.IsNil)
+				require.NoError(t, s.TrustS.DeleteCertAuthority(ctx, *ca.ID()))
 				return out
 			},
 		},
 	}
-	s.runEventsTests(c, testCases)
+	s.runEventsTests(t, testCases, types.Watch{Kinds: eventsTestKinds(testCases)})
 
 	testCases = []eventTest{
 		{
@@ -1388,43 +1685,17 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 			},
 			crud: func(context.Context) types.Resource {
 				expires := time.Now().UTC().Add(time.Hour)
-				t, err := types.NewProvisionToken("token",
+				tok, err := types.NewProvisionToken("token",
 					types.SystemRoles{types.RoleAuth, types.RoleNode}, expires)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				c.Assert(s.ProvisioningS.UpsertToken(ctx, t), check.IsNil)
+				require.NoError(t, s.ProvisioningS.UpsertToken(ctx, tok))
 
 				token, err := s.ProvisioningS.GetToken(ctx, "token")
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				c.Assert(s.ProvisioningS.DeleteToken(ctx, "token"), check.IsNil)
+				require.NoError(t, s.ProvisioningS.DeleteToken(ctx, "token"))
 				return token
-			},
-		},
-		{
-			name: "Namespace",
-			kind: types.WatchKind{
-				Kind: types.KindNamespace,
-			},
-			crud: func(context.Context) types.Resource {
-				ns := types.Namespace{
-					Kind:    types.KindNamespace,
-					Version: types.V2,
-					Metadata: types.Metadata{
-						Name:      "testnamespace",
-						Namespace: apidefaults.Namespace,
-					},
-				}
-				err := s.PresenceS.UpsertNamespace(ns)
-				c.Assert(err, check.IsNil)
-
-				out, err := s.PresenceS.GetNamespace(ns.Metadata.Name)
-				c.Assert(err, check.IsNil)
-
-				err = s.PresenceS.DeleteNamespace(ns.Metadata.Name)
-				c.Assert(err, check.IsNil)
-
-				return out
 			},
 		},
 		{
@@ -1442,16 +1713,16 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 						},
 					},
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				err = s.ConfigS.SetStaticTokens(staticTokens)
-				c.Assert(err, check.IsNil)
+				err = s.LocalConfigS.SetStaticTokens(staticTokens)
+				require.NoError(t, err)
 
-				out, err := s.ConfigS.GetStaticTokens()
-				c.Assert(err, check.IsNil)
+				out, err := s.LocalConfigS.GetStaticTokens()
+				require.NoError(t, err)
 
-				err = s.ConfigS.DeleteStaticTokens()
-				c.Assert(err, check.IsNil)
+				err = s.LocalConfigS.DeleteStaticTokens()
+				require.NoError(t, err)
 
 				return out
 			},
@@ -1462,7 +1733,7 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 				Kind: types.KindRole,
 			},
 			crud: func(context.Context) types.Resource {
-				role, err := types.NewRoleV3("role1", types.RoleSpecV5{
+				role, err := types.NewRole("role1", types.RoleSpecV6{
 					Options: types.RoleOptions{
 						MaxSessionTTL: types.Duration(time.Hour),
 					},
@@ -1472,16 +1743,16 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 					},
 					Deny: types.RoleConditions{},
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				err = s.Access.UpsertRole(ctx, role)
-				c.Assert(err, check.IsNil)
+				_, err = s.Access.UpsertRole(ctx, role)
+				require.NoError(t, err)
 
 				out, err := s.Access.GetRole(ctx, role.GetName())
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.Access.DeleteRole(ctx, role.GetName())
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				return out
 			},
@@ -1492,14 +1763,14 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 				Kind: types.KindUser,
 			},
 			crud: func(context.Context) types.Resource {
-				user := newUser("user1", []string{"admin"})
-				err := s.Users().UpsertUser(user)
-				c.Assert(err, check.IsNil)
+				user := newUser("user1", []string{constants.DefaultImplicitRole})
+				user, err := s.Users().UpsertUser(ctx, user)
+				require.NoError(t, err)
 
-				out, err := s.Users().GetUser(user.GetName(), false)
-				c.Assert(err, check.IsNil)
+				out, err := s.Users().GetUser(ctx, user.GetName(), false)
+				require.NoError(t, err)
 
-				c.Assert(s.Users().DeleteUser(ctx, user.GetName()), check.IsNil)
+				require.NoError(t, s.Users().DeleteUser(ctx, user.GetName()))
 				return out
 			},
 		},
@@ -1512,13 +1783,13 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 				srv := NewServer(types.KindNode, "srv1", "127.0.0.1:2022", apidefaults.Namespace)
 
 				_, err := s.PresenceS.UpsertNode(ctx, srv)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				out, err := s.PresenceS.GetNodes(ctx, srv.Metadata.Namespace)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.PresenceS.DeleteAllNodes(ctx, srv.Metadata.Namespace)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				return out[0]
 			},
@@ -1531,14 +1802,14 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 			crud: func(context.Context) types.Resource {
 				srv := NewServer(types.KindProxy, "srv1", "127.0.0.1:2022", apidefaults.Namespace)
 
-				err := s.PresenceS.UpsertProxy(srv)
-				c.Assert(err, check.IsNil)
+				err := s.PresenceS.UpsertProxy(ctx, srv)
+				require.NoError(t, err)
 
 				out, err := s.PresenceS.GetProxies()
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.PresenceS.DeleteAllProxies()
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				return out[0]
 			},
@@ -1554,16 +1825,16 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 					ProxyName:     "p1",
 					LastHeartbeat: time.Now().UTC(),
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				err = s.PresenceS.UpsertTunnelConnection(conn)
-				c.Assert(err, check.IsNil)
+				err = s.TrustS.UpsertTunnelConnection(conn)
+				require.NoError(t, err)
 
-				out, err := s.PresenceS.GetTunnelConnections("example.com")
-				c.Assert(err, check.IsNil)
+				out, err := s.TrustS.GetTunnelConnections("example.com")
+				require.NoError(t, err)
 
-				err = s.PresenceS.DeleteAllTunnelConnections()
-				c.Assert(err, check.IsNil)
+				err = s.TrustS.DeleteAllTunnelConnections()
+				require.NoError(t, err)
 
 				return out[0]
 			},
@@ -1575,13 +1846,13 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 			},
 			crud: func(context.Context) types.Resource {
 				tunnel := newReverseTunnel("example.com", []string{"example.com:2023"})
-				c.Assert(s.PresenceS.UpsertReverseTunnel(tunnel), check.IsNil)
+				require.NoError(t, s.PresenceS.UpsertReverseTunnel(ctx, tunnel))
 
-				out, err := s.PresenceS.GetReverseTunnels()
-				c.Assert(err, check.IsNil)
+				out, err := s.PresenceS.GetReverseTunnels(context.Background())
+				require.NoError(t, err)
 
-				err = s.PresenceS.DeleteReverseTunnel(tunnel.Spec.ClusterName)
-				c.Assert(err, check.IsNil)
+				err = s.PresenceS.DeleteReverseTunnel(ctx, tunnel.Spec.ClusterName)
+				require.NoError(t, err)
 
 				return out[0]
 			},
@@ -1591,59 +1862,47 @@ func (s *ServicesTestSuite) Events(c *check.C) {
 			kind: types.WatchKind{
 				Kind: types.KindRemoteCluster,
 			},
-			crud: func(context.Context) types.Resource {
+			crud: func(ctx context.Context) types.Resource {
 				rc, err := types.NewRemoteCluster("example.com")
 				rc.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
-				c.Assert(err, check.IsNil)
-				c.Assert(s.PresenceS.CreateRemoteCluster(rc), check.IsNil)
+				require.NoError(t, err)
+				_, err = s.TrustS.CreateRemoteCluster(ctx, rc)
+				require.NoError(t, err)
 
-				out, err := s.PresenceS.GetRemoteClusters()
-				c.Assert(err, check.IsNil)
+				out, err := s.TrustS.GetRemoteClusters(ctx)
+				require.NoError(t, err)
 
-				err = s.PresenceS.DeleteRemoteCluster(rc.GetName())
-				c.Assert(err, check.IsNil)
+				err = s.TrustS.DeleteRemoteCluster(ctx, rc.GetName())
+				require.NoError(t, err)
 
 				return out[0]
 			},
 		},
 	}
-	s.runEventsTests(c, testCases)
+	// this also tests the partial success mode by requesting an unknown kind
+	s.runEventsTests(t, testCases, types.Watch{
+		Kinds:               append(eventsTestKinds(testCases), types.WatchKind{Kind: "unknown"}),
+		AllowPartialSuccess: true,
+	})
 
-	// Namespace with a name
-	testCases = []eventTest{
-		{
-			name: "Namespace with a name",
-			kind: types.WatchKind{
-				Kind: types.KindNamespace,
-				Name: "shmest",
-			},
-			crud: func(context.Context) types.Resource {
-				ns := types.Namespace{
-					Kind:    types.KindNamespace,
-					Version: types.V2,
-					Metadata: types.Metadata{
-						Name:      "shmest",
-						Namespace: apidefaults.Namespace,
-					},
-				}
-				err := s.PresenceS.UpsertNamespace(ns)
-				c.Assert(err, check.IsNil)
+	// tests that a watch fails given an unknown kind when the partial success mode is not enabled
+	s.runUnknownEventsTest(t, types.Watch{Kinds: []types.WatchKind{
+		{Kind: types.KindNamespace},
+		{Kind: "unknown"},
+	}})
 
-				out, err := s.PresenceS.GetNamespace(ns.Metadata.Name)
-				c.Assert(err, check.IsNil)
-
-				err = s.PresenceS.DeleteNamespace(ns.Metadata.Name)
-				c.Assert(err, check.IsNil)
-
-				return out
-			},
+	// tests that a watch fails if all given kinds are unknown even if the success mode is enabled
+	s.runUnknownEventsTest(t, types.Watch{
+		Kinds: []types.WatchKind{
+			{Kind: "unrecognized"},
+			{Kind: "unidentified"},
 		},
-	}
-	s.runEventsTests(c, testCases)
+		AllowPartialSuccess: true,
+	})
 }
 
 // EventsClusterConfig tests cluster config resource events
-func (s *ServicesTestSuite) EventsClusterConfig(c *check.C) {
+func (s *ServicesTestSuite) EventsClusterConfig(t *testing.T) {
 	testCases := []eventTest{
 		{
 			name: "Cluster name",
@@ -1654,16 +1913,16 @@ func (s *ServicesTestSuite) EventsClusterConfig(c *check.C) {
 				clusterName, err := services.NewClusterNameWithRandomID(types.ClusterNameSpecV2{
 					ClusterName: "example.com",
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.ConfigS.UpsertClusterName(clusterName)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				out, err := s.ConfigS.GetClusterName()
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.ConfigS.DeleteClusterName()
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 				return out
 			},
 		},
@@ -1679,16 +1938,16 @@ func (s *ServicesTestSuite) EventsClusterConfig(c *check.C) {
 					AuditSessionsURI: "file:///home/log",
 					AuditEventsURI:   []string{"dynamodb://audit_table_name", "file:///home/test/log"},
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.ConfigS.SetClusterAuditConfig(ctx, auditConfig)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				out, err := s.ConfigS.GetClusterAuditConfig(ctx)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.ConfigS.DeleteClusterAuditConfig(ctx)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 				return out
 			},
 		},
@@ -1701,16 +1960,16 @@ func (s *ServicesTestSuite) EventsClusterConfig(c *check.C) {
 				netConfig, err := types.NewClusterNetworkingConfigFromConfigFile(types.ClusterNetworkingConfigSpecV2{
 					ClientIdleTimeout: types.Duration(5 * time.Second),
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				err = s.ConfigS.SetClusterNetworkingConfig(ctx, netConfig)
-				c.Assert(err, check.IsNil)
+				_, err = s.ConfigS.UpsertClusterNetworkingConfig(ctx, netConfig)
+				require.NoError(t, err)
 
 				out, err := s.ConfigS.GetClusterNetworkingConfig(ctx)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.ConfigS.DeleteClusterNetworkingConfig(ctx)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 				return out
 			},
 		},
@@ -1723,33 +1982,33 @@ func (s *ServicesTestSuite) EventsClusterConfig(c *check.C) {
 				recConfig, err := types.NewSessionRecordingConfigFromConfigFile(types.SessionRecordingConfigSpecV2{
 					Mode: types.RecordAtProxySync,
 				})
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
-				err = s.ConfigS.SetSessionRecordingConfig(ctx, recConfig)
-				c.Assert(err, check.IsNil)
+				_, err = s.ConfigS.UpsertSessionRecordingConfig(ctx, recConfig)
+				require.NoError(t, err)
 
 				out, err := s.ConfigS.GetSessionRecordingConfig(ctx)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 
 				err = s.ConfigS.DeleteSessionRecordingConfig(ctx)
-				c.Assert(err, check.IsNil)
+				require.NoError(t, err)
 				return out
 			},
 		},
 	}
-	s.runEventsTests(c, testCases)
+	s.runEventsTests(t, testCases, types.Watch{Kinds: eventsTestKinds(testCases)})
 }
 
 // NetworkRestrictions tests network restrictions.
-func (s *ServicesTestSuite) NetworkRestrictions(c *check.C, opts ...Option) {
+func (s *ServicesTestSuite) NetworkRestrictions(t *testing.T, opts ...Option) {
 	ctx := context.Background()
 
 	// blank slate, should be get/delete should fail
 	_, err := s.RestrictionsS.GetNetworkRestrictions(ctx)
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 
 	err = s.RestrictionsS.DeleteNetworkRestrictions(ctx)
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 
 	allow := []types.AddressCondition{
 		{CIDR: "10.0.1.0/24"},
@@ -1766,37 +2025,39 @@ func (s *ServicesTestSuite) NetworkRestrictions(c *check.C, opts ...Option) {
 
 	// set and make sure we get it back
 	err = s.RestrictionsS.SetNetworkRestrictions(ctx, expected)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	actual, err := s.RestrictionsS.GetNetworkRestrictions(ctx)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
-	fixtures.DeepCompare(c, expected.GetAllow(), actual.GetAllow())
-	fixtures.DeepCompare(c, expected.GetDeny(), actual.GetDeny())
+	require.Empty(t, cmp.Diff(expected.GetAllow(), actual.GetAllow()))
+	require.Empty(t, cmp.Diff(expected.GetDeny(), actual.GetDeny()))
 
 	// now delete should work ok and get should fail again
 	err = s.RestrictionsS.DeleteNetworkRestrictions(ctx)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = s.RestrictionsS.DeleteNetworkRestrictions(ctx)
-	fixtures.ExpectNotFound(c, err)
+	require.True(t, trace.IsNotFound(err))
 }
 
-func (s *ServicesTestSuite) runEventsTests(c *check.C, testCases []eventTest) {
+func (s *ServicesTestSuite) runEventsTests(t *testing.T, testCases []eventTest, watch types.Watch) {
 	ctx := context.Background()
-	w, err := s.EventsS.NewWatcher(ctx, types.Watch{
-		Kinds: eventsTestKinds(testCases),
-	})
-	c.Assert(err, check.IsNil)
+	w, err := s.EventsS.NewWatcher(ctx, watch)
+	require.NoError(t, err)
 	defer w.Close()
 
 	select {
 	case event := <-w.Events():
-		c.Assert(event.Type, check.Equals, types.OpInit)
+		require.Equal(t, types.OpInit, event.Type)
+		watchStatus, ok := event.Resource.(types.WatchStatus)
+		require.True(t, ok)
+		expectedKinds := eventsTestKinds(testCases)
+		require.Equal(t, expectedKinds, watchStatus.GetKinds())
 	case <-w.Done():
-		c.Fatalf("Watcher exited with error %v", w.Error())
+		t.Fatalf("Watcher exited with error %v", w.Error())
 	case <-time.After(2 * time.Second):
-		c.Fatalf("Timeout waiting for init event")
+		t.Fatalf("Timeout waiting for init event")
 	}
 
 	// filter out all events that could have been inserted
@@ -1805,20 +2066,20 @@ skiploop:
 	for {
 		select {
 		case event := <-w.Events():
-			log.Debugf("Skipping pre-test event: %v", event)
+			slog.DebugContext(ctx, "Skipping pre-test event", "event", event)
 			continue skiploop
 		default:
 			break skiploop
 		case <-w.Done():
-			c.Fatalf("Watcher exited with error %v", w.Error())
+			t.Fatalf("Watcher exited with error %v", w.Error())
 		}
 	}
 
 	for _, tc := range testCases {
-		c.Logf("test case %q", tc.name)
+		t.Logf("test case %q", tc.name)
 		resource := tc.crud(ctx)
 
-		ExpectResource(c, w, 3*time.Second, resource)
+		ExpectResource(t, w, 3*time.Second, resource)
 
 		meta := resource.GetMetadata()
 		header := &types.ResourceHeader{
@@ -1830,9 +2091,27 @@ skiploop:
 				Namespace: meta.Namespace,
 			},
 		}
-		// delete events don't have IDs yet
-		header.SetResourceID(0)
-		ExpectDeleteResource(c, w, 3*time.Second, header)
+		ExpectDeleteResource(t, w, 3*time.Second, header)
+	}
+}
+
+func (s *ServicesTestSuite) runUnknownEventsTest(t *testing.T, watch types.Watch) {
+	ctx := context.Background()
+	w, err := s.EventsS.NewWatcher(ctx, watch)
+	if err != nil {
+		// depending on the implementation of EventsS, it might fail here immediately
+		// or later before returning the first event from the watcher.
+		return
+	}
+	defer w.Close()
+
+	select {
+	case <-w.Events():
+		t.Fatal("unexpected event from watcher that is supposed to fail")
+	case <-w.Done():
+		require.Error(t, w.Error())
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timeout waiting for error from watcher")
 	}
 }
 
@@ -1851,50 +2130,57 @@ func eventsTestKinds(tests []eventTest) []types.WatchKind {
 }
 
 // ExpectResource expects a Put event of a certain resource
-func ExpectResource(c *check.C, w types.Watcher, timeout time.Duration, resource types.Resource) {
+func ExpectResource(t *testing.T, w types.Watcher, timeout time.Duration, resource types.Resource) {
 	timeoutC := time.After(timeout)
 waitLoop:
 	for {
 		select {
 		case <-timeoutC:
-			c.Fatalf("Timeout waiting for event")
+			t.Fatalf("Timeout waiting for event")
 		case <-w.Done():
-			c.Fatalf("Watcher exited with error %v", w.Error())
+			t.Fatalf("Watcher exited with error %v", w.Error())
 		case event := <-w.Events():
 			if event.Type != types.OpPut {
-				log.Debugf("Skipping event %+v", event)
+				slog.DebugContext(context.Background(), "Skipping event", "event", event)
 				continue
 			}
-			if resource.GetResourceID() > event.Resource.GetResourceID() {
-				log.Debugf("Skipping stale event %v %v %v %v, latest object version is %v", event.Type, event.Resource.GetKind(), event.Resource.GetName(), event.Resource.GetResourceID(), resource.GetResourceID())
-				continue waitLoop
-			}
 			if resource.GetName() != event.Resource.GetName() || resource.GetKind() != event.Resource.GetKind() || resource.GetSubKind() != event.Resource.GetSubKind() {
-				log.Debugf("Skipping event %v resource %v, expecting %v", event.Type, event.Resource.GetMetadata(), event.Resource.GetMetadata())
+				slog.DebugContext(context.Background(), "Skipping event", "event", event)
 				continue waitLoop
 			}
-			fixtures.DeepCompare(c, resource, event.Resource)
+			require.Empty(t, cmp.Diff(resource, event.Resource))
 			break waitLoop
 		}
 	}
 }
 
 // ExpectDeleteResource expects a delete event of a certain kind
-func ExpectDeleteResource(c *check.C, w types.Watcher, timeout time.Duration, resource types.Resource) {
+func ExpectDeleteResource(t *testing.T, w types.Watcher, timeout time.Duration, resource types.Resource) {
 	timeoutC := time.After(timeout)
 waitLoop:
 	for {
 		select {
 		case <-timeoutC:
-			c.Fatalf("Timeout waiting for delete resource %v", resource)
+			t.Fatalf("Timeout waiting for delete resource %v", resource)
 		case <-w.Done():
-			c.Fatalf("Watcher exited with error %v", w.Error())
+			t.Fatalf("Watcher exited with error %v", w.Error())
 		case event := <-w.Events():
 			if event.Type != types.OpDelete {
-				log.Debugf("Skipping stale event %v %v", event.Type, event.Resource.GetName())
+				slog.DebugContext(context.Background(), "Skipping stale event",
+					"event_type", event.Type,
+					"resource_name", event.Resource.GetName(),
+				)
 				continue
 			}
-			fixtures.DeepCompare(c, resource, event.Resource)
+
+			// Server resources may have subkind set, but the backend
+			// generating this delete event doesn't know the subkind.
+			// Set it to prevent the check below from failing.
+			if event.Resource.GetKind() == types.KindNode {
+				event.Resource.SetSubKind(resource.GetSubKind())
+			}
+
+			require.Empty(t, cmp.Diff(resource, event.Resource))
 			break waitLoop
 		}
 	}

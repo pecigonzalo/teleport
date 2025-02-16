@@ -1,29 +1,34 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package multiplexer
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net"
 
-	"github.com/gravitational/teleport/lib/utils"
-
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // TestProxy is tcp passthrough proxy that sends a proxy-line when connecting
@@ -32,12 +37,13 @@ type TestProxy struct {
 	listener net.Listener
 	target   string
 	closeCh  chan (struct{})
-	log      logrus.FieldLogger
+	log      *slog.Logger
+	v2       bool
 }
 
 // NewTestProxy creates a new test proxy that sends a proxy-line when
 // proxying connections to the provided target address.
-func NewTestProxy(target string) (*TestProxy, error) {
+func NewTestProxy(target string, v2 bool) (*TestProxy, error) {
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -46,7 +52,8 @@ func NewTestProxy(target string) (*TestProxy, error) {
 		listener: listener,
 		target:   target,
 		closeCh:  make(chan struct{}),
-		log:      logrus.WithField(trace.Component, "test:proxy"),
+		log:      utils.NewSlogLoggerForTests().With(teleport.ComponentKey, "test:proxy"),
+		v2:       v2,
 	}, nil
 }
 
@@ -62,10 +69,10 @@ func (p *TestProxy) Serve() error {
 		if err != nil {
 			return trace.Wrap(err)
 		}
-		p.log.Debugf("Accepted connection from %v.", clientConn.RemoteAddr().String())
+		p.log.DebugContext(context.Background(), "Accepted connection", "remote_addr", logutils.StringerAttr(clientConn.RemoteAddr()))
 		go func() {
 			if err := p.handleConnection(clientConn); err != nil {
-				p.log.WithError(err).Error("Failed to handle connection.")
+				p.log.ErrorContext(context.Background(), "Failed to handle connection", "error", err)
 			}
 		}()
 	}
@@ -105,7 +112,7 @@ func (p *TestProxy) handleConnection(clientConn net.Conn) error {
 				errs = append(errs, err)
 			}
 		case <-p.closeCh:
-			p.log.Debug("Closing.")
+			p.log.DebugContext(context.Background(), "Closing")
 			return trace.NewAggregate(errs...)
 		}
 	}
@@ -127,8 +134,19 @@ func (p *TestProxy) sendProxyLine(clientConn, serverConn net.Conn) error {
 		Source:      net.TCPAddr{IP: net.ParseIP(clientAddr.Host()), Port: clientAddr.Port(0)},
 		Destination: net.TCPAddr{IP: net.ParseIP(serverAddr.Host()), Port: serverAddr.Port(0)},
 	}
-	p.log.Debugf("Sending %v to %v.", proxyLine.String(), serverConn.RemoteAddr().String())
-	_, err = serverConn.Write([]byte(proxyLine.String()))
+	p.log.DebugContext(context.Background(), "Sending proxy line",
+		"proxy_line", proxyLine.String(),
+		"remote_addr", serverConn.RemoteAddr().String(),
+	)
+	if p.v2 {
+		b, bErr := proxyLine.Bytes()
+		if bErr != nil {
+			return trace.Wrap(err)
+		}
+		_, err = serverConn.Write(b)
+	} else {
+		_, err = serverConn.Write([]byte(proxyLine.String()))
+	}
 	if err != nil {
 		return trace.Wrap(err)
 	}

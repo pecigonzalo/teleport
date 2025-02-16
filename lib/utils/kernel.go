@@ -1,33 +1,34 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"runtime"
-	"strings"
-
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/trace"
 
 	"github.com/coreos/go-semver/semver"
+	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/api/constants"
 )
 
 // KernelVersion parses /proc/sys/kernel/osrelease and returns the kernel
@@ -37,7 +38,7 @@ func KernelVersion() (*semver.Version, error) {
 		return nil, trace.BadParameter("requested kernel version on non-Linux host")
 	}
 
-	file, err := os.Open("/proc/sys/kernel/osrelease")
+	file, err := OpenFileNoUnsafeLinks("/proc/sys/kernel/osrelease")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -51,6 +52,12 @@ func KernelVersion() (*semver.Version, error) {
 	return ver, nil
 }
 
+// kernelVersionRegex extracts the first three digits of a version from
+// a kernel version - this strips off any additional digits or additional
+// information appended to the kernel version e.g:
+// 5.15.68.1-microsoft-standard-WSL2 => 5.15.68
+var kernelVersionRegex = regexp.MustCompile(`^\d+\.\d+\.\d+`)
+
 // kernelVersion reads in the kernel version from the reader and returns
 // a *semver.Version.
 func kernelVersion(reader io.Reader) (*semver.Version, error) {
@@ -59,10 +66,13 @@ func kernelVersion(reader io.Reader) (*semver.Version, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	// Only keep the major, minor, and patch, throw away everything after "-".
-	parts := bytes.Split(buf, []byte("-"))
-	s := strings.TrimSpace(string(parts[0]))
-
+	s := kernelVersionRegex.FindString(string(buf))
+	if s == "" {
+		return nil, trace.BadParameter(
+			"unable to extract kernel semver from string %q",
+			string(buf),
+		)
+	}
 	ver, err := semver.NewVersion(s)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -81,7 +91,7 @@ func HasBTF() error {
 		return trace.BadParameter("requested kernel version on non-Linux host")
 	}
 
-	file, err := os.Open(btfFile)
+	file, err := OpenFileNoUnsafeLinks(btfFile)
 	if err == nil {
 		file.Close()
 		return nil
@@ -91,5 +101,5 @@ func HasBTF() error {
 		return fmt.Errorf("%v was not found. Make sure the kernel was compiled with BTF support (CONFIG_DEBUG_INFO_BTF)", btfFile)
 	}
 
-	return fmt.Errorf("failed to open %v: %v", btfFile, err)
+	return fmt.Errorf("failed to open %v: %w", btfFile, err)
 }

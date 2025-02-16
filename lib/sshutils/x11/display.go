@@ -1,59 +1,50 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package x11
 
 import (
-	"errors"
 	"fmt"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"unicode"
 
 	"github.com/gravitational/trace"
 )
 
 const (
-	// DefaultDisplayOffset is the default display offset when
-	// searching for an open XServer unix socket.
-	DefaultDisplayOffset = 10
-	// DefaultMaxDisplays is the default maximum number of displays
-	// supported when searching for an open XServer unix socket.
-	DefaultMaxDisplays = 1000
-	// MaxDisplay is the theoretical max display value which
-	// X Clients and serverwill be able to parse into a unix socket.
-	MaxDisplayNumber = math.MaxInt32
 	// DisplayEnv is an environment variable used to determine what
 	// local display should be connected to during X11 forwarding.
 	DisplayEnv = "DISPLAY"
-
+	// x11SocketDirName is the name of the directory where X11 unix sockets are kept.
+	x11SocketDirName = ".X11-unix"
 	// x11BasePort is the base port used for XServer tcp addresses.
 	// e.g. DISPLAY=localhost:10 -> net.Dial("tcp", "localhost:6010")
 	// Used by some XServer clients, such as openSSH and MobaXTerm.
 	x11BasePort = 6000
-	// x11SocketDirName is the name of the directory where X11 unix sockets are kept.
-	x11SocketDirName = ".X11-unix"
 )
 
 // Display is an XServer display.
 type Display struct {
-	// HostName is the the display's hostname. For tcp display sockets, this will be
+	// HostName is the display's hostname. For tcp display sockets, this will be
 	// an ip address. For unix display sockets, this will be empty or "unix".
 	HostName string `json:"hostname"`
 	// DisplayNumber is a number representing an x display.
@@ -67,53 +58,42 @@ func (d *Display) String() string {
 	return fmt.Sprintf("%s:%d.%d", d.HostName, d.DisplayNumber, d.ScreenNumber)
 }
 
-// Dial opens an XServer connection to the display
-func (d *Display) Dial() (XServerConn, error) {
-	var conn XServerConn
-
+func (d *Display) getNetAddr() (net.Addr, error) {
 	unixSock, unixErr := d.unixSocket()
 	if unixErr == nil {
-		if conn, unixErr = net.DialUnix("unix", nil, unixSock); unixErr == nil {
-			return conn, nil
-		}
+		return unixSock, nil
 	}
 
 	tcpSock, tcpErr := d.tcpSocket()
 	if tcpErr == nil {
-		if conn, tcpErr = net.DialTCP("tcp", nil, tcpSock); tcpErr == nil {
-			return conn, nil
-		}
+		return tcpSock, nil
 	}
 
 	return nil, trace.NewAggregate(unixErr, tcpErr)
 }
 
+// Dial opens an XServer connection to the display
+func (d *Display) Dial() (net.Conn, error) {
+	netAddr, err := d.getNetAddr()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	conn, err := net.Dial(netAddr.Network(), netAddr.String())
+	return conn, trace.Wrap(err)
+}
+
 // Listen opens an XServer listener. It will attempt to listen on the display
 // address for both tcp and unix and return an aggregate error, unless one
 // results in an addr in use error.
-func (d *Display) Listen() (XServerListener, error) {
-	unixSock, unixErr := d.unixSocket()
-	if unixErr == nil {
-		var l *net.UnixListener
-		if l, unixErr = net.ListenUnix("unix", unixSock); unixErr == nil {
-			return &xserverUnixListener{l}, nil
-		} else if errors.Is(unixErr, syscall.EADDRINUSE) {
-			return nil, trace.Wrap(unixErr)
-		}
+func (d *Display) Listen() (net.Listener, error) {
+	netAddr, err := d.getNetAddr()
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	tcpSock, tcpErr := d.tcpSocket()
-	if tcpErr == nil {
-		var l *net.TCPListener
-		if l, tcpErr = net.ListenTCP("tcp", tcpSock); tcpErr == nil {
-			return &xserverTCPListener{l}, nil
-		} else if errors.Is(tcpErr, syscall.EADDRINUSE) {
-			return nil, trace.Wrap(tcpErr)
-		}
-
-	}
-
-	return nil, trace.NewAggregate(unixErr, tcpErr)
+	listener, err := net.Listen(netAddr.Network(), netAddr.String())
+	return listener, trace.Wrap(err)
 }
 
 // xserverUnixSocket returns the display's associated unix socket.
@@ -142,6 +122,20 @@ func (d *Display) unixSocket() (*net.UnixAddr, error) {
 	}
 
 	return nil, trace.BadParameter("display is not a unix socket")
+}
+
+// ParseDisplay parses the given display value and returns the host,
+// display number, and screen number, or a parsing error. display must be
+// in one of the following formats - hostname:d[.s], unix:d[.s], :d[.s], ::d[.s].
+func ParseDisplayFromUnixSocket(socket string) (Display, error) {
+	if filepath.Dir(socket) != x11SockDir() {
+		return Display{}, trace.BadParameter("parsing x11 sockets outside of the standard /tmp/.X11-unix path is not supported")
+	}
+
+	// The file name should look like X[d].[s] and we want :[d].[s]
+	fileName := filepath.Base(socket)
+	displayName := strings.Replace(fileName, "X", ":", 1)
+	return ParseDisplay(displayName)
 }
 
 // xserverTCPSocket returns the display's associated tcp socket.
@@ -177,9 +171,8 @@ func GetXDisplay() (Display, error) {
 
 // ParseDisplay parses the given display value and returns the host,
 // display number, and screen number, or a parsing error. display must be
-//in one of the following formats - hostname:d[.s], unix:d[.s], :d[.s], ::d[.s].
+// in one of the following formats - hostname:d[.s], unix:d[.s], :d[.s], ::d[.s].
 func ParseDisplay(displayString string) (Display, error) {
-
 	if displayString == "" {
 		return Display{}, trace.BadParameter("display cannot be an empty string")
 	}
@@ -227,5 +220,7 @@ func ParseDisplay(displayString string) (Display, error) {
 }
 
 func x11SockDir() string {
-	return filepath.Join(os.TempDir(), x11SocketDirName)
+	// We use "/tmp" instead of "os.TempDir" because X11
+	// is not OS aware and uses "/tmp" regardless of OS.
+	return filepath.Join("/tmp", x11SocketDirName)
 }

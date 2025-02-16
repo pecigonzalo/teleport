@@ -1,31 +1,259 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/runtime/protoiface"
+
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/stretchr/testify/require"
 )
+
+// eventsMap maps event names to event types for testing. Be sure to update
+// this map if you add a new event type.
+var eventsMap = map[string]apievents.AuditEvent{
+	SessionPrintEvent:                              &apievents.SessionPrint{},
+	SessionStartEvent:                              &apievents.SessionStart{},
+	SessionEndEvent:                                &apievents.SessionEnd{},
+	SessionUploadEvent:                             &apievents.SessionUpload{},
+	SessionJoinEvent:                               &apievents.SessionJoin{},
+	SessionLeaveEvent:                              &apievents.SessionLeave{},
+	SessionDataEvent:                               &apievents.SessionData{},
+	ClientDisconnectEvent:                          &apievents.ClientDisconnect{},
+	UserLoginEvent:                                 &apievents.UserLogin{},
+	UserDeleteEvent:                                &apievents.UserDelete{},
+	UserCreateEvent:                                &apievents.UserCreate{},
+	UserUpdatedEvent:                               &apievents.UserUpdate{},
+	UserPasswordChangeEvent:                        &apievents.UserPasswordChange{},
+	AccessRequestCreateEvent:                       &apievents.AccessRequestCreate{},
+	AccessRequestReviewEvent:                       &apievents.AccessRequestCreate{},
+	AccessRequestUpdateEvent:                       &apievents.AccessRequestCreate{},
+	AccessRequestResourceSearch:                    &apievents.AccessRequestResourceSearch{},
+	BillingCardCreateEvent:                         &apievents.BillingCardCreate{},
+	BillingCardUpdateEvent:                         &apievents.BillingCardCreate{},
+	BillingCardDeleteEvent:                         &apievents.BillingCardDelete{},
+	BillingInformationUpdateEvent:                  &apievents.BillingInformationUpdate{},
+	ResetPasswordTokenCreateEvent:                  &apievents.UserTokenCreate{},
+	ExecEvent:                                      &apievents.Exec{},
+	SubsystemEvent:                                 &apievents.Subsystem{},
+	X11ForwardEvent:                                &apievents.X11Forward{},
+	PortForwardEvent:                               &apievents.PortForward{},
+	AuthAttemptEvent:                               &apievents.AuthAttempt{},
+	SCPEvent:                                       &apievents.SCP{},
+	ResizeEvent:                                    &apievents.Resize{},
+	SessionCommandEvent:                            &apievents.SessionCommand{},
+	SessionDiskEvent:                               &apievents.SessionDisk{},
+	SessionNetworkEvent:                            &apievents.SessionNetwork{},
+	RoleCreatedEvent:                               &apievents.RoleCreate{},
+	RoleUpdatedEvent:                               &apievents.RoleUpdate{},
+	RoleDeletedEvent:                               &apievents.RoleDelete{},
+	TrustedClusterCreateEvent:                      &apievents.TrustedClusterCreate{},
+	TrustedClusterDeleteEvent:                      &apievents.TrustedClusterDelete{},
+	TrustedClusterTokenCreateEvent:                 &apievents.TrustedClusterTokenCreate{}, //nolint:staticcheck // SA1019. We want to test every event type, even if they're deprecated.
+	ProvisionTokenCreateEvent:                      &apievents.ProvisionTokenCreate{},
+	GithubConnectorCreatedEvent:                    &apievents.GithubConnectorCreate{},
+	GithubConnectorUpdatedEvent:                    &apievents.GithubConnectorUpdate{},
+	GithubConnectorDeletedEvent:                    &apievents.GithubConnectorDelete{},
+	OIDCConnectorCreatedEvent:                      &apievents.OIDCConnectorCreate{},
+	OIDCConnectorUpdatedEvent:                      &apievents.OIDCConnectorUpdate{},
+	OIDCConnectorDeletedEvent:                      &apievents.OIDCConnectorDelete{},
+	SAMLConnectorCreatedEvent:                      &apievents.SAMLConnectorCreate{},
+	SAMLConnectorUpdatedEvent:                      &apievents.SAMLConnectorUpdate{},
+	SAMLConnectorDeletedEvent:                      &apievents.SAMLConnectorDelete{},
+	SessionRejectedEvent:                           &apievents.SessionReject{},
+	AppSessionStartEvent:                           &apievents.AppSessionStart{},
+	AppSessionEndEvent:                             &apievents.AppSessionEnd{},
+	AppSessionChunkEvent:                           &apievents.AppSessionChunk{},
+	AppSessionRequestEvent:                         &apievents.AppSessionRequest{},
+	AppSessionDynamoDBRequestEvent:                 &apievents.AppSessionDynamoDBRequest{},
+	AppCreateEvent:                                 &apievents.AppCreate{},
+	AppUpdateEvent:                                 &apievents.AppUpdate{},
+	AppDeleteEvent:                                 &apievents.AppDelete{},
+	DatabaseCreateEvent:                            &apievents.DatabaseCreate{},
+	DatabaseUpdateEvent:                            &apievents.DatabaseUpdate{},
+	DatabaseDeleteEvent:                            &apievents.DatabaseDelete{},
+	DatabaseSessionStartEvent:                      &apievents.DatabaseSessionStart{},
+	DatabaseSessionEndEvent:                        &apievents.DatabaseSessionEnd{},
+	DatabaseSessionQueryEvent:                      &apievents.DatabaseSessionQuery{},
+	DatabaseSessionQueryFailedEvent:                &apievents.DatabaseSessionQuery{},
+	DatabaseSessionCommandResultEvent:              &apievents.DatabaseSessionCommandResult{},
+	DatabaseSessionMalformedPacketEvent:            &apievents.DatabaseSessionMalformedPacket{},
+	DatabaseSessionPermissionsUpdateEvent:          &apievents.DatabasePermissionUpdate{},
+	DatabaseSessionUserCreateEvent:                 &apievents.DatabaseUserCreate{},
+	DatabaseSessionUserDeactivateEvent:             &apievents.DatabaseUserDeactivate{},
+	DatabaseSessionPostgresParseEvent:              &apievents.PostgresParse{},
+	DatabaseSessionPostgresBindEvent:               &apievents.PostgresBind{},
+	DatabaseSessionPostgresExecuteEvent:            &apievents.PostgresExecute{},
+	DatabaseSessionPostgresCloseEvent:              &apievents.PostgresClose{},
+	DatabaseSessionPostgresFunctionEvent:           &apievents.PostgresFunctionCall{},
+	DatabaseSessionMySQLStatementPrepareEvent:      &apievents.MySQLStatementPrepare{},
+	DatabaseSessionMySQLStatementExecuteEvent:      &apievents.MySQLStatementExecute{},
+	DatabaseSessionMySQLStatementSendLongDataEvent: &apievents.MySQLStatementSendLongData{},
+	DatabaseSessionMySQLStatementCloseEvent:        &apievents.MySQLStatementClose{},
+	DatabaseSessionMySQLStatementResetEvent:        &apievents.MySQLStatementReset{},
+	DatabaseSessionMySQLStatementFetchEvent:        &apievents.MySQLStatementFetch{},
+	DatabaseSessionMySQLStatementBulkExecuteEvent:  &apievents.MySQLStatementBulkExecute{},
+	DatabaseSessionMySQLInitDBEvent:                &apievents.MySQLInitDB{},
+	DatabaseSessionMySQLCreateDBEvent:              &apievents.MySQLCreateDB{},
+	DatabaseSessionMySQLDropDBEvent:                &apievents.MySQLDropDB{},
+	DatabaseSessionMySQLShutDownEvent:              &apievents.MySQLShutDown{},
+	DatabaseSessionMySQLProcessKillEvent:           &apievents.MySQLProcessKill{},
+	DatabaseSessionMySQLDebugEvent:                 &apievents.MySQLDebug{},
+	DatabaseSessionMySQLRefreshEvent:               &apievents.MySQLRefresh{},
+	DatabaseSessionSQLServerRPCRequestEvent:        &apievents.SQLServerRPCRequest{},
+	DatabaseSessionElasticsearchRequestEvent:       &apievents.ElasticsearchRequest{},
+	DatabaseSessionOpenSearchRequestEvent:          &apievents.OpenSearchRequest{},
+	DatabaseSessionDynamoDBRequestEvent:            &apievents.DynamoDBRequest{},
+	KubeRequestEvent:                               &apievents.KubeRequest{},
+	MFADeviceAddEvent:                              &apievents.MFADeviceAdd{},
+	MFADeviceDeleteEvent:                           &apievents.MFADeviceDelete{},
+	DeviceEvent:                                    &apievents.DeviceEvent{},
+	DeviceCreateEvent:                              &apievents.DeviceEvent2{},
+	DeviceDeleteEvent:                              &apievents.DeviceEvent2{},
+	DeviceUpdateEvent:                              &apievents.DeviceEvent2{},
+	DeviceEnrollEvent:                              &apievents.DeviceEvent2{},
+	DeviceAuthenticateEvent:                        &apievents.DeviceEvent2{},
+	DeviceEnrollTokenCreateEvent:                   &apievents.DeviceEvent2{},
+	DeviceWebTokenCreateEvent:                      &apievents.DeviceEvent2{},
+	DeviceAuthenticateConfirmEvent:                 &apievents.DeviceEvent2{},
+	LockCreatedEvent:                               &apievents.LockCreate{},
+	LockDeletedEvent:                               &apievents.LockDelete{},
+	RecoveryCodeGeneratedEvent:                     &apievents.RecoveryCodeGenerate{},
+	RecoveryCodeUsedEvent:                          &apievents.RecoveryCodeUsed{},
+	RecoveryTokenCreateEvent:                       &apievents.UserTokenCreate{},
+	PrivilegeTokenCreateEvent:                      &apievents.UserTokenCreate{},
+	WindowsDesktopSessionStartEvent:                &apievents.WindowsDesktopSessionStart{},
+	WindowsDesktopSessionEndEvent:                  &apievents.WindowsDesktopSessionEnd{},
+	DesktopRecordingEvent:                          &apievents.DesktopRecording{},
+	DesktopClipboardSendEvent:                      &apievents.DesktopClipboardSend{},
+	DesktopClipboardReceiveEvent:                   &apievents.DesktopClipboardReceive{},
+	SessionConnectEvent:                            &apievents.SessionConnect{},
+	AccessRequestDeleteEvent:                       &apievents.AccessRequestDelete{},
+	CertificateCreateEvent:                         &apievents.CertificateCreate{},
+	RenewableCertificateGenerationMismatchEvent:    &apievents.RenewableCertificateGenerationMismatch{},
+	SFTPEvent:                                   &apievents.SFTP{},
+	UpgradeWindowStartUpdateEvent:               &apievents.UpgradeWindowStartUpdate{},
+	SessionRecordingAccessEvent:                 &apievents.SessionRecordingAccess{},
+	SSMRunEvent:                                 &apievents.SSMRun{},
+	KubernetesClusterCreateEvent:                &apievents.KubernetesClusterCreate{},
+	KubernetesClusterUpdateEvent:                &apievents.KubernetesClusterUpdate{},
+	KubernetesClusterDeleteEvent:                &apievents.KubernetesClusterDelete{},
+	DesktopSharedDirectoryStartEvent:            &apievents.DesktopSharedDirectoryStart{},
+	DesktopSharedDirectoryReadEvent:             &apievents.DesktopSharedDirectoryRead{},
+	DesktopSharedDirectoryWriteEvent:            &apievents.DesktopSharedDirectoryWrite{},
+	BotJoinEvent:                                &apievents.BotJoin{},
+	InstanceJoinEvent:                           &apievents.InstanceJoin{},
+	BotCreateEvent:                              &apievents.BotCreate{},
+	BotUpdateEvent:                              &apievents.BotUpdate{},
+	BotDeleteEvent:                              &apievents.BotDelete{},
+	LoginRuleCreateEvent:                        &apievents.LoginRuleCreate{},
+	LoginRuleDeleteEvent:                        &apievents.LoginRuleDelete{},
+	SAMLIdPAuthAttemptEvent:                     &apievents.SAMLIdPAuthAttempt{},
+	SAMLIdPServiceProviderCreateEvent:           &apievents.SAMLIdPServiceProviderCreate{},
+	SAMLIdPServiceProviderUpdateEvent:           &apievents.SAMLIdPServiceProviderUpdate{},
+	SAMLIdPServiceProviderDeleteEvent:           &apievents.SAMLIdPServiceProviderDelete{},
+	SAMLIdPServiceProviderDeleteAllEvent:        &apievents.SAMLIdPServiceProviderDeleteAll{},
+	OktaGroupsUpdateEvent:                       &apievents.OktaResourcesUpdate{},
+	OktaApplicationsUpdateEvent:                 &apievents.OktaResourcesUpdate{},
+	OktaSyncFailureEvent:                        &apievents.OktaSyncFailure{},
+	OktaAssignmentProcessEvent:                  &apievents.OktaAssignmentResult{},
+	OktaAssignmentCleanupEvent:                  &apievents.OktaAssignmentResult{},
+	OktaUserSyncEvent:                           &apievents.OktaUserSync{},
+	OktaAccessListSyncEvent:                     &apievents.OktaAccessListSync{},
+	AccessGraphAccessPathChangedEvent:           &apievents.AccessPathChanged{},
+	AccessListCreateEvent:                       &apievents.AccessListCreate{},
+	AccessListUpdateEvent:                       &apievents.AccessListUpdate{},
+	AccessListDeleteEvent:                       &apievents.AccessListDelete{},
+	AccessListReviewEvent:                       &apievents.AccessListReview{},
+	AccessListMemberCreateEvent:                 &apievents.AccessListMemberCreate{},
+	AccessListMemberUpdateEvent:                 &apievents.AccessListMemberUpdate{},
+	AccessListMemberDeleteEvent:                 &apievents.AccessListMemberDelete{},
+	AccessListMemberDeleteAllForAccessListEvent: &apievents.AccessListMemberDeleteAllForAccessList{},
+	UserLoginAccessListInvalidEvent:             &apievents.UserLoginAccessListInvalid{},
+	SecReportsAuditQueryRunEvent:                &apievents.AuditQueryRun{},
+	SecReportsReportRunEvent:                    &apievents.SecurityReportRun{},
+	ExternalAuditStorageEnableEvent:             &apievents.ExternalAuditStorageEnable{},
+	ExternalAuditStorageDisableEvent:            &apievents.ExternalAuditStorageDisable{},
+	CreateMFAAuthChallengeEvent:                 &apievents.CreateMFAAuthChallenge{},
+	ValidateMFAAuthResponseEvent:                &apievents.ValidateMFAAuthResponse{},
+	SPIFFESVIDIssuedEvent:                       &apievents.SPIFFESVIDIssued{},
+	AuthPreferenceUpdateEvent:                   &apievents.AuthPreferenceUpdate{},
+	ClusterNetworkingConfigUpdateEvent:          &apievents.ClusterNetworkingConfigUpdate{},
+	SessionRecordingConfigUpdateEvent:           &apievents.SessionRecordingConfigUpdate{},
+	AccessGraphSettingsUpdateEvent:              &apievents.AccessGraphSettingsUpdate{},
+	DatabaseSessionSpannerRPCEvent:              &apievents.SpannerRPC{},
+	UnknownEvent:                                &apievents.Unknown{},
+	DatabaseSessionCassandraBatchEvent:          &apievents.CassandraBatch{},
+	DatabaseSessionCassandraRegisterEvent:       &apievents.CassandraRegister{},
+	DatabaseSessionCassandraPrepareEvent:        &apievents.CassandraPrepare{},
+	DatabaseSessionCassandraExecuteEvent:        &apievents.CassandraExecute{},
+	DiscoveryConfigCreateEvent:                  &apievents.DiscoveryConfigCreate{},
+	DiscoveryConfigUpdateEvent:                  &apievents.DiscoveryConfigUpdate{},
+	DiscoveryConfigDeleteEvent:                  &apievents.DiscoveryConfigDelete{},
+	DiscoveryConfigDeleteAllEvent:               &apievents.DiscoveryConfigDeleteAll{},
+	IntegrationCreateEvent:                      &apievents.IntegrationCreate{},
+	IntegrationUpdateEvent:                      &apievents.IntegrationUpdate{},
+	IntegrationDeleteEvent:                      &apievents.IntegrationDelete{},
+	SPIFFEFederationCreateEvent:                 &apievents.SPIFFEFederationCreate{},
+	SPIFFEFederationDeleteEvent:                 &apievents.SPIFFEFederationDelete{},
+	PluginCreateEvent:                           &apievents.PluginCreate{},
+	PluginUpdateEvent:                           &apievents.PluginUpdate{},
+	PluginDeleteEvent:                           &apievents.PluginDelete{},
+	StaticHostUserCreateEvent:                   &apievents.StaticHostUserCreate{},
+	StaticHostUserUpdateEvent:                   &apievents.StaticHostUserUpdate{},
+	StaticHostUserDeleteEvent:                   &apievents.StaticHostUserDelete{},
+	CrownJewelCreateEvent:                       &apievents.CrownJewelCreate{},
+	CrownJewelUpdateEvent:                       &apievents.CrownJewelUpdate{},
+	CrownJewelDeleteEvent:                       &apievents.CrownJewelDelete{},
+	UserTaskCreateEvent:                         &apievents.UserTaskCreate{},
+	UserTaskUpdateEvent:                         &apievents.UserTaskUpdate{},
+	UserTaskDeleteEvent:                         &apievents.UserTaskDelete{},
+	SFTPSummaryEvent:                            &apievents.SFTPSummary{},
+	AutoUpdateConfigCreateEvent:                 &apievents.AutoUpdateConfigCreate{},
+	AutoUpdateConfigUpdateEvent:                 &apievents.AutoUpdateConfigUpdate{},
+	AutoUpdateConfigDeleteEvent:                 &apievents.AutoUpdateConfigDelete{},
+	AutoUpdateVersionCreateEvent:                &apievents.AutoUpdateVersionCreate{},
+	AutoUpdateVersionUpdateEvent:                &apievents.AutoUpdateVersionUpdate{},
+	AutoUpdateVersionDeleteEvent:                &apievents.AutoUpdateVersionDelete{},
+	ContactCreateEvent:                          &apievents.ContactCreate{},
+	ContactDeleteEvent:                          &apievents.ContactDelete{},
+	WorkloadIdentityCreateEvent:                 &apievents.WorkloadIdentityCreate{},
+	WorkloadIdentityUpdateEvent:                 &apievents.WorkloadIdentityUpdate{},
+	WorkloadIdentityDeleteEvent:                 &apievents.WorkloadIdentityDelete{},
+	AccessRequestExpireEvent:                    &apievents.AccessRequestExpire{},
+	StableUNIXUserCreateEvent:                   &apievents.StableUNIXUserCreate{},
+	WorkloadIdentityX509RevocationCreateEvent:   &apievents.WorkloadIdentityX509RevocationCreate{},
+	WorkloadIdentityX509RevocationDeleteEvent:   &apievents.WorkloadIdentityX509RevocationDelete{},
+	WorkloadIdentityX509RevocationUpdateEvent:   &apievents.WorkloadIdentityX509RevocationUpdate{},
+}
 
 // TestJSON tests JSON marshal events
 func TestJSON(t *testing.T) {
@@ -144,7 +372,7 @@ func TestJSON(t *testing.T) {
 		},
 		{
 			name: "session command event",
-			json: `{"argv":["/usr/bin/lesspipe"],"login":"alice","path":"/usr/bin/dirname","return_code":0,"time":"2020-03-30T15:58:54.65Z","user":"alice@example.com","code":"T4000I","event":"session.command","pid":31638,"server_id":"a7c54b0c-469c-431e-af4d-418cd3ae9694","uid":"4f725f11-e87a-452f-96ec-ef93e9e6a260","cgroup_id":4294971450,"ppid":31637,"program":"dirname","namespace":"default","sid":"5b3555dc-729f-11ea-b66a-507b9dd95841","cluster_name":"test","ei":4}`,
+			json: `{"argv":["/usr/bin/lesspipe"],"login":"alice","path":"/usr/bin/dirname","return_code":0,"time":"2020-03-30T15:58:54.65Z","user":"alice@example.com","code":"T4000I","event":"session.command","pid":31638,"server_id":"a7c54b0c-469c-431e-af4d-418cd3ae9694","server_hostname":"ip-172-31-11-148","uid":"4f725f11-e87a-452f-96ec-ef93e9e6a260","cgroup_id":4294971450,"ppid":31637,"program":"dirname","namespace":"default","sid":"5b3555dc-729f-11ea-b66a-507b9dd95841","cluster_name":"test","ei":4}`,
 			event: apievents.SessionCommand{
 				Metadata: apievents.Metadata{
 					Index:       4,
@@ -156,6 +384,7 @@ func TestJSON(t *testing.T) {
 				},
 				ServerMetadata: apievents.ServerMetadata{
 					ServerID:        "a7c54b0c-469c-431e-af4d-418cd3ae9694",
+					ServerHostname:  "ip-172-31-11-148",
 					ServerNamespace: "default",
 				},
 				SessionMetadata: apievents.SessionMetadata{
@@ -178,7 +407,7 @@ func TestJSON(t *testing.T) {
 		},
 		{
 			name: "session network event",
-			json: `{"dst_port":443,"cgroup_id":4294976805,"dst_addr":"2607:f8b0:400a:801::200e","program":"curl","sid":"e9a4bd34-78ff-11ea-b062-507b9dd95841","src_addr":"2601:602:8700:4470:a3:813c:1d8c:30b9","login":"alice","pid":17604,"uid":"729498e0-c28b-438f-baa7-663a74418449","user":"alice@example.com","event":"session.network","namespace":"default","time":"2020-04-07T18:45:16.602Z","version":6,"ei":0,"code":"T4002I","server_id":"00b54ef5-ae1e-425f-8565-c71b01d8f7b8","cluster_name":"example","operation":0,"action":1}`,
+			json: `{"dst_port":443,"cgroup_id":4294976805,"dst_addr":"2607:f8b0:400a:801::200e","program":"curl","sid":"e9a4bd34-78ff-11ea-b062-507b9dd95841","src_addr":"2601:602:8700:4470:a3:813c:1d8c:30b9","login":"alice","pid":17604,"uid":"729498e0-c28b-438f-baa7-663a74418449","user":"alice@example.com","event":"session.network","namespace":"default","time":"2020-04-07T18:45:16.602Z","version":6,"ei":0,"code":"T4002I","server_id":"00b54ef5-ae1e-425f-8565-c71b01d8f7b8","server_hostname":"ip-172-31-11-148","cluster_name":"example","operation":0,"action":1}`,
 			event: apievents.SessionNetwork{
 				Metadata: apievents.Metadata{
 					Index:       0,
@@ -190,6 +419,7 @@ func TestJSON(t *testing.T) {
 				},
 				ServerMetadata: apievents.ServerMetadata{
 					ServerID:        "00b54ef5-ae1e-425f-8565-c71b01d8f7b8",
+					ServerHostname:  "ip-172-31-11-148",
 					ServerNamespace: "default",
 				},
 				SessionMetadata: apievents.SessionMetadata{
@@ -214,7 +444,7 @@ func TestJSON(t *testing.T) {
 		},
 		{
 			name: "session disk event",
-			json: `{"time":"2020-04-07T19:56:38.545Z","login":"bob","pid":31521,"sid":"ddddce15-7909-11ea-b062-507b9dd95841","user":"bob@example.com","ei":175,"code":"T4001I","flags":142606336,"namespace":"default","uid":"ab8467af-6d85-46ce-bb5c-bdfba8acad3f","cgroup_id":4294976835,"program":"clear_console","server_id":"00b54ef5-ae1e-425f-8565-c71b01d8f7b8","event":"session.disk","path":"/etc/ld.so.cache","return_code":3,"cluster_name":"example2"}`,
+			json: `{"time":"2020-04-07T19:56:38.545Z","login":"bob","pid":31521,"sid":"ddddce15-7909-11ea-b062-507b9dd95841","user":"bob@example.com","ei":175,"code":"T4001I","flags":142606336,"namespace":"default","uid":"ab8467af-6d85-46ce-bb5c-bdfba8acad3f","cgroup_id":4294976835,"program":"clear_console","server_id":"00b54ef5-ae1e-425f-8565-c71b01d8f7b8","server_hostname":"ip-172-31-11-148","event":"session.disk","path":"/etc/ld.so.cache","return_code":3,"cluster_name":"example2"}`,
 			event: apievents.SessionDisk{
 				Metadata: apievents.Metadata{
 					Index:       175,
@@ -226,6 +456,7 @@ func TestJSON(t *testing.T) {
 				},
 				ServerMetadata: apievents.ServerMetadata{
 					ServerID:        "00b54ef5-ae1e-425f-8565-c71b01d8f7b8",
+					ServerHostname:  "ip-172-31-11-148",
 					ServerNamespace: "default",
 				},
 				SessionMetadata: apievents.SessionMetadata{
@@ -414,7 +645,7 @@ func TestJSON(t *testing.T) {
 		},
 		{
 			name: "rejected subsystem",
-			json: `{"ei":0,"cluster_name":"test","addr.local":"127.0.0.1:57518","addr.remote":"127.0.0.1:3022","code":"T3001E","event":"subsystem","exitError":"some error","login":"alice","name":"proxy","time":"2020-04-15T20:28:18Z","uid":"3129a5ae-ee1e-4b39-8d7c-a0a3f218e7dc","user":"alice@example.com"}`,
+			json: `{"ei":0,"cluster_name":"test","addr.local":"127.0.0.1:57518","addr.remote":"127.0.0.1:3022","code":"T3001E","event":"subsystem","exitError":"some error","forwarded_by":"abc","login":"alice","name":"proxy","server_id":"123","time":"2020-04-15T20:28:18Z","uid":"3129a5ae-ee1e-4b39-8d7c-a0a3f218e7dc","user":"alice@example.com"}`,
 			event: apievents.Subsystem{
 				Metadata: apievents.Metadata{
 					ID:          "3129a5ae-ee1e-4b39-8d7c-a0a3f218e7dc",
@@ -430,6 +661,10 @@ func TestJSON(t *testing.T) {
 				ConnectionMetadata: apievents.ConnectionMetadata{
 					LocalAddr:  "127.0.0.1:57518",
 					RemoteAddr: "127.0.0.1:3022",
+				},
+				ServerMetadata: apievents.ServerMetadata{
+					ServerID:    "123",
+					ForwardedBy: "abc",
 				},
 				Name:  "proxy",
 				Error: "some error",
@@ -486,7 +721,7 @@ func TestJSON(t *testing.T) {
 		},
 		{
 			name: "desktop session start",
-			json: `{"uid":"cd06365f-3cef-4b21-809a-4af9502c11a1","user":"foo","impersonator":"bar","login":"Administrator","success":true,"proto":"tdp","sid":"test-session","addr.local":"192.168.1.100:39887","addr.remote":"[::1]:34902","with_mfa":"mfa-device","code":"TDP00I","event":"windows.desktop.session.start","time":"2020-04-23T18:22:35.35Z","ei":4,"cluster_name":"test-cluster","windows_user":"Administrator","windows_domain":"test.example.com","desktop_name":"test-desktop","desktop_addr":"[::1]:34902","windows_desktop_service":"00baaef5-ff1e-4222-85a5-c7cb0cd8e7b8","desktop_labels":{"env":"production"}}`,
+			json: `{"uid":"cd06365f-3cef-4b21-809a-4af9502c11a1","user":"foo","impersonator":"bar","login":"Administrator","success":true,"proto":"tdp","sid":"test-session","addr.local":"192.168.1.100:39887","addr.remote":"[::1]:34902","with_mfa":"mfa-device","code":"TDP00I","event":"windows.desktop.session.start","time":"2020-04-23T18:22:35.35Z","ei":4,"cluster_name":"test-cluster","windows_user":"Administrator","windows_domain":"test.example.com","desktop_name":"test-desktop","desktop_addr":"[::1]:34902","windows_desktop_service":"00baaef5-ff1e-4222-85a5-c7cb0cd8e7b8","allow_user_creation":false,"nla":true,"desktop_labels":{"env":"production"}}`,
 			event: apievents.WindowsDesktopSessionStart{
 				Metadata: apievents.Metadata{
 					Index:       4,
@@ -519,6 +754,7 @@ func TestJSON(t *testing.T) {
 				Domain:                "test.example.com",
 				WindowsUser:           "Administrator",
 				DesktopLabels:         map[string]string{"env": "production"},
+				NLA:                   true,
 			},
 		},
 		{
@@ -769,4 +1005,168 @@ func TestJSON(t *testing.T) {
 			require.Equal(t, tc.event, outEvent.Elem().Interface())
 		})
 	}
+}
+
+// TestEvents tests that all events can be converted and processed correctly.
+func TestEvents(t *testing.T) {
+	t.Parallel()
+
+	for eventName, eventType := range eventsMap {
+		t.Run(fmt.Sprintf("%s OneOf", eventName), func(t *testing.T) {
+			converted, err := apievents.ToOneOf(eventType)
+			require.NoError(t, err, "failed to convert event type to OneOf, is the event type added to api/types/events/oneof.go?")
+			auditEvent, err := apievents.FromOneOf(*converted)
+			require.NoError(t, err, "failed to convert OneOf back to an Audit event")
+			require.IsType(t, eventType, auditEvent, "FromOneOf did not convert the event type correctly")
+		})
+
+		t.Run(fmt.Sprintf("%s EventFields", eventName), func(t *testing.T) {
+			auditEvent, err := FromEventFields(EventFields{EventType: eventName})
+			require.NoError(t, err, "failed to convert EventFields to an Audit event, is the event type added to lib/events/dynamic.go?")
+			require.IsType(t, eventType, auditEvent, "FromEventFields did not convert the event type correctly")
+		})
+	}
+}
+
+func TestTrimToMaxSize(t *testing.T) {
+	t.Parallel()
+
+	for eventName, eventMsg := range eventsMap {
+		t.Run(eventName, func(t *testing.T) {
+			// clone the message to avoid modifying the original in the global map
+			event := proto.Clone(toV2Proto(t, eventMsg))
+			setProtoFields(event)
+
+			auditEvent := protoadapt.MessageV1Of(event).(apievents.AuditEvent)
+			size := auditEvent.Size()
+			maxSize := int(float32(size) * 0.8)
+
+			trimmedAuditEvent := auditEvent.TrimToMaxSize(maxSize)
+			if trimmedAuditEvent.Size() == auditEvent.Size() {
+				t.Skipf("skipping %s, event does not have any fields to trim", eventName)
+			}
+			trimmedEvent := toV2Proto(t, trimmedAuditEvent)
+
+			require.NotEqual(t, auditEvent, trimmedEvent)
+			require.LessOrEqual(t, trimmedAuditEvent.Size(), maxSize)
+			if trimmedAuditEvent.Size() != maxSize {
+				t.Logf("original event: %s\ntrimmed event: %s", protojson.Format(event), protojson.Format(trimmedEvent))
+			}
+
+			// ensure Metadata hasn't been trimmed
+			require.Equal(t, auditEvent.GetID(), trimmedAuditEvent.GetID())
+			require.Equal(t, auditEvent.GetCode(), trimmedAuditEvent.GetCode())
+			require.Equal(t, auditEvent.GetType(), trimmedAuditEvent.GetType())
+			require.Equal(t, auditEvent.GetClusterName(), trimmedAuditEvent.GetClusterName())
+		})
+	}
+}
+
+type testingVal interface {
+	Helper()
+	require.TestingT
+}
+
+func setProtoFields(msg proto.Message) {
+	m := msg.ProtoReflect()
+	fields := m.Descriptor().Fields()
+
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		if m.Has(fd) {
+			continue
+		}
+
+		if fd.IsList() {
+			// Handle repeated fields
+			listValue := m.Mutable(fd).List()
+			if fd.Kind() == protoreflect.MessageKind {
+				listMsg := listValue.AppendMutable().Message()
+				setProtoFields(listMsg.Interface())
+			} else {
+				listValue.Append(getDefaultValue(m, fd))
+			}
+			continue
+		}
+
+		switch fd.Kind() {
+		case protoreflect.MessageKind:
+			if fd.IsMap() {
+				// Handle map values
+				mapValue := m.Mutable(fd).Map()
+				keyDesc := fd.MapKey()
+				valueDesc := fd.MapValue()
+
+				keyVal := getDefaultValue(m, keyDesc).MapKey()
+				var valueVal protoreflect.Value
+
+				if valueDesc.Kind() == protoreflect.MessageKind {
+					valueMsg := mapValue.NewValue().Message()
+					setProtoFields(valueMsg.Interface())
+					valueVal = protoreflect.ValueOfMessage(valueMsg)
+				} else {
+					valueVal = getDefaultValue(m, valueDesc)
+				}
+
+				mapValue.Set(keyVal, valueVal)
+			} else {
+				// Handle singular message fields
+				nestedMsg := m.Mutable(fd).Message()
+				setProtoFields(nestedMsg.Interface())
+			}
+		default:
+			m.Set(fd, getDefaultValue(m, fd))
+		}
+	}
+}
+
+const metadataString = "some metadata"
+
+var (
+	eventString = strings.Repeat("umai", 170)
+)
+
+func getDefaultValue(m protoreflect.Message, fd protoreflect.FieldDescriptor) protoreflect.Value {
+	strVal := metadataString
+	msgName := string(m.Descriptor().Name())
+	// set shorter strings for metadata fields which won't be trimmed
+	if msgName == "CommandMetadata" || !strings.Contains(msgName, "Metadata") {
+		strVal = eventString
+	}
+
+	switch fd.Kind() {
+	case protoreflect.BoolKind:
+		return protoreflect.ValueOfBool(true)
+	case protoreflect.Int32Kind, protoreflect.Int64Kind:
+		return protoreflect.ValueOfInt64(6)
+	case protoreflect.Uint32Kind, protoreflect.Uint64Kind:
+		return protoreflect.ValueOfUint64(7)
+	case protoreflect.FloatKind, protoreflect.DoubleKind:
+		return protoreflect.ValueOfFloat64(3.14)
+	case protoreflect.StringKind:
+		return protoreflect.ValueOfString(strVal)
+	case protoreflect.BytesKind:
+		return protoreflect.ValueOfBytes([]byte(strVal))
+	case protoreflect.EnumKind:
+		enumValues := fd.Enum().Values()
+		if enumValues.Len() > 0 {
+			return protoreflect.ValueOfEnum(enumValues.Get(0).Number())
+		}
+	case protoreflect.MessageKind:
+		// Handle singular message fields
+		nestedMsg := m.NewField(fd).Message()
+		setProtoFields(nestedMsg.Interface())
+		return protoreflect.ValueOfMessage(nestedMsg)
+	default:
+		panic(fmt.Sprintf("unhandled field kind: %s", fd.Kind()))
+	}
+	return protoreflect.Value{} // This should never happen
+}
+
+func toV2Proto(t testingVal, e apievents.AuditEvent) protoreflect.ProtoMessage {
+	t.Helper()
+
+	pm, ok := e.(protoiface.MessageV1)
+	require.True(t, ok)
+	return protoadapt.MessageV2Of(pm)
 }

@@ -1,35 +1,38 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
 	"context"
 	"encoding/hex"
-	"sort"
+	"errors"
+	"strings"
+
+	"github.com/gravitational/trace"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/trace"
-
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
+	"github.com/gravitational/teleport/lib/automaticupgrades/version"
 )
 
 // GetKubeClient returns instance of client to the kubernetes cluster
@@ -102,7 +105,7 @@ func GetKubeConfig(configPath string, allConfigEntries bool, clusterName string)
 	case configPath == "" && clusterName != "":
 		cfg, err := rest.InClusterConfig()
 		if err != nil {
-			if err == rest.ErrNotInCluster {
+			if errors.Is(err, rest.ErrNotInCluster) {
 				return nil, trace.NotFound("not running inside of a Kubernetes pod")
 			}
 			return nil, trace.Wrap(err)
@@ -138,88 +141,63 @@ func GetKubeConfig(configPath string, allConfigEntries bool, clusterName string)
 //
 // It is hex encoded to allow wildcard matching to work. In DNS wildcard match
 // include only one '.'
-//
 func EncodeClusterName(clusterName string) string {
 	// k is to avoid first letter to be a number
 	return "k" + hex.EncodeToString([]byte(clusterName))
 }
 
-// KubeServicesPresence fetches a list of registered kubernetes services.
-// It's a subset of services.Presence.
-type KubeServicesPresence interface {
-	// GetKubeServices returns a list of registered kubernetes services.
-	GetKubeServices(context.Context) ([]types.Server, error)
-}
-
-// KubeClusterNames returns a sorted list of unique kubernetes clusters
+// ListKubeClustersWithFilters returns a sorted list of unique kubernetes clusters
 // registered in p.
-//
-// DELETE IN 11.0.0, replaced by ListKubeClusterNamesWithFilters
-func KubeClusterNames(ctx context.Context, p KubeServicesPresence) ([]string, error) {
-	kss, err := p.GetKubeServices(ctx)
+func ListKubeClustersWithFilters(ctx context.Context, p client.GetResourcesClient, req proto.ListResourcesRequest) ([]types.KubeCluster, error) {
+	req.ResourceType = types.KindKubeServer
+
+	kss, err := client.GetAllResources[types.KubeServer](ctx, p, &req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return extractAndSortKubeClusterNames(kss), nil
+
+	return extractAndSortKubeClusters(kss), nil
 }
 
-// ListKubeClusterNamesWithFilters returns a sorted list of unique kubernetes clusters
-// registered in p.
-func ListKubeClusterNamesWithFilters(ctx context.Context, p client.ListResourcesClient, req proto.ListResourcesRequest) ([]string, error) {
-	req.ResourceType = types.KindKubeService
-	var kss []types.Server
-
-	resources, err := client.GetResourcesWithFilters(ctx, p, req)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	kss, err = types.ResourcesWithLabels(resources).AsServers()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return extractAndSortKubeClusterNames(kss), nil
-}
-
-func extractAndSortKubeClusterNames(kss []types.Server) []string {
-	kubeClusters := make(map[string]struct{})
+func extractAndSortKubeClusters(kss []types.KubeServer) []types.KubeCluster {
+	uniqueClusters := make(map[string]types.KubeCluster)
 	for _, ks := range kss {
-		for _, kc := range ks.GetKubernetesClusters() {
-			kubeClusters[kc.Name] = struct{}{}
-		}
+		uniqueClusters[ks.GetName()] = ks.GetCluster()
 	}
-	kubeClusterNames := make([]string, 0, len(kubeClusters))
-	for n := range kubeClusters {
-		kubeClusterNames = append(kubeClusterNames, n)
+	kubeClusters := make([]types.KubeCluster, 0, len(uniqueClusters))
+	for _, cluster := range uniqueClusters {
+		kubeClusters = append(kubeClusters, cluster)
 	}
-	sort.Strings(kubeClusterNames)
-	return kubeClusterNames
+
+	sorted := types.KubeClusters(kubeClusters)
+	sorted.SortByCustom(types.SortBy{
+		Field: types.ResourceMetadataName,
+	})
+
+	return []types.KubeCluster(sorted)
 }
 
-// CheckOrSetKubeCluster validates kubeClusterName if it's set, or a sane
-// default based on registered clusters.
-//
-// If no clusters are registered, a NotFound error is returned.
-func CheckOrSetKubeCluster(ctx context.Context, p KubeServicesPresence, kubeClusterName, teleportClusterName string) (string, error) {
-	kubeClusterNames, err := KubeClusterNames(ctx, p)
+type Pinger interface {
+	Ping(context.Context) (proto.PingResponse, error)
+}
+
+// GetKubeAgentVersion returns a version of the Kube agent appropriate for this Teleport cluster. Used for example when deciding version
+// for enrolling EKS clusters.
+func GetKubeAgentVersion(ctx context.Context, pinger Pinger, clusterFeatures proto.Features, versionGetter version.Getter) (string, error) {
+	pingResponse, err := pinger.Ping(ctx)
 	if err != nil {
 		return "", trace.Wrap(err)
 	}
-	if kubeClusterName != "" {
-		if !apiutils.SliceContainsStr(kubeClusterNames, kubeClusterName) {
-			return "", trace.BadParameter("kubernetes cluster %q is not registered in this teleport cluster; you can list registered kubernetes clusters using 'tsh kube ls'", kubeClusterName)
+	agentVersion := pingResponse.ServerVersion
+
+	if clusterFeatures.GetAutomaticUpgrades() && clusterFeatures.GetCloud() {
+		defaultVersion, err := versionGetter.GetVersion(ctx)
+		if err == nil {
+			agentVersion = defaultVersion
+		} else if !errors.Is(err, &version.NoNewVersionError{}) {
+			return "", trace.Wrap(err)
 		}
-		return kubeClusterName, nil
 	}
-	// Default is the cluster with a name matching the Teleport cluster
-	// name (for backwards-compatibility with pre-5.0 behavior) or the
-	// first name alphabetically.
-	if len(kubeClusterNames) == 0 {
-		return "", trace.NotFound("no kubernetes clusters registered")
-	}
-	if apiutils.SliceContainsStr(kubeClusterNames, teleportClusterName) {
-		return teleportClusterName, nil
-	}
-	return kubeClusterNames[0], nil
+
+	return strings.TrimPrefix(agentVersion, "v"), nil
 }

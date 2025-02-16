@@ -36,7 +36,7 @@ Some access workflows plugins will become available in the open source:
 * JIRA Plugin
 * PagerDuty Plugin
 
-### Enteprise Only Features
+### Enterprise Only Features
 
 The following features will remain enterprise only.
 
@@ -90,7 +90,11 @@ role:
    name: user
 spec:
   options:
-    port_forwarding: true
+    ssh_port_forwarding:
+      remote:
+        enabled: true
+      local:
+        enabled: true
     max_session_ttl: 30h
     forward_agent: true
     enhanced_recording: ['command', 'network']

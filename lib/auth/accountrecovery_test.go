@@ -1,49 +1,57 @@
-/**
- * Copyright 2021 Gravitational, Inc.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package auth
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/api/types"
-	apievents "github.com/gravitational/teleport/api/types/events"
-	wantypes "github.com/gravitational/teleport/api/types/webauthn"
-	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/constants"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
+	"github.com/gravitational/teleport/api/types"
+	apievents "github.com/gravitational/teleport/api/types/events"
+	wanpb "github.com/gravitational/teleport/api/types/webauthn"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/modules"
 )
 
 // TestGenerateAndUpsertRecoveryCodes tests the following:
-//  - generation of recovery codes are of correct format
-//  - recovery codes are upserted
-//  - recovery codes can be verified and marked used
-//  - reusing a used or non-existing token returns error
+//   - generation of recovery codes are of correct format
+//   - recovery codes are upserted
+//   - recovery codes can be verified and marked used
+//   - reusing a used or non-existing token returns error
 func TestGenerateAndUpsertRecoveryCodes(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
@@ -99,7 +107,7 @@ func TestRecoveryCodeEventsEmitted(t *testing.T) {
 	t.Parallel()
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	mockEmitter := &events.MockEmitter{}
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	user := "fake@fake.com"
@@ -129,13 +137,13 @@ func TestRecoveryCodeEventsEmitted(t *testing.T) {
 func TestStartAccountRecovery(t *testing.T) {
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	fakeClock := srv.Clock().(clockwork.FakeClock)
-	mockEmitter := &events.MockEmitter{}
+	fakeClock := srv.Clock().(*clockwork.FakeClock)
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -174,14 +182,14 @@ func TestStartAccountRecovery(t *testing.T) {
 				RecoverType:  c.recoverType,
 			})
 			require.NoError(t, err)
-			require.Equal(t, UserTokenTypeRecoveryStart, startToken.GetSubKind())
+			require.Equal(t, authclient.UserTokenTypeRecoveryStart, startToken.GetSubKind())
 			require.Equal(t, c.recoverType, startToken.GetUsage())
 			require.Equal(t, startToken.GetURL(), fmt.Sprintf("https://<proxyhost>:3080/web/recovery/steps/%s/verify", startToken.GetName()))
 
 			// Test token returned correct byte length.
 			bytes, err := hex.DecodeString(startToken.GetName())
 			require.NoError(t, err)
-			require.Len(t, bytes, RecoveryTokenLenBytes)
+			require.Len(t, bytes, defaults.RecoveryTokenLenBytes)
 
 			// Test expired token.
 			fakeClock.Advance(defaults.RecoveryStartTokenTTL)
@@ -190,9 +198,9 @@ func TestStartAccountRecovery(t *testing.T) {
 
 			// Test events emitted.
 			event := mockEmitter.LastEvent()
-			require.Equal(t, event.GetType(), events.RecoveryTokenCreateEvent)
-			require.Equal(t, event.GetCode(), events.RecoveryTokenCreateCode)
-			require.Equal(t, event.(*apievents.UserTokenCreate).Name, u.username)
+			require.Equal(t, events.RecoveryTokenCreateEvent, event.GetType())
+			require.Equal(t, events.RecoveryTokenCreateCode, event.GetCode())
+			require.Equal(t, u.username, event.(*apievents.UserTokenCreate).Name)
 		})
 	}
 }
@@ -203,7 +211,7 @@ func TestStartAccountRecovery_WithLock(t *testing.T) {
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -220,34 +228,6 @@ func TestStartAccountRecovery_WithLock(t *testing.T) {
 		RecoverType:  types.UserTokenUsage_USER_TOKEN_RECOVER_MFA,
 	})
 	require.NoError(t, err)
-
-	// Trigger max failed recovery attempts.
-	for i := 1; i <= defaults.MaxAccountRecoveryAttempts; i++ {
-		_, err = srv.Auth().StartAccountRecovery(ctx, &proto.StartAccountRecoveryRequest{
-			Username: u.username,
-		})
-		require.True(t, trace.IsAccessDenied(err))
-
-		if i == defaults.MaxAccountRecoveryAttempts {
-			require.Equal(t, MaxFailedAttemptsFromStartRecoveryErrMsg, err.Error())
-		}
-	}
-
-	// Test recovery is denied from attempt recovery lock.
-	_, err = srv.Auth().StartAccountRecovery(ctx, &proto.StartAccountRecoveryRequest{
-		Username:     u.username,
-		RecoveryCode: []byte(u.recoveryCodes[1]),
-		RecoverType:  types.UserTokenUsage_USER_TOKEN_RECOVER_MFA,
-	})
-	require.True(t, trace.IsAccessDenied(err))
-	require.Equal(t, startRecoveryMaxFailedAttemptsErrMsg, err.Error())
-
-	// Test locks have been placed.
-	user, err := srv.Auth().GetUser(u.username, false)
-	require.NoError(t, err)
-	require.True(t, user.GetStatus().IsLocked)
-	require.False(t, user.GetStatus().RecoveryAttemptLockExpires.IsZero())
-	require.Equal(t, user.GetStatus().LockExpires, user.GetStatus().RecoveryAttemptLockExpires)
 }
 
 func TestStartAccountRecovery_UserErrors(t *testing.T) {
@@ -256,7 +236,7 @@ func TestStartAccountRecovery_UserErrors(t *testing.T) {
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -312,13 +292,13 @@ func TestStartAccountRecovery_UserErrors(t *testing.T) {
 func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	fakeClock := srv.Clock().(clockwork.FakeClock)
-	mockEmitter := &events.MockEmitter{}
+	fakeClock := srv.Clock().(*clockwork.FakeClock)
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -356,7 +336,7 @@ func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 				AuthnCred: &proto.VerifyAccountRecoveryRequest_MFAAuthenticateResponse{
 					MFAAuthenticateResponse: &proto.MFAAuthenticateResponse{
 						Response: &proto.MFAAuthenticateResponse_Webauthn{
-							Webauthn: &wantypes.CredentialAssertionResponse{}, // invalid response
+							Webauthn: &wanpb.CredentialAssertionResponse{}, // invalid response
 						},
 					},
 				},
@@ -388,7 +368,7 @@ func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			// Acquire a start token.
-			startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, c.recoverType)
+			startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryStart, c.recoverType)
 			require.NoError(t, err)
 
 			// Try a failed attempt, to test it gets cleared later.
@@ -398,16 +378,11 @@ func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 			require.True(t, trace.IsAccessDenied(err))
 			require.Equal(t, verifyRecoveryBadAuthnErrMsg, err.Error())
 
-			attempts, err := srv.Auth().GetUserRecoveryAttempts(ctx, u.username)
-			require.NoError(t, err)
-			require.Len(t, attempts, 1)
-
 			// Get request with authn.
 			mfaChallenge, err := srv.Auth().CreateAuthenticateChallenge(ctx, &proto.CreateAuthenticateChallengeRequest{
-				Request: &proto.CreateAuthenticateChallengeRequest_UserCredentials{UserCredentials: &proto.UserCredentials{
-					Username: u.username,
-					Password: u.password,
-				}},
+				Request: &proto.CreateAuthenticateChallengeRequest_RecoveryStartTokenID{
+					RecoveryStartTokenID: startToken.GetName(),
+				},
 			})
 			require.NoError(t, err)
 			req := c.createValidReq(mfaChallenge)
@@ -417,14 +392,14 @@ func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 			// Acquire an approval token with the start token.
 			approvedToken, err := srv.Auth().VerifyAccountRecovery(ctx, req)
 			require.NoError(t, err)
-			require.Equal(t, UserTokenTypeRecoveryApproved, approvedToken.GetSubKind())
+			require.Equal(t, authclient.UserTokenTypeRecoveryApproved, approvedToken.GetSubKind())
 			require.Equal(t, c.recoverType.String(), approvedToken.GetUsage().String())
 
 			// Test events emitted.
 			event := mockEmitter.LastEvent()
-			require.Equal(t, event.GetType(), events.RecoveryTokenCreateEvent)
-			require.Equal(t, event.GetCode(), events.RecoveryTokenCreateCode)
-			require.Equal(t, event.(*apievents.UserTokenCreate).Name, u.username)
+			require.Equal(t, events.RecoveryTokenCreateEvent, event.GetType())
+			require.Equal(t, events.RecoveryTokenCreateCode, event.GetCode())
+			require.Equal(t, u.username, event.(*apievents.UserTokenCreate).Name)
 
 			// Test start token got deleted.
 			_, err = srv.Auth().GetUserToken(ctx, startToken.GetName())
@@ -434,11 +409,6 @@ func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 			fakeClock.Advance(defaults.RecoveryApprovedTokenTTL)
 			_, err = srv.Auth().GetUserToken(ctx, approvedToken.GetName())
 			require.True(t, trace.IsNotFound(err))
-
-			// Test recovery attempts are deleted.
-			attempts, err = srv.Auth().GetUserRecoveryAttempts(ctx, u.username)
-			require.NoError(t, err)
-			require.Len(t, attempts, 0)
 		})
 	}
 }
@@ -446,12 +416,12 @@ func TestVerifyAccountRecovery_WithAuthnErrors(t *testing.T) {
 func TestVerifyAccountRecovery_WithLock(t *testing.T) {
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	mockEmitter := &events.MockEmitter{}
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -459,7 +429,7 @@ func TestVerifyAccountRecovery_WithLock(t *testing.T) {
 	require.NoError(t, err)
 
 	// Acquire a start token.
-	startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+	startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 	require.NoError(t, err)
 
 	// Trigger login lock.
@@ -472,55 +442,17 @@ func TestVerifyAccountRecovery_WithLock(t *testing.T) {
 		AuthnCred:            &proto.VerifyAccountRecoveryRequest_Password{Password: u.password},
 	})
 	require.NoError(t, err)
-
-	// Acquire another start token, as last success would have deleted it.
-	startToken, err = srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
-	require.NoError(t, err)
-
-	// Trigger max failed recovery attempts.
-	for i := 1; i <= defaults.MaxAccountRecoveryAttempts; i++ {
-		_, err = srv.Auth().VerifyAccountRecovery(ctx, &proto.VerifyAccountRecoveryRequest{
-			RecoveryStartTokenID: startToken.GetName(),
-			Username:             u.username,
-			AuthnCred:            &proto.VerifyAccountRecoveryRequest_Password{Password: []byte("wrong-password")},
-		})
-		require.True(t, trace.IsAccessDenied(err))
-
-		if i == defaults.MaxAccountRecoveryAttempts {
-			require.Equal(t, MaxFailedAttemptsFromVerifyRecoveryErrMsg, err.Error())
-		}
-	}
-
-	// Test start token is deleted from max failed attempts.
-	_, err = srv.Auth().VerifyAccountRecovery(ctx, &proto.VerifyAccountRecoveryRequest{
-		Username:             u.username,
-		RecoveryStartTokenID: startToken.GetName(),
-		AuthnCred:            &proto.VerifyAccountRecoveryRequest_Password{Password: u.password},
-	})
-	require.True(t, trace.IsAccessDenied(err))
-
-	// Test only login is locked.
-	user, err := srv.Auth().GetUser(u.username, false)
-	require.NoError(t, err)
-	require.True(t, user.GetStatus().IsLocked)
-	require.True(t, user.GetStatus().RecoveryAttemptLockExpires.IsZero())
-	require.False(t, user.GetStatus().LockExpires.IsZero())
-
-	// Test recovery attempts got reset.
-	attempts, err := srv.Auth().GetUserRecoveryAttempts(ctx, u.username)
-	require.NoError(t, err)
-	require.Len(t, attempts, 0)
 }
 
 func TestVerifyAccountRecovery_WithErrors(t *testing.T) {
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	mockEmitter := &events.MockEmitter{}
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -536,7 +468,7 @@ func TestVerifyAccountRecovery_WithErrors(t *testing.T) {
 			name: "invalid token type",
 			getRequest: func() *proto.VerifyAccountRecoveryRequest {
 				// Generate an incorrect token type.
-				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.VerifyAccountRecoveryRequest{
@@ -558,7 +490,7 @@ func TestVerifyAccountRecovery_WithErrors(t *testing.T) {
 			expErrMsg: verifyRecoveryBadAuthnErrMsg,
 			getRequest: func() *proto.VerifyAccountRecoveryRequest {
 				// Acquire a start token.
-				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.VerifyAccountRecoveryRequest{
@@ -572,7 +504,7 @@ func TestVerifyAccountRecovery_WithErrors(t *testing.T) {
 			expErrMsg: verifyRecoveryBadAuthnErrMsg,
 			getRequest: func() *proto.VerifyAccountRecoveryRequest {
 				// Acquire a start token for recovering second factor.
-				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.VerifyAccountRecoveryRequest{
@@ -586,7 +518,7 @@ func TestVerifyAccountRecovery_WithErrors(t *testing.T) {
 			expErrMsg: verifyRecoveryBadAuthnErrMsg,
 			getRequest: func() *proto.VerifyAccountRecoveryRequest {
 				// Acquire a start token for recovering password.
-				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_PASSWORD)
+				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_PASSWORD)
 				require.NoError(t, err)
 
 				return &proto.VerifyAccountRecoveryRequest{
@@ -614,12 +546,12 @@ func TestVerifyAccountRecovery_WithErrors(t *testing.T) {
 func TestCompleteAccountRecovery(t *testing.T) {
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	mockEmitter := &events.MockEmitter{}
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -630,7 +562,7 @@ func TestCompleteAccountRecovery(t *testing.T) {
 	triggerLoginLock(t, srv.Auth(), u.username)
 
 	// Acquire an approved token for recovering password.
-	approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_PASSWORD)
+	approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_PASSWORD)
 	require.NoError(t, err)
 
 	err = srv.Auth().CompleteAccountRecovery(ctx, &proto.CompleteAccountRecoveryRequest{
@@ -640,64 +572,71 @@ func TestCompleteAccountRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test locks are removed.
-	user, err := srv.Auth().GetUser(u.username, false)
+	user, err := srv.Auth().GetUser(ctx, u.username, false)
 	require.NoError(t, err)
 	require.False(t, user.GetStatus().IsLocked)
-	require.True(t, user.GetStatus().RecoveryAttemptLockExpires.IsZero())
 	require.True(t, user.GetStatus().LockExpires.IsZero())
 
 	// Test login attempts are removed.
 	attempts, err := srv.Auth().GetUserLoginAttempts(u.username)
 	require.NoError(t, err)
-	require.Len(t, attempts, 0)
+	require.Empty(t, attempts)
 
 	// Test adding MFA devices.
-	approvedToken, err = srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+	approvedToken, err = srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 	require.NoError(t, err)
 
 	cases := []struct {
 		name       string
-		getRequest func() *proto.CompleteAccountRecoveryRequest
+		getRequest func(t *testing.T) *proto.CompleteAccountRecoveryRequest
 	}{
 		{
 			name: "add new TOTP device",
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
-				res, err := srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
+				registerChal, err := srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
 					TokenID:    approvedToken.GetName(),
 					DeviceType: proto.DeviceType_DEVICE_TYPE_TOTP,
 				})
-				require.NoError(t, err)
+				require.NoError(t, err, "CreateRegisterChallenge")
 
-				otpCode, err := totp.GenerateCode(res.GetTOTP().GetSecret(), srv.Clock().Now())
-				require.NoError(t, err)
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal, WithTestDeviceClock(srv.Clock()))
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.CompleteAccountRecoveryRequest{
 					NewDeviceName:           "new-otp",
 					RecoveryApprovedTokenID: approvedToken.GetName(),
-					NewAuthnCred: &proto.CompleteAccountRecoveryRequest_NewMFAResponse{NewMFAResponse: &proto.MFARegisterResponse{
-						Response: &proto.MFARegisterResponse_TOTP{TOTP: &proto.TOTPRegisterResponse{Code: otpCode}},
-					}},
+					NewAuthnCred: &proto.CompleteAccountRecoveryRequest_NewMFAResponse{
+						NewMFAResponse: registerSolved,
+					},
 				}
 			},
 		},
 		{
 			name: "add new WEBAUTHN device",
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
-				_, webauthnRegRes, err := getMockedWebauthnAndRegisterRes(srv.Auth(), approvedToken.GetName())
-				require.NoError(t, err)
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
+				registerChal, err := srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+					TokenID:     approvedToken.GetName(),
+					DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+					DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+				})
+				require.NoError(t, err, "CreateRegisterChallenge")
+
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal)
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.CompleteAccountRecoveryRequest{
 					NewDeviceName:           "new-webauthn",
 					RecoveryApprovedTokenID: approvedToken.GetName(),
-					NewAuthnCred:            &proto.CompleteAccountRecoveryRequest_NewMFAResponse{NewMFAResponse: webauthnRegRes},
+					NewAuthnCred: &proto.CompleteAccountRecoveryRequest_NewMFAResponse{
+						NewMFAResponse: registerSolved,
+					},
 				}
 			},
 		},
 	}
-
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			req := c.getRequest()
+			req := c.getRequest(t)
 
 			// Change authentication.
 			err = srv.Auth().CompleteAccountRecovery(ctx, req)
@@ -705,12 +644,12 @@ func TestCompleteAccountRecovery(t *testing.T) {
 
 			// Test events emitted.
 			event := mockEmitter.LastEvent()
-			require.Equal(t, event.GetType(), events.MFADeviceAddEvent)
-			require.Equal(t, event.GetCode(), events.MFADeviceAddEventCode)
-			require.Equal(t, event.(*apievents.MFADeviceAdd).UserMetadata.User, u.username)
+			require.Equal(t, events.MFADeviceAddEvent, event.GetType())
+			require.Equal(t, events.MFADeviceAddEventCode, event.GetCode())
+			require.Equal(t, u.username, event.(*apievents.MFADeviceAdd).UserMetadata.User)
 
 			// Test new device has been added.
-			mfas, err := srv.Auth().Identity.GetMFADevices(ctx, u.username, false)
+			mfas, err := srv.Auth().Services.GetMFADevices(ctx, u.username, false)
 			require.NoError(t, err)
 
 			found := false
@@ -728,12 +667,12 @@ func TestCompleteAccountRecovery(t *testing.T) {
 func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 	srv := newTestTLSServer(t)
 	ctx := context.Background()
-	mockEmitter := &events.MockEmitter{}
+	mockEmitter := &eventstest.MockRecorderEmitter{}
 	srv.Auth().emitter = mockEmitter
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -745,14 +684,14 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		expErrMsg      string
 		isDuplicate    bool
 		isBadParameter bool
-		getRequest     func() *proto.CompleteAccountRecoveryRequest
+		getRequest     func(t *testing.T) *proto.CompleteAccountRecoveryRequest
 	}{
 		{
 			name: "invalid token type",
 			// expectErrMsg not supplied on purpose, there is no const err message for this error.
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				// Generate an incorrect token type.
-				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				startToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.CompleteAccountRecoveryRequest{
@@ -763,7 +702,7 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		{
 			name:      "token not found",
 			expErrMsg: completeRecoveryGenericErrMsg,
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				return &proto.CompleteAccountRecoveryRequest{
 					RecoveryApprovedTokenID: "non-existent-token-id",
 				}
@@ -772,9 +711,9 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		{
 			name:      "provide new password when it expects new MFA register response",
 			expErrMsg: completeRecoveryGenericErrMsg,
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				// Acquire an approved token for recovering second factor.
-				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.CompleteAccountRecoveryRequest{
@@ -786,9 +725,9 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		{
 			name:      "provide new MFA register response when it expects new password",
 			expErrMsg: completeRecoveryGenericErrMsg,
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				// Acquire an approved token for recovering password.
-				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_PASSWORD)
+				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_PASSWORD)
 				require.NoError(t, err)
 
 				return &proto.CompleteAccountRecoveryRequest{
@@ -800,25 +739,31 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		{
 			name:        "duplicate device name",
 			isDuplicate: true,
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				// Acquire an approved token for recovering second factor.
-				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				// Retrieve list of devices to get the name of an existing device.
-				devs, err := srv.Auth().Identity.GetMFADevices(ctx, u.username, false)
+				devs, err := srv.Auth().Services.GetMFADevices(ctx, u.username, false)
 				require.NoError(t, err)
 				require.NotEmpty(t, devs)
 
-				// New register response.
-				_, mfaResp, err := getMockedWebauthnAndRegisterRes(srv.Auth(), approvedToken.GetName())
-				require.NoError(t, err)
+				registerChal, err := srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+					TokenID:     approvedToken.GetName(),
+					DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+					DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+				})
+				require.NoError(t, err, "CreateRegisterChallenge")
+
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal)
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.CompleteAccountRecoveryRequest{
 					RecoveryApprovedTokenID: approvedToken.GetName(),
 					NewDeviceName:           devs[0].GetName(),
 					NewAuthnCred: &proto.CompleteAccountRecoveryRequest_NewMFAResponse{
-						NewMFAResponse: mfaResp,
+						NewMFAResponse: registerSolved,
 					},
 				}
 			},
@@ -826,9 +771,9 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		{
 			name:           "providing TOTP fields when TOTP is not enabled by auth settings",
 			isBadParameter: true,
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				// Acquire an approved token for recovering second factor.
-				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
@@ -839,7 +784,7 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 					},
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, ap)
+				_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 				require.NoError(t, err)
 
 				return &proto.CompleteAccountRecoveryRequest{
@@ -853,9 +798,9 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 		{
 			name:           "providing Webauthn fields when Webauthn is not enabled by auth settings",
 			isBadParameter: true,
-			getRequest: func() *proto.CompleteAccountRecoveryRequest {
+			getRequest: func(t *testing.T) *proto.CompleteAccountRecoveryRequest {
 				// Acquire an approved token for recovering second factor.
-				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				approvedToken, err := srv.Auth().createRecoveryToken(ctx, u.username, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
@@ -863,7 +808,7 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 					SecondFactor: constants.SecondFactorOTP,
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, ap)
+				_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 				require.NoError(t, err)
 
 				return &proto.CompleteAccountRecoveryRequest{
@@ -871,7 +816,7 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 					NewAuthnCred: &proto.CompleteAccountRecoveryRequest_NewMFAResponse{
 						NewMFAResponse: &proto.MFARegisterResponse{
 							Response: &proto.MFARegisterResponse_Webauthn{
-								Webauthn: &wantypes.CredentialCreationResponse{},
+								Webauthn: &wanpb.CredentialCreationResponse{},
 							},
 						},
 					},
@@ -879,10 +824,9 @@ func TestCompleteAccountRecovery_WithErrors(t *testing.T) {
 			},
 		},
 	}
-
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err = srv.Auth().CompleteAccountRecovery(ctx, c.getRequest())
+			err = srv.Auth().CompleteAccountRecovery(ctx, c.getRequest(t))
 			switch {
 			case c.isDuplicate:
 				require.True(t, trace.IsAlreadyExists(err))
@@ -905,7 +849,7 @@ func TestAccountRecoveryFlow(t *testing.T) {
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -988,13 +932,22 @@ func TestAccountRecoveryFlow(t *testing.T) {
 				}
 			},
 			getCompleteRequest: func(u *userAuthCreds, approvedTokenID string) *proto.CompleteAccountRecoveryRequest {
-				_, webauthnRegRes, err := getMockedWebauthnAndRegisterRes(srv.Auth(), approvedTokenID)
-				require.NoError(t, err)
+				registerChal, err := srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+					TokenID:     approvedTokenID,
+					DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+					DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+				})
+				require.NoError(t, err, "CreateRegisterChallenge")
+
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal)
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.CompleteAccountRecoveryRequest{
 					NewDeviceName:           "new-webauthn",
 					RecoveryApprovedTokenID: approvedTokenID,
-					NewAuthnCred:            &proto.CompleteAccountRecoveryRequest_NewMFAResponse{NewMFAResponse: webauthnRegRes},
+					NewAuthnCred: &proto.CompleteAccountRecoveryRequest_NewMFAResponse{
+						NewMFAResponse: registerSolved,
+					},
 				}
 			},
 		},
@@ -1046,10 +999,9 @@ func TestAccountRecoveryFlow(t *testing.T) {
 
 			// Step 2: Obtain an approval token using the start token.
 			mfaChallenge, err := srv.Auth().CreateAuthenticateChallenge(ctx, &proto.CreateAuthenticateChallengeRequest{
-				Request: &proto.CreateAuthenticateChallengeRequest_UserCredentials{UserCredentials: &proto.UserCredentials{
-					Username: user.username,
-					Password: user.password,
-				}},
+				Request: &proto.CreateAuthenticateChallengeRequest_RecoveryStartTokenID{
+					RecoveryStartTokenID: startToken.GetName(),
+				},
 			})
 			require.NoError(t, err)
 			approvedToken, err := srv.Auth().VerifyAccountRecovery(ctx, c.getApproveRequest(user, mfaChallenge, startToken.GetName()))
@@ -1077,14 +1029,14 @@ func TestGetAccountRecoveryToken(t *testing.T) {
 			name:    "invalid token type",
 			wantErr: true,
 			getRequest: func() *proto.GetAccountRecoveryTokenRequest {
-				wrongTokenType, err := srv.Auth().newUserToken(CreateUserTokenRequest{
+				wrongTokenType, err := srv.Auth().newUserToken(authclient.CreateUserTokenRequest{
 					Name: "llama",
 					TTL:  5 * time.Minute,
-					Type: UserTokenTypeResetPassword,
+					Type: authclient.UserTokenTypeResetPassword,
 				})
 				require.NoError(t, err)
 
-				_, err = srv.Auth().Identity.CreateUserToken(ctx, wrongTokenType)
+				_, err = srv.Auth().CreateUserToken(ctx, wrongTokenType)
 				require.NoError(t, err)
 
 				return &proto.GetAccountRecoveryTokenRequest{
@@ -1103,9 +1055,9 @@ func TestGetAccountRecoveryToken(t *testing.T) {
 		},
 		{
 			name:      "recovery start token",
-			tokenType: UserTokenTypeRecoveryStart,
+			tokenType: authclient.UserTokenTypeRecoveryStart,
 			getRequest: func() *proto.GetAccountRecoveryTokenRequest {
-				token, err := srv.Auth().createRecoveryToken(ctx, "llama", UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				token, err := srv.Auth().createRecoveryToken(ctx, "llama", authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.GetAccountRecoveryTokenRequest{
@@ -1115,9 +1067,9 @@ func TestGetAccountRecoveryToken(t *testing.T) {
 		},
 		{
 			name:      "recovery approve token",
-			tokenType: UserTokenTypeRecoveryApproved,
+			tokenType: authclient.UserTokenTypeRecoveryApproved,
 			getRequest: func() *proto.GetAccountRecoveryTokenRequest {
-				token, err := srv.Auth().createRecoveryToken(ctx, "llama", UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				token, err := srv.Auth().createRecoveryToken(ctx, "llama", authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.GetAccountRecoveryTokenRequest{
@@ -1151,7 +1103,7 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -1162,20 +1114,23 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = srv.Auth().SetAuthPreference(ctx, ap)
+	_, err = srv.Auth().UpsertAuthPreference(ctx, ap)
 	require.NoError(t, err)
 
+	const user = "llama@example.com"
+	_, _, err = CreateUserAndRole(srv.Auth(), user, []string{user}, nil /* allowRules */)
+	require.NoError(t, err, "CreateUserAndRole failed")
+
 	cases := []struct {
-		name        string
-		wantErr     bool
-		forRecovery bool
-		getRequest  func() *proto.CreateAccountRecoveryCodesRequest
+		name       string
+		wantErr    bool
+		getRequest func() *proto.CreateAccountRecoveryCodesRequest
 	}{
 		{
 			name:    "invalid token type",
 			wantErr: true,
 			getRequest: func() *proto.CreateAccountRecoveryCodesRequest {
-				token, err := srv.Auth().createRecoveryToken(ctx, "llama@example.com", UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				token, err := srv.Auth().createRecoveryToken(ctx, user, authclient.UserTokenTypeRecoveryStart, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.CreateAccountRecoveryCodesRequest{
@@ -1196,7 +1151,7 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 			name:    "invalid user name",
 			wantErr: true,
 			getRequest: func() *proto.CreateAccountRecoveryCodesRequest {
-				token, err := srv.Auth().createRecoveryToken(ctx, "invalid-username", UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				token, err := srv.Auth().createRecoveryToken(ctx, "invalid-username", authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.CreateAccountRecoveryCodesRequest{
@@ -1205,10 +1160,9 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 			},
 		},
 		{
-			name:        "recovery approved token",
-			forRecovery: true,
+			name: "recovery approved token",
 			getRequest: func() *proto.CreateAccountRecoveryCodesRequest {
-				token, err := srv.Auth().createRecoveryToken(ctx, "llama@example.com", UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
+				token, err := srv.Auth().createRecoveryToken(ctx, user, authclient.UserTokenTypeRecoveryApproved, types.UserTokenUsage_USER_TOKEN_RECOVER_MFA)
 				require.NoError(t, err)
 
 				return &proto.CreateAccountRecoveryCodesRequest{
@@ -1219,7 +1173,7 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 		{
 			name: "privilege token",
 			getRequest: func() *proto.CreateAccountRecoveryCodesRequest {
-				token, err := srv.Auth().createPrivilegeToken(ctx, "llama@example.com", UserTokenTypePrivilege)
+				token, err := srv.Auth().createPrivilegeToken(ctx, user, authclient.UserTokenTypePrivilege)
 				require.NoError(t, err)
 
 				return &proto.CreateAccountRecoveryCodesRequest{
@@ -1236,7 +1190,7 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 
 			switch {
 			case c.wantErr:
-				require.True(t, trace.IsAccessDenied(err))
+				require.True(t, trace.IsAccessDenied(err), "CreateAccountRecoveryCodes returned err=%v (%T), want AccessDenied", err, trace.Unwrap(err))
 
 			default:
 				require.NoError(t, err)
@@ -1244,13 +1198,8 @@ func TestCreateAccountRecoveryCodes(t *testing.T) {
 				require.NotEmpty(t, res.GetCreated())
 
 				// Check token is deleted after success.
-				_, err = srv.Auth().Identity.GetUserToken(ctx, req.TokenID)
-				switch {
-				case c.forRecovery:
-					require.True(t, trace.IsNotFound(err))
-				default:
-					require.NoError(t, err)
-				}
+				_, err = srv.Auth().GetUserToken(ctx, req.TokenID)
+				require.True(t, trace.IsNotFound(err))
 			}
 		})
 	}
@@ -1262,7 +1211,7 @@ func TestGetAccountRecoveryCodes(t *testing.T) {
 
 	modules.SetTestModules(t, &modules.TestModules{
 		TestFeatures: modules.Features{
-			Cloud: true,
+			RecoveryCodes: true,
 		},
 	})
 
@@ -1274,7 +1223,7 @@ func TestGetAccountRecoveryCodes(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	err = srv.Auth().SetAuthPreference(ctx, authPreference)
+	_, err = srv.Auth().UpsertAuthPreference(ctx, authPreference)
 	require.NoError(t, err)
 
 	u, err := createUserWithSecondFactors(srv)
@@ -1291,17 +1240,21 @@ func TestGetAccountRecoveryCodes(t *testing.T) {
 
 func triggerLoginLock(t *testing.T, srv *Server, username string) {
 	for i := 1; i <= defaults.MaxLoginAttempts; i++ {
-		_, _, err := srv.authenticateUser(context.Background(), AuthenticateUserRequest{
-			Username: username,
-			OTP:      &OTPCreds{},
-		})
+		_, _, _, err := srv.authenticateUser(
+			context.Background(),
+			authclient.AuthenticateUserRequest{
+				Username: username,
+				OTP:      &authclient.OTPCreds{},
+			},
+			mfav1.ChallengeExtensions{Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_LOGIN},
+		)
 		require.True(t, trace.IsAccessDenied(err))
 
 		// Test last attempt returns locked error.
 		if i == defaults.MaxLoginAttempts {
-			require.Equal(t, err.Error(), MaxFailedAttemptsErrMsg)
+			require.Equal(t, MaxFailedAttemptsErrMsg, err.Error())
 		} else {
-			require.NotEqual(t, err.Error(), MaxFailedAttemptsErrMsg)
+			require.NotEqual(t, MaxFailedAttemptsErrMsg, err.Error())
 		}
 	}
 }
@@ -1314,10 +1267,10 @@ type userAuthCreds struct {
 	totpDev, webDev *TestDevice
 }
 
-func createUserWithSecondFactors(srv *TestTLSServer) (*userAuthCreds, error) {
+func createUserWithSecondFactors(testServer *TestTLSServer) (*userAuthCreds, error) {
 	ctx := context.Background()
 	username := fmt.Sprintf("llama%v@goteleport.com", rand.Int())
-	password := []byte("abc123")
+	password := []byte("abcdef123456")
 
 	// Enable second factors.
 	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
@@ -1326,49 +1279,71 @@ func createUserWithSecondFactors(srv *TestTLSServer) (*userAuthCreds, error) {
 		Webauthn: &types.Webauthn{
 			RPID: "localhost",
 		},
-		// Use default Webauthn config.
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	if err := srv.Auth().SetAuthPreference(ctx, ap); err != nil {
+	authServer := testServer.Auth()
+	if _, err = authServer.UpsertAuthPreference(ctx, ap); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	_, _, err = CreateUserAndRole(srv.Auth(), username, []string{username})
+	_, _, err = CreateUserAndRole(authServer, username, []string{username}, nil)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	resetToken, err := srv.Auth().CreateResetPasswordToken(ctx, CreateUserTokenRequest{
+	// Reset password and register a Webauthn device.
+	resetToken, err := authServer.CreateResetPasswordToken(ctx, authclient.CreateUserTokenRequest{
 		Name: username,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	// Insert a password, device, and recovery codes.
-	webDev, mfaResp, err := getMockedWebauthnAndRegisterRes(srv.Auth(), resetToken.GetName())
+	registerChal, err := authServer.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+		TokenID:     resetToken.GetName(),
+		DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+		DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	res, err := srv.Auth().ChangeUserAuthentication(ctx, &proto.ChangeUserAuthenticationRequest{
+	webDev, registerSolved, err := NewTestDeviceFromChallenge(registerChal)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	changeAuthnResp, err := authServer.ChangeUserAuthentication(ctx, &proto.ChangeUserAuthenticationRequest{
 		TokenID:                resetToken.GetName(),
 		NewPassword:            password,
-		NewMFARegisterResponse: mfaResp,
+		NewMFARegisterResponse: registerSolved,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	clt, err := srv.NewClient(TestUser(username))
+	userClient, err := testServer.NewClient(TestUser(username))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	totpDev, err := RegisterTestDevice(ctx, clt, "otp-1", proto.DeviceType_DEVICE_TYPE_TOTP, webDev, WithTestDeviceClock(srv.Clock()))
+	// Fetch the MFA device created above.
+	devicesResp, err := userClient.GetMFADevices(ctx, &proto.GetMFADevicesRequest{})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if len(devicesResp.Devices) != 1 {
+		return nil, fmt.Errorf("found an unexpected number of MFA devices: %v", devicesResp.Devices)
+	}
+	webDev.MFA = devicesResp.Devices[0]
+
+	// Register a TOTP device.
+	totpDev, err := RegisterTestDevice(
+		ctx,
+		userClient,
+		"otp-1", proto.DeviceType_DEVICE_TYPE_TOTP,
+		webDev, /* authenticator */
+		WithTestDeviceClock(testServer.Clock()))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1376,21 +1351,39 @@ func createUserWithSecondFactors(srv *TestTLSServer) (*userAuthCreds, error) {
 	return &userAuthCreds{
 		username:      username,
 		password:      password,
-		recoveryCodes: res.GetRecovery().GetCodes(),
+		recoveryCodes: changeAuthnResp.GetRecovery().GetCodes(),
 		totpDev:       totpDev,
 		webDev:        webDev,
 	}, nil
 }
 
-func getMockedWebauthnAndRegisterRes(authSrv *Server, tokenID string) (*TestDevice, *proto.MFARegisterResponse, error) {
-	res, err := authSrv.CreateRegisterChallenge(context.Background(), &proto.CreateRegisterChallengeRequest{
-		TokenID:    tokenID,
-		DeviceType: proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
-	})
-	if err != nil {
-		return nil, nil, trace.Wrap(err)
+func TestProquint(t *testing.T) {
+	t.Parallel()
+
+	// source: https://arxiv.org/html/0901.4016
+	proquintTestCases := []struct{ address, proquint string }{
+		{"127.0.0.1", "lusab-babad"},
+		{"63.84.220.193", "gutih-tugad"},
+		{"63.118.7.35", "gutuk-bisog"},
+		{"140.98.193.141", "mudof-sakat"},
+		{"64.255.6.200", "haguz-biram"},
+		{"128.30.52.45", "mabiv-gibot"},
+		{"147.67.119.2", "natag-lisaf"},
+		{"212.58.253.68", "tibup-zujah"},
+		{"216.35.68.215", "tobog-higil"},
+		{"216.68.232.21", "todah-vobij"},
+		{"198.81.129.136", "sinid-makam"},
+		{"12.110.110.204", "budov-kuras"},
 	}
 
-	dev, regRes, err := NewTestDeviceFromChallenge(res)
-	return dev, regRes, trace.Wrap(err)
+	for _, tc := range proquintTestCases {
+		addr, err := netip.ParseAddr(tc.address)
+		require.NoError(t, err)
+		require.True(t, addr.Is4())
+		addr4 := addr.As4()
+
+		hi, lo := binary.BigEndian.Uint16(addr4[:2]), binary.BigEndian.Uint16(addr4[2:])
+		proquint := encodeProquint(hi) + "-" + encodeProquint(lo)
+		require.Equal(t, tc.proquint, proquint, "wrong encoding for address %v", addr)
+	}
 }

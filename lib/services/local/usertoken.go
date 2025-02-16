@@ -1,52 +1,44 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package local
 
 import (
-	"bytes"
 	"context"
+
+	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/services"
-
-	"github.com/gravitational/trace"
 )
 
 // GetUserTokens returns all user tokens.
 func (s *IdentityService) GetUserTokens(ctx context.Context) ([]types.UserToken, error) {
-	startKey := backend.Key(userTokenPrefix)
+	startKey := backend.ExactKey(userTokenPrefix)
 	result, err := s.GetRange(ctx, startKey, backend.RangeEnd(startKey), backend.NoLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// DELETE IN 9.0.0 retrieve tokens with old prefix.
-	startKey = backend.Key(LegacyPasswordTokensPrefix)
-	oldPrefixResult, err := s.GetRange(ctx, startKey, backend.RangeEnd(startKey), backend.NoLimit)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	items := append(result.Items, oldPrefixResult.Items...)
-
 	var tokens []types.UserToken
-	for _, item := range items {
-		if !bytes.HasSuffix(item.Key, []byte(paramsPrefix)) {
+	for _, item := range result.Items {
+		if !item.Key.HasSuffix(backend.NewKey(paramsPrefix)) {
 			continue
 		}
 
@@ -68,26 +60,17 @@ func (s *IdentityService) DeleteUserToken(ctx context.Context, tokenID string) e
 		return trace.Wrap(err)
 	}
 
-	startKey := backend.Key(userTokenPrefix, tokenID)
+	startKey := backend.ExactKey(userTokenPrefix, tokenID)
 	if err = s.DeleteRange(ctx, startKey, backend.RangeEnd(startKey)); err != nil {
 		return trace.Wrap(err)
 	}
 
-	// DELETE IN 9.0.0 also delete any tokens with old prefix.
-	startKey = backend.Key(LegacyPasswordTokensPrefix, tokenID)
-	return trace.Wrap(s.DeleteRange(ctx, startKey, backend.RangeEnd(startKey)))
+	return nil
 }
 
 // GetUserToken returns a token by its ID.
 func (s *IdentityService) GetUserToken(ctx context.Context, tokenID string) (types.UserToken, error) {
-	item, err := s.Get(ctx, backend.Key(userTokenPrefix, tokenID, paramsPrefix))
-
-	// DELETE IN 9.0.0: fallback for old prefix first.
-	if trace.IsNotFound(err) {
-		item, err = s.Get(ctx, backend.Key(LegacyPasswordTokensPrefix, tokenID, paramsPrefix))
-	}
-
-	// Handle errors from either Get.
+	item, err := s.Get(ctx, backend.NewKey(userTokenPrefix, tokenID, paramsPrefix))
 	switch {
 	case trace.IsNotFound(err):
 		return nil, trace.NotFound("user token(%s) not found", backend.MaskKeyName(tokenID))
@@ -105,7 +88,7 @@ func (s *IdentityService) GetUserToken(ctx context.Context, tokenID string) (typ
 
 // CreateUserToken creates a user token.
 func (s *IdentityService) CreateUserToken(ctx context.Context, token types.UserToken) (types.UserToken, error) {
-	if err := token.CheckAndSetDefaults(); err != nil {
+	if err := services.CheckAndSetDefaults(token); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -115,7 +98,7 @@ func (s *IdentityService) CreateUserToken(ctx context.Context, token types.UserT
 	}
 
 	item := backend.Item{
-		Key:     backend.Key(userTokenPrefix, token.GetName(), paramsPrefix),
+		Key:     backend.NewKey(userTokenPrefix, token.GetName(), paramsPrefix),
 		Value:   value,
 		Expires: token.Expiry(),
 	}
@@ -129,14 +112,7 @@ func (s *IdentityService) CreateUserToken(ctx context.Context, token types.UserT
 
 // GetUserTokenSecrets returns token secrets.
 func (s *IdentityService) GetUserTokenSecrets(ctx context.Context, tokenID string) (types.UserTokenSecrets, error) {
-	item, err := s.Get(ctx, backend.Key(userTokenPrefix, tokenID, secretsPrefix))
-
-	// DELETE IN 9.0.0: fallback for old prefix first.
-	if trace.IsNotFound(err) {
-		item, err = s.Get(ctx, backend.Key(LegacyPasswordTokensPrefix, tokenID, secretsPrefix))
-	}
-
-	// Handle errors from either Get.
+	item, err := s.Get(ctx, backend.NewKey(userTokenPrefix, tokenID, secretsPrefix))
 	switch {
 	case trace.IsNotFound(err):
 		return nil, trace.NotFound("user token(%s) secrets not found", backend.MaskKeyName(tokenID))
@@ -154,7 +130,7 @@ func (s *IdentityService) GetUserTokenSecrets(ctx context.Context, tokenID strin
 
 // UpsertUserTokenSecrets upserts token secrets
 func (s *IdentityService) UpsertUserTokenSecrets(ctx context.Context, secrets types.UserTokenSecrets) error {
-	if err := secrets.CheckAndSetDefaults(); err != nil {
+	if err := services.CheckAndSetDefaults(secrets); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -163,7 +139,7 @@ func (s *IdentityService) UpsertUserTokenSecrets(ctx context.Context, secrets ty
 		return trace.Wrap(err)
 	}
 	item := backend.Item{
-		Key:     backend.Key(userTokenPrefix, secrets.GetName(), secretsPrefix),
+		Key:     backend.NewKey(userTokenPrefix, secrets.GetName(), secretsPrefix),
 		Value:   value,
 		Expires: secrets.Expiry(),
 	}
@@ -173,8 +149,6 @@ func (s *IdentityService) UpsertUserTokenSecrets(ctx context.Context, secrets ty
 }
 
 const (
-	// DELETE IN 9.0.0 in favor of userTokenPrefix.
-	LegacyPasswordTokensPrefix = "resetpasswordtokens"
-	userTokenPrefix            = "usertoken"
-	secretsPrefix              = "secrets"
+	userTokenPrefix = "usertoken"
+	secretsPrefix   = "secrets"
 )

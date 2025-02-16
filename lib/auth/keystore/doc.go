@@ -1,31 +1,33 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package keystore provides a generic client and associated helpers for handling
-// private keys that may be backed by an HSM.
+// private keys that may be backed by an HSM or KMS.
 //
-// Notes on testing
+// # Notes on testing
 //
-// Testing the Keystore package predictably requires an HSM. Testcases are
-// currently written for the "raw" KeyStore (no HSM), SoftHSMv2, YubiHSM2, and
-// AWS CloudHSM. Only the "raw" tests run without any setup, but testing for
-// SoftHSM is enabled by default in the Teleport docker buildbox and will be
-// run in CI.
+// Fully testing the Keystore package predictably requires an HSM. Testcases are
+// currently written for the software KeyStore (no HSM), SoftHSMv2, YubiHSM2,
+// AWS CloudHSM, and GCP KMS. Only the software tests run without any setup, but
+// testing for SoftHSM is enabled by default in the Teleport docker buildbox and
+// will be run in CI.
 //
-// Testing this package with SoftHSMv2
+// # Testing this package with SoftHSMv2
 //
 // To test with SoftHSMv2, you must install it (see
 // https://github.com/opendnssec/SoftHSMv2 or
@@ -36,7 +38,7 @@ limitations under the License.
 //
 // The test will create its own config file and token, and clean up after itself.
 //
-// Testing this package with YubiHSM2
+// # Testing this package with YubiHSM2
 //
 // To test with YubiHSM2, you must:
 //
@@ -46,7 +48,7 @@ limitations under the License.
 //
 // 3. start the connector "yubihsm-connector -d"
 //
-// 4. create a config file
+//  4. create a config file
 //     connector = http://127.0.0.1:12345
 //     debug
 //
@@ -56,7 +58,7 @@ limitations under the License.
 //
 // The test will use the factory default pin of "0001password" in slot 0.
 //
-// Testing this package with AWS CloudHSM
+// # Testing this package with AWS CloudHSM
 //
 // 1. Create a CloudHSM Cluster and HSM, and activate them https://docs.aws.amazon.com/cloudhsm/latest/userguide/getting-started.html
 //
@@ -70,7 +72,25 @@ limitations under the License.
 //
 // 6. Run the test on the connected EC2 instance
 //
-// Testing Teleport with an HSM-backed CA
+// # Testing this package with GCP CloudHSM
 //
-// TBD as full support is added.
+// 1. Sign into the Gcloud CLI
+//
+//  2. Create a keyring
+//     ```
+//     gcloud kms keyrings create "test" --location global
+//     ```
+//
+//  3. Set GCP_KMS_KEYRING to the name of the keyring you just created
+//     ```
+//     gcloud kms keyrings list --location global
+//     export GCP_KMS_KEYRING=<name from above>
+//     ```
+//
+// 4. Run the unit tests
+//
+// # Testing Teleport with an HSM-backed CA
+//
+// Integration tests can be found in integration/hsm. They run with SoftHSM by
+// default, manually alter the auth config as necessary to test different HSMs.
 package keystore

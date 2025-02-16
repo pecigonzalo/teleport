@@ -1,58 +1,66 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/types"
-	"gopkg.in/check.v1"
 )
 
-type RolesTestSuite struct {
-}
+func TestParsing(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&RolesTestSuite{})
-
-func (s *RolesTestSuite) TestParsing(c *check.C) {
 	roles, err := types.ParseTeleportRoles("auth, Proxy,nODE")
-	c.Assert(err, check.IsNil)
-	c.Assert(roles, check.DeepEquals, types.SystemRoles{
+	require.NoError(t, err)
+	require.Empty(t, cmp.Diff(roles, types.SystemRoles{
 		"Auth",
 		"Proxy",
 		"Node",
-	})
-	c.Assert(roles[0].Check(), check.IsNil)
-	c.Assert(roles[1].Check(), check.IsNil)
-	c.Assert(roles[2].Check(), check.IsNil)
-	c.Assert(roles.Check(), check.IsNil)
-	c.Assert(roles.String(), check.Equals, "Auth,Proxy,Node")
-	c.Assert(roles[0].String(), check.Equals, "Auth")
+	}))
+
+	require.NoError(t, roles[0].Check())
+	require.NoError(t, roles[1].Check())
+	require.NoError(t, roles[2].Check())
+	require.NoError(t, roles.Check())
+	require.Equal(t, "Auth,Proxy,Node", roles.String())
+	require.Equal(t, "Auth", roles[0].String())
 }
 
-func (s *RolesTestSuite) TestBadRoles(c *check.C) {
+func TestBadRoles(t *testing.T) {
+	t.Parallel()
+
 	bad := types.SystemRole("bad-role")
-	c.Assert(bad.Check(), check.ErrorMatches, "role bad-role is not registered")
+	require.ErrorContains(t, bad.Check(), "role bad-role is not registered")
 	badRoles := types.SystemRoles{
 		bad,
 		types.RoleAdmin,
 	}
-	c.Assert(badRoles.Check(), check.ErrorMatches, "role bad-role is not registered")
+	require.ErrorContains(t, badRoles.Check(), "role bad-role is not registered")
 }
 
-func (s *RolesTestSuite) TestEquivalence(c *check.C) {
+func TestEquivalence(t *testing.T) {
+	t.Parallel()
+
 	nodeProxyRole := types.SystemRoles{
 		types.RoleNode,
 		types.RoleProxy,
@@ -62,9 +70,8 @@ func (s *RolesTestSuite) TestEquivalence(c *check.C) {
 		types.RoleAuth,
 	}
 
-	c.Assert(authRole.Include(types.RoleAdmin), check.Equals, true)
-	c.Assert(authRole.Include(types.RoleProxy), check.Equals, false)
-	c.Assert(authRole.Equals(nodeProxyRole), check.Equals, false)
-	c.Assert(authRole.Equals(types.SystemRoles{types.RoleAuth, types.RoleAdmin}),
-		check.Equals, true)
+	require.True(t, authRole.Include(types.RoleAdmin))
+	require.False(t, authRole.Include(types.RoleProxy))
+	require.False(t, authRole.Equals(nodeProxyRole))
+	require.True(t, authRole.Equals(types.SystemRoles{types.RoleAuth, types.RoleAdmin}))
 }

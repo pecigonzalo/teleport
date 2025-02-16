@@ -16,22 +16,23 @@ package utils
 import (
 	"bytes"
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"time"
 
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/api/utils/tlsutils"
-
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport/api/utils/keys"
+	"github.com/gravitational/teleport/api/utils/tlsutils"
+	"github.com/gravitational/teleport/lib/cryptosuites"
 )
 
 // ParseKeyStorePEM parses signing key store from PEM encoded key pair
@@ -40,11 +41,11 @@ func ParseKeyStorePEM(keyPEM, certPEM string) (*KeyStore, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	key, err := ParsePrivateKeyPEM([]byte(keyPEM))
+	key, err := keys.ParsePrivateKey([]byte(keyPEM))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	rsaKey, ok := key.(*rsa.PrivateKey)
+	rsaKey, ok := key.Signer.(*rsa.PrivateKey)
 	if !ok {
 		return nil, trace.BadParameter("key of type %T is not supported, only RSA keys are supported", key)
 	}
@@ -61,16 +62,24 @@ type KeyStore struct {
 	cert       []byte
 }
 
+// GetKeyPair implements goxmldsig.X509KeyPair.
 func (ks *KeyStore) GetKeyPair() (*rsa.PrivateKey, []byte, error) {
 	return ks.privateKey, ks.cert, nil
 }
 
-// GenerateSelfSignedSigningCert generates self-signed certificate used for digital signatures
-func GenerateSelfSignedSigningCert(entity pkix.Name, dnsNames []string, ttl time.Duration) ([]byte, []byte, error) {
-	priv, err := rsa.GenerateKey(rand.Reader, constants.RSAKeySize)
+// GenerateSelfSignedSigningCert is an alias of GenerateRSASelfSignedSigningCert
+// used due to references in teleport.e.
+var GenerateSelfSignedSigningCert = GenerateRSASelfSignedSigningCert
+
+// GenerateRSASelfSignedSigningCert generates an RSA self-signed certificate used
+// for digital signatures.
+// This should only be used for the SAML implementation and tests.
+func GenerateRSASelfSignedSigningCert(entity pkix.Name, dnsNames []string, ttl time.Duration) ([]byte, []byte, error) {
+	priv, err := cryptosuites.GenerateKeyWithAlgorithm(cryptosuites.RSA2048)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
+	rsaPriv := priv.(*rsa.PrivateKey)
 	// to account for clock skew
 	notBefore := time.Now().Add(-2 * time.Minute)
 	notAfter := notBefore.Add(ttl)
@@ -92,48 +101,21 @@ func GenerateSelfSignedSigningCert(entity pkix.Name, dnsNames []string, ttl time
 		DNSNames:              dnsNames,
 	}
 
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &rsaPriv.PublicKey, rsaPriv)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaPriv)})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 
 	return keyPEM, certPEM, nil
 }
 
-// ParsePrivateKeyPEM parses PEM-encoded private key
+// ParsePrivateKeyPEM parses PEM-encoded private key.
+// Prefer [keys.ParsePrivateKey], this will be deleted after references are removed from teleport.e.
 func ParsePrivateKeyPEM(bytes []byte) (crypto.Signer, error) {
-	block, _ := pem.Decode(bytes)
-	if block == nil {
-		return nil, trace.BadParameter("expected PEM-encoded block")
-	}
-	return ParsePrivateKeyDER(block.Bytes)
-}
-
-// ParsePrivateKeyDER parses unencrypted DER-encoded private key
-func ParsePrivateKeyDER(der []byte) (crypto.Signer, error) {
-	generalKey, err := x509.ParsePKCS8PrivateKey(der)
-	if err != nil {
-		generalKey, err = x509.ParsePKCS1PrivateKey(der)
-		if err != nil {
-			generalKey, err = x509.ParseECPrivateKey(der)
-			if err != nil {
-				logrus.Errorf("Failed to parse key: %v.", err)
-				return nil, trace.BadParameter("failed parsing private key")
-			}
-		}
-	}
-
-	switch k := generalKey.(type) {
-	case *rsa.PrivateKey:
-		return k, nil
-	case *ecdsa.PrivateKey:
-		return k, nil
-	}
-
-	return nil, trace.BadParameter("unsupported private key type")
+	return keys.ParsePrivateKey(bytes)
 }
 
 // VerifyCertificateExpiry checks the certificate's expiration status.
@@ -147,14 +129,14 @@ func VerifyCertificateExpiry(c *x509.Certificate, clock clockwork.Clock) error {
 		return x509.CertificateInvalidError{
 			Cert:   c,
 			Reason: x509.Expired,
-			Detail: fmt.Sprintf("current time %s is before %s", now.Format(time.RFC3339), c.NotBefore.Format(time.RFC3339)),
+			Detail: fmt.Sprintf("current time %s is before %s", now.UTC().Format(time.RFC3339), c.NotBefore.UTC().Format(time.RFC3339)),
 		}
 	}
 	if now.After(c.NotAfter) {
 		return x509.CertificateInvalidError{
 			Cert:   c,
 			Reason: x509.Expired,
-			Detail: fmt.Sprintf("current time %s is after %s", now.Format(time.RFC3339), c.NotAfter.Format(time.RFC3339)),
+			Detail: fmt.Sprintf("current time %s is after %s", now.UTC().Format(time.RFC3339), c.NotAfter.UTC().Format(time.RFC3339)),
 		}
 	}
 	return nil
@@ -195,66 +177,142 @@ func VerifyCertificateChain(certificateChain []*x509.Certificate) error {
 	return nil
 }
 
-// IsSelfSigned checks if the certificate is a self-signed certificate. To
-// check if a certificate is self-signed, we make sure that only one
-// certificate is in the chain and that the SubjectKeyId and AuthorityKeyId
-// match.
-//
-// From RFC5280: https://tools.ietf.org/html/rfc5280#section-4.2.1.1
-//
-//   The signature on a self-signed certificate is generated with the private
-//   key associated with the certificate's subject public key. (This
-//   proves that the issuer possesses both the public and private keys.)
-//   In this case, the subject and authority key identifiers would be
-//   identical, but only the subject key identifier is needed for
-//   certification path building.
-//
+// IsSelfSigned checks if the certificate is a self-signed certificate. To check
+// if a certificate is self-signed, we make sure that only one certificate is in
+// the chain and that its Subject and Issuer match.
 func IsSelfSigned(certificateChain []*x509.Certificate) bool {
 	if len(certificateChain) != 1 {
 		return false
 	}
 
-	return bytes.Equal(certificateChain[0].SubjectKeyId, certificateChain[0].AuthorityKeyId)
+	return bytes.Equal(certificateChain[0].RawSubject, certificateChain[0].RawIssuer)
 }
 
-// ReadCertificateChain parses PEM encoded bytes that can contain one or
+// ReadCertificates parses PEM encoded bytes that can contain one or
 // multiple certificates and returns a slice of x509.Certificate.
-func ReadCertificateChain(certificateChainBytes []byte) ([]*x509.Certificate, error) {
-	// build the certificate chain next
+func ReadCertificates(certificateChainBytes []byte) ([]*x509.Certificate, error) {
 	var (
 		certificateBlock *pem.Block
-		certificateChain [][]byte
+		certificates     [][]byte
 	)
 	remainingBytes := bytes.TrimSpace(certificateChainBytes)
 
 	for {
 		certificateBlock, remainingBytes = pem.Decode(remainingBytes)
-		if certificateBlock == nil || certificateBlock.Type != pemBlockCertificate {
+		if certificateBlock == nil {
 			return nil, trace.NotFound("no PEM data found")
 		}
-		certificateChain = append(certificateChain, certificateBlock.Bytes)
+		if t := certificateBlock.Type; t != pemBlockCertificate {
+			return nil, trace.BadParameter("expecting certificate, but found %v", t)
+		}
+		certificates = append(certificates, certificateBlock.Bytes)
 
 		if len(remainingBytes) == 0 {
 			break
 		}
 	}
 
-	// build a concatenated certificate chain
+	// build concatenated certificates into a buffer
 	var buf bytes.Buffer
-	for _, cc := range certificateChain {
+	for _, cc := range certificates {
 		_, err := buf.Write(cc)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
 
-	// parse the chain and get a slice of x509.Certificates.
-	x509Chain, err := x509.ParseCertificates(buf.Bytes())
+	// parse the buffer and get a slice of x509.Certificates.
+	x509Certs, err := x509.ParseCertificates(buf.Bytes())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return x509Chain, nil
+	return x509Certs, nil
+}
+
+// ReadCertificatesFromPath parses PEM encoded certificates from provided path.
+func ReadCertificatesFromPath(path string) ([]*x509.Certificate, error) {
+	bytes, err := ReadPath(path)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	certs, err := ReadCertificates(bytes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return certs, nil
+}
+
+// NewCertPoolFromPath creates a new x509.CertPool from provided path.
+func NewCertPoolFromPath(path string) (*x509.CertPool, error) {
+	// x509.CertPool.AppendCertsFromPEM skips parse errors. Using our own
+	// implementation here to be more strict.
+	cas, err := ReadCertificatesFromPath(path)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	pool := x509.NewCertPool()
+	for _, ca := range cas {
+		pool.AddCert(ca)
+	}
+	return pool, nil
+}
+
+// TLSCertLeaf is a helper function that extracts the parsed leaf *x509.Certificate
+// from a tls.Certificate.
+// If the leaf certificate is not parsed already, then this function parses it.
+func TLSCertLeaf(cert tls.Certificate) (*x509.Certificate, error) {
+	if cert.Leaf != nil {
+		return cert.Leaf, nil
+	}
+	if len(cert.Certificate) < 1 {
+		return nil, trace.NotFound("invalid certificate length")
+	}
+	x509cert, err := x509.ParseCertificate(cert.Certificate[0])
+	return x509cert, trace.Wrap(err)
+}
+
+// InitCertLeaf initializes the Leaf field for each cert in a slice of certs,
+// to reduce per-handshake processing.
+// Typically, servers should avoid doing this since it will
+// consume more memory.
+func InitCertLeaf(cert *tls.Certificate) error {
+	leaf, err := TLSCertLeaf(*cert)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	cert.Leaf = leaf
+	return nil
 }
 
 const pemBlockCertificate = "CERTIFICATE"
+
+// CreateCertificateBLOB creates Certificate BLOB
+// It has following structure:
+//
+//	CertificateBlob {
+//		PropertyID: u32, little endian,
+//		Reserved: u32, little endian, must be set to 0x01 0x00 0x00 0x00
+//		Length: u32, little endian
+//		Value: certificate data
+//	}
+//
+// Documentation on this structure is a little thin, but one with the structure
+// exists in [MS-GPEF]. This doesn't list the `PropertyID` we use below, however
+// some references can be found scattered about the internet such as [here].
+//
+// [MS-GPEF]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpef/e051aba9-c9df-4f82-a42a-c13012c9d381
+// [here]: https://github.com/diyinfosec/010-Editor/blob/master/WINDOWS_CERTIFICATE_BLOB.bt
+func CreateCertificateBLOB(certData []byte) []byte {
+	buf := new(bytes.Buffer)
+	buf.Grow(len(certData) + 12)
+	// PropertyID for certificate is 32
+	binary.Write(buf, binary.LittleEndian, int32(32))
+	binary.Write(buf, binary.LittleEndian, int32(1))
+	binary.Write(buf, binary.LittleEndian, int32(len(certData)))
+	buf.Write(certData)
+
+	return buf.Bytes()
+}

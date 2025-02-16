@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
@@ -20,133 +22,77 @@ import (
 	"context"
 	"testing"
 
-	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/lib/automaticupgrades"
 )
 
-func TestCheckOrSetKubeCluster(t *testing.T) {
+func TestGetAgentVersion(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
 
-	tests := []struct {
-		desc        string
-		services    []types.Server
-		kubeCluster string
-		teleCluster string
-		want        string
-		assertErr   require.ErrorAssertionFunc
+	ctx := context.Background()
+
+	testCases := []struct {
+		desc            string
+		ping            func(ctx context.Context) (proto.PingResponse, error)
+		clusterFeatures proto.Features
+		channelVersion  string
+		expectedVersion string
+		errorAssert     require.ErrorAssertionFunc
 	}{
 		{
-			desc: "valid cluster name",
-			services: []types.Server{
-				kubeService("k8s-1", "k8s-2"),
-				kubeService("k8s-3", "k8s-4"),
+			desc: "ping error",
+			ping: func(ctx context.Context) (proto.PingResponse, error) {
+				return proto.PingResponse{}, trace.BadParameter("ping error")
 			},
-			kubeCluster: "k8s-4",
-			teleCluster: "zzz-tele-cluster",
-			want:        "k8s-4",
-			assertErr:   require.NoError,
+			expectedVersion: "",
+			errorAssert:     require.Error,
 		},
 		{
-			desc: "invalid cluster name",
-			services: []types.Server{
-				kubeService("k8s-1", "k8s-2"),
-				kubeService("k8s-3", "k8s-4"),
+			desc: "no automatic upgrades",
+			ping: func(ctx context.Context) (proto.PingResponse, error) {
+				return proto.PingResponse{ServerVersion: "1.2.3"}, nil
 			},
-			kubeCluster: "k8s-5",
-			teleCluster: "zzz-tele-cluster",
-			assertErr:   require.Error,
+			expectedVersion: "1.2.3",
+			errorAssert:     require.NoError,
 		},
 		{
-			desc:        "no registered clusters",
-			services:    []types.Server{},
-			kubeCluster: "k8s-1",
-			teleCluster: "zzz-tele-cluster",
-			assertErr:   require.Error,
-		},
-		{
-			desc:        "no registered clusters and empty cluster provided",
-			services:    []types.Server{},
-			kubeCluster: "",
-			teleCluster: "zzz-tele-cluster",
-			assertErr:   require.Error,
-		},
-		{
-			desc: "no cluster provided, default to first alphabetically",
-			services: []types.Server{
-				kubeService("k8s-1", "k8s-2"),
-				kubeService("k8s-3", "k8s-4"),
+			desc: "automatic upgrades",
+			ping: func(ctx context.Context) (proto.PingResponse, error) {
+				return proto.PingResponse{ServerVersion: "10"}, nil
 			},
-			kubeCluster: "",
-			teleCluster: "zzz-tele-cluster",
-			want:        "k8s-1",
-			assertErr:   require.NoError,
-		},
-		{
-			desc: "no cluster provided, default to teleport cluster name",
-			services: []types.Server{
-				kubeService("k8s-1", "k8s-2"),
-				kubeService("k8s-3", "zzz-tele-cluster", "k8s-4"),
-			},
-			kubeCluster: "",
-			teleCluster: "zzz-tele-cluster",
-			want:        "zzz-tele-cluster",
-			assertErr:   require.NoError,
+			clusterFeatures: proto.Features{AutomaticUpgrades: true, Cloud: true},
+			channelVersion:  "v1.2.3",
+			expectedVersion: "1.2.3",
+			errorAssert:     require.NoError,
 		},
 	}
-	for _, tt := range tests {
+
+	for _, tt := range testCases {
 		t.Run(tt.desc, func(t *testing.T) {
-			got, err := CheckOrSetKubeCluster(ctx, mockKubeServicesPresence(tt.services), tt.kubeCluster, tt.teleCluster)
-			tt.assertErr(t, err)
-			require.Equal(t, got, tt.want)
+			p := &pinger{pingFn: tt.ping}
+
+			var channel *automaticupgrades.Channel
+			if tt.channelVersion != "" {
+				channel = &automaticupgrades.Channel{StaticVersion: tt.channelVersion}
+				err := channel.CheckAndSetDefaults()
+				require.NoError(t, err)
+			}
+
+			result, err := GetKubeAgentVersion(ctx, p, tt.clusterFeatures, channel)
+
+			tt.errorAssert(t, err)
+			require.Equal(t, tt.expectedVersion, result)
 		})
 	}
 }
 
-type mockKubeServicesPresence []types.Server
-
-func (p mockKubeServicesPresence) GetKubeServices(context.Context) ([]types.Server, error) {
-	return p, nil
+type pinger struct {
+	pingFn func(ctx context.Context) (proto.PingResponse, error)
 }
 
-func kubeService(kubeClusters ...string) types.Server {
-	var ks []*types.KubernetesCluster
-	for _, kc := range kubeClusters {
-		ks = append(ks, &types.KubernetesCluster{Name: kc})
-	}
-	return &types.ServerV2{
-		Spec: types.ServerSpecV2{
-			KubernetesClusters: ks,
-		},
-	}
-}
-
-func TestExtractAndSortKubeClusterNames(t *testing.T) {
-	t.Parallel()
-
-	server1, err := types.NewServer("foo", types.KindNode, types.ServerSpecV2{
-		KubernetesClusters: []*types.KubernetesCluster{
-			{Name: "watermelon"},
-		},
-	})
-	require.NoError(t, err)
-
-	server2, err := types.NewServer("foo", types.KindNode, types.ServerSpecV2{
-		KubernetesClusters: []*types.KubernetesCluster{
-			{Name: "watermelon"},
-		},
-	})
-	require.NoError(t, err)
-
-	server3, err := types.NewServer("bar", types.KindNode, types.ServerSpecV2{
-		KubernetesClusters: []*types.KubernetesCluster{
-			{Name: "banana"},
-			{Name: "apple"},
-			{Name: "pear"},
-		},
-	})
-	require.NoError(t, err)
-
-	names := extractAndSortKubeClusterNames([]types.Server{server1, server2, server3})
-	require.Equal(t, []string{"apple", "banana", "pear", "watermelon"}, names)
+func (p *pinger) Ping(ctx context.Context) (proto.PingResponse, error) {
+	return p.pingFn(ctx)
 }

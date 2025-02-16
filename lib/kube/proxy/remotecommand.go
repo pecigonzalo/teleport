@@ -19,21 +19,27 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
-	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	spdystream "k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	"k8s.io/apimachinery/pkg/util/httpstream/wsstream"
 	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/client-go/tools/remotecommand"
 	utilexec "k8s.io/client-go/util/exec"
+
+	apievents "github.com/gravitational/teleport/api/types/events"
 )
 
 // remoteCommandRequest is a request to execute a remote command
@@ -51,15 +57,16 @@ type remoteCommandRequest struct {
 	onResize           resizeCallback
 	context            context.Context
 	pingPeriod         time.Duration
+	idleTimeout        time.Duration
 }
 
-func (req remoteCommandRequest) eventPodMeta(ctx context.Context, creds *kubeCreds) apievents.KubernetesPodMetadata {
+func (req remoteCommandRequest) eventPodMeta(ctx context.Context, creds kubeCreds) apievents.KubernetesPodMetadata {
 	meta := apievents.KubernetesPodMetadata{
 		KubernetesPodName:       req.podName,
 		KubernetesPodNamespace:  req.podNamespace,
 		KubernetesContainerName: req.containerName,
 	}
-	if creds == nil || creds.kubeClient == nil {
+	if creds == nil || creds.getKubeClient() == nil {
 		return meta
 	}
 
@@ -67,9 +74,9 @@ func (req remoteCommandRequest) eventPodMeta(ctx context.Context, creds *kubeCre
 	//
 	// This can fail if a user has set tight RBAC rules for teleport. Failure
 	// here shouldn't prevent a session from starting.
-	pod, err := creds.kubeClient.CoreV1().Pods(req.podNamespace).Get(ctx, req.podName, metav1.GetOptions{})
+	pod, err := creds.getKubeClient().CoreV1().Pods(req.podNamespace).Get(ctx, req.podName, metav1.GetOptions{})
 	if err != nil {
-		log.WithError(err).Debugf("Failed fetching pod from kubernetes API; skipping additional metadata on the audit event")
+		slog.DebugContext(ctx, "Failed fetching pod from kubernetes API; skipping additional metadata on the audit event", "error", err)
 		return meta
 	}
 	meta.KubernetesNodeName = pod.Spec.NodeName
@@ -91,7 +98,40 @@ func (req remoteCommandRequest) eventPodMeta(ctx context.Context, creds *kubeCre
 	return meta
 }
 
-func createRemoteCommandProxy(req remoteCommandRequest) (*remoteCommandProxy, error) {
+func upgradeRequestToRemoteCommandProxy(req remoteCommandRequest, exec func(*remoteCommandProxy) error) (any, error) {
+	var (
+		proxy *remoteCommandProxy
+		err   error
+	)
+	if wsstream.IsWebSocketRequest(req.httpRequest) {
+		proxy, err = createWebSocketStreams(req)
+	} else {
+		proxy, err = createSPDYStreams(req)
+	}
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	defer proxy.Close()
+
+	if proxy.resizeStream != nil {
+		proxy.resizeQueue = newTermQueue(req.context, req.onResize)
+		go proxy.resizeQueue.handleResizeEvents(proxy.resizeStream)
+	}
+	err = exec(proxy)
+	if !isRelevantWebsocketError(err) {
+		err = nil
+	}
+	if err := proxy.sendStatus(err); err != nil {
+		slog.WarnContext(req.context, "Failed to send status", "error", err)
+	}
+	// return rsp=nil, err=nil to indicate that the request has been handled
+	// by the hijacked connection. If we return an error, the request will be
+	// considered unhandled and the middleware will try to write the error
+	// or response into the hicjacked connection, which will fail.
+	return nil /* rsp */, nil /* err */
+}
+
+func createSPDYStreams(req remoteCommandRequest) (*remoteCommandProxy, error) {
 	protocol, err := httpstream.Handshake(req.httpRequest, req.httpResponseWriter, []string{StreamProtocolV4Name})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -99,13 +139,15 @@ func createRemoteCommandProxy(req remoteCommandRequest) (*remoteCommandProxy, er
 
 	streamCh := make(chan streamAndReply)
 
+	ctx, cancel := context.WithCancel(req.context)
+	defer cancel()
 	upgrader := spdystream.NewResponseUpgraderWithPings(req.pingPeriod)
 	conn := upgrader.UpgradeResponse(req.httpResponseWriter, req.httpRequest, func(stream httpstream.Stream, replySent <-chan struct{}) error {
 		select {
 		case streamCh <- streamAndReply{Stream: stream, replySent: replySent}:
 			return nil
-		case <-req.context.Done():
-			return trace.BadParameter("request has been cancelled")
+		case <-ctx.Done():
+			return trace.BadParameter("request has been canceled")
 		}
 	})
 	// from this point on, we can no longer call methods on response
@@ -116,18 +158,19 @@ func createRemoteCommandProxy(req remoteCommandRequest) (*remoteCommandProxy, er
 		return nil, trace.ConnectionProblem(trace.BadParameter("missing connection"), "missing connection")
 	}
 
-	conn.SetIdleTimeout(IdleTimeout)
+	conn.SetIdleTimeout(adjustIdleTimeoutForConn(req.idleTimeout))
 
 	var handler protocolHandler
 	switch protocol {
 	case "":
-		log.Warningf("Client did not request protocol negotiation.")
+		slog.WarnContext(ctx, "Client did not request protocol negotiation")
 		fallthrough
 	case StreamProtocolV4Name:
-		log.Infof("Negotiated protocol %v.", protocol)
+		slog.InfoContext(ctx, "Negotiated protocol", "protocol", protocol)
 		handler = &v4ProtocolHandler{}
 	default:
-		return nil, trace.BadParameter("protocol %v is not supported. upgrade the client", protocol)
+		err = trace.BadParameter("protocol %v is not supported. upgrade the client", protocol)
+		return nil, trace.NewAggregate(err, conn.Close())
 	}
 
 	// count the streams client asked for, starting with 1
@@ -148,18 +191,13 @@ func createRemoteCommandProxy(req remoteCommandRequest) (*remoteCommandProxy, er
 	expired := time.NewTimer(DefaultStreamCreationTimeout)
 	defer expired.Stop()
 
-	proxy, err := handler.waitForStreams(req.context, streamCh, expectedStreams, expired.C)
+	proxy, err := handler.waitForStreams(ctx, streamCh, expectedStreams, expired.C)
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, trace.NewAggregate(err, conn.Close())
 	}
 
 	proxy.conn = conn
 	proxy.tty = req.tty
-
-	if proxy.resizeStream != nil {
-		proxy.resizeQueue = newTermQueue(req.context, req.onResize)
-		go proxy.resizeQueue.handleResizeEvents(proxy.resizeStream)
-	}
 	return proxy, nil
 }
 
@@ -179,6 +217,10 @@ type remoteCommandProxy struct {
 func (s *remoteCommandProxy) Close() error {
 	if s.conn != nil {
 		return s.conn.Close()
+	}
+	// if resize queue is available release its goroutines to prevent stream leaks.
+	if s.resizeQueue != nil {
+		s.resizeQueue.Close()
 	}
 	return nil
 }
@@ -203,7 +245,12 @@ func (s *remoteCommandProxy) sendStatus(err error) error {
 			Status: metav1.StatusSuccess,
 		}})
 	}
-	if exitErr, ok := err.(utilexec.ExitError); ok && exitErr.Exited() {
+	var statusErr *apierrors.StatusError
+	if errors.As(err, &statusErr) {
+		return s.writeStatus(statusErr)
+	}
+	var exitErr utilexec.ExitError
+	if errors.As(err, &exitErr) && exitErr.Exited() {
 		rc := exitErr.ExitStatus()
 		return s.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{
 			Status: metav1.StatusFailure,
@@ -219,8 +266,48 @@ func (s *remoteCommandProxy) sendStatus(err error) error {
 			Message: fmt.Sprintf("command terminated with non-zero exit code: %v", exitErr),
 		}})
 	}
+	// kubernetes client-go errorDecoderV4 parses the metav1.Status and returns the `fmt.Errorf(status.Message)` for every case except
+	// errors with reason =  NonZeroExitCodeReason for which it returns an exec.CodeExitError.
+	// This means when forwarding an exec request to a remote cluster using the `Forwarder.remoteExec` function we only have access
+	// to the status.Message. This happens because the error is sent after the connection was upgraded to a bidirectional stream.
+	// This hack is here to recreate the forbidden message and return it back to the user terminal
+	if strings.Contains(err.Error(), "is forbidden:") {
+		return s.writeStatus(&apierrors.StatusError{
+			ErrStatus: metav1.Status{
+				Status:  metav1.StatusFailure,
+				Code:    http.StatusForbidden,
+				Reason:  metav1.StatusReasonForbidden,
+				Message: formatExecForbiddenErrorMessage(err),
+			},
+		})
+	} else if isSessionTerminatedError(err) {
+		return s.writeStatus(sessionTerminatedByModeratorErr)
+	}
+
 	err = trace.BadParameter("error executing command in container: %v", err)
 	return s.writeStatus(apierrors.NewInternalError(err))
+}
+
+// formatExecForbiddenErrorMessage formats the error message for the forbidden error
+// when trying to exec into a pod in Kubernetes 1.30.
+func formatExecForbiddenErrorMessage(err error) string {
+	message := err.Error()
+	// forbiddenGetResource is the error message that is returned when the user is forbidden to exec into a pod.
+	// This error message is returned when the user does not have the necessary RBAC rules to exec into a pod.
+	const forbiddenGetResource = "cannot get resource \"pods/exec\" in API group"
+	// Kubernetes 1.30 switched to a new exec API that uses a different protocol.
+	// Previously, the exec API used SPDY. The new exec API uses websockets.
+	// SPDY allowed the client to send the request as GET or POST, but websockets
+	// only allow GET per definition.
+	// This means that most clients that used kubectl version 1.29 or older can
+	// suddenly get a forbidden error when trying to exec into a pod in Kubernetes 1.30
+	// because the RBAC rules are not allowing the user to access the pods/exec resource
+	// using the GET verb.
+	// This error message is a hint to the user that they need to update their RBAC rules.
+	if strings.Contains(message, forbiddenGetResource) {
+		message += kubernetes130BreakingChangeHint
+	}
+	return message
 }
 
 // streamAndReply holds both a Stream and a channel that is closed when the stream's reply frame is
@@ -261,7 +348,7 @@ func (t *termQueue) Next() *remotecommand.TerminalSize {
 	}
 }
 
-func (t *termQueue) Done() {
+func (t *termQueue) Close() {
 	t.cancel()
 }
 
@@ -270,8 +357,8 @@ func (t *termQueue) handleResizeEvents(stream io.Reader) {
 	for {
 		size := remotecommand.TerminalSize{}
 		if err := decoder.Decode(&size); err != nil {
-			if err != io.EOF {
-				log.Warningf("Failed to decode resize event: %v", err)
+			if !errors.Is(err, io.EOF) {
+				slog.WarnContext(t.done, "Failed to decode resize event", "error", err)
 			}
 			t.cancel()
 			return
@@ -326,7 +413,7 @@ WaitForStreams:
 				remoteProxy.resizeStream = stream
 				go waitStreamReply(stopCtx, stream.replySent, replyChan)
 			default:
-				log.Warningf("Ignoring unexpected stream type: %q", streamType)
+				slog.WarnContext(stopCtx, "Ignoring unexpected stream type", "stream_type", streamType)
 			}
 		case <-replyChan:
 			receivedStreams++
@@ -336,7 +423,7 @@ WaitForStreams:
 		case <-expired:
 			return nil, trace.BadParameter("timed out waiting for client to create streams")
 		case <-connContext.Done():
-			return nil, trace.BadParameter("onnectoin has dropped, exiting")
+			return nil, trace.BadParameter("connection has dropped, exiting")
 		}
 	}
 
@@ -359,12 +446,35 @@ func waitStreamReply(ctx context.Context, replySent <-chan struct{}, notify chan
 // v4WriteStatusFunc returns a WriteStatusFunc that marshals a given api Status
 // as json in the error channel.
 func v4WriteStatusFunc(stream io.Writer) func(status *apierrors.StatusError) error {
-	return func(status *apierrors.StatusError) error {
-		bs, err := json.Marshal(status.Status())
+	return writeStatusOnceFunc(func(status *apierrors.StatusError) error {
+		st := status.Status()
+		data, err := runtime.Encode(globalKubeCodecs.LegacyCodec(), &st)
 		if err != nil {
-			return err
+			return trace.Wrap(err)
 		}
-		_, err = stream.Write(bs)
+		_, err = stream.Write(data)
 		return err
+	})
+}
+
+func v1WriteStatusFunc(stream io.Writer) func(status *apierrors.StatusError) error {
+	return writeStatusOnceFunc(func(status *apierrors.StatusError) error {
+		if status.Status().Status == metav1.StatusSuccess {
+			return nil // send error messages
+		}
+		_, err := stream.Write([]byte(status.Error()))
+		return err
+	})
+}
+
+// writeStatusOnceFunc returns a function that only calls f once, and returns the result of the first call.
+func writeStatusOnceFunc(f func(status *apierrors.StatusError) error) func(status *apierrors.StatusError) error {
+	var once sync.Once
+	var err error
+	return func(status *apierrors.StatusError) error {
+		once.Do(func() {
+			err = f(status)
+		})
+		return trace.Wrap(err)
 	}
 }

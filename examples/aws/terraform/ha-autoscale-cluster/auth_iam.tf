@@ -120,7 +120,7 @@ EOF
 
 }
 
-// S3 is used for letsencrypt, auth servers request certificates from letsencrypt
+// S3 is used for Let's Encrypt, auth servers request certificates from Let's Encrypt
 // and publish to S3 encrypted bucket. SSM is not used, because certificates and private keys
 // are too big for SSM.
 resource "aws_iam_role_policy" "auth_s3" {
@@ -136,7 +136,8 @@ resource "aws_iam_role_policy" "auth_s3" {
        "Action": [
          "s3:ListBucket",
          "s3:ListBucketVersions",
-         "s3:ListBucketMultipartUploads"
+         "s3:ListBucketMultipartUploads",
+         "s3:AbortMultipartUpload"
         ],
        "Resource": ["arn:aws:s3:::${aws_s3_bucket.certs.bucket}"]
      },

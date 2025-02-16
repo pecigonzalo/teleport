@@ -1,102 +1,46 @@
 /*
-Copyright 2018-2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package scp
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
-	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
-
 	"github.com/google/go-cmp/cmp"
-	"github.com/sirupsen/logrus"
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestMain(m *testing.M) {
 	utils.InitLoggerForTests()
 	os.Exit(m.Run())
-}
-
-func TestHTTPSendFile(t *testing.T) {
-	outDir := t.TempDir()
-
-	expectedBytes := []byte("hello")
-	buf := bytes.NewReader(expectedBytes)
-	req, err := http.NewRequest("POST", "/", buf)
-	require.NoError(t, err)
-
-	req.Header.Set("Content-Length", strconv.Itoa(len(expectedBytes)))
-
-	stdOut := bytes.NewBufferString("")
-	cmd, err := CreateHTTPUpload(
-		HTTPTransferRequest{
-			FileName:       "filename",
-			RemoteLocation: outDir,
-			HTTPRequest:    req,
-			Progress:       stdOut,
-			User:           "test-user",
-		})
-	require.NoError(t, err)
-	err = runSCP(cmd, "-v", "-t", outDir)
-	require.NoError(t, err)
-	bytesReceived, err := os.ReadFile(filepath.Join(outDir, "filename"))
-	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(string(bytesReceived), string(expectedBytes)))
-}
-
-func TestHTTPReceiveFile(t *testing.T) {
-	source := filepath.Join(t.TempDir(), "target")
-
-	contents := []byte("hello, file contents!")
-	err := os.WriteFile(source, contents, 0666)
-	require.NoError(t, err)
-
-	w := httptest.NewRecorder()
-	stdOut := bytes.NewBufferString("")
-	cmd, err := CreateHTTPDownload(
-		HTTPTransferRequest{
-			RemoteLocation: "/home/robots.txt",
-			HTTPResponse:   w,
-			User:           "test-user",
-			Progress:       stdOut,
-		})
-	require.NoError(t, err)
-
-	err = runSCP(cmd, "-v", "-f", source)
-	require.NoError(t, err)
-
-	data, err := io.ReadAll(w.Body)
-	contentLengthStr := strconv.Itoa(len(data))
-	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(string(data), string(contents)))
-	require.Empty(t, cmp.Diff(contentLengthStr, w.Header().Get("Content-Length")))
-	require.Empty(t, cmp.Diff("application/octet-stream", w.Header().Get("Content-Type")))
-	require.Empty(t, cmp.Diff(`attachment;filename="robots.txt"`, w.Header().Get("Content-Disposition")))
 }
 
 func TestSend(t *testing.T) {
@@ -105,8 +49,8 @@ func TestSend(t *testing.T) {
 	atime := testNow.Add(1 * time.Second)
 	dirModtime := testNow.Add(2 * time.Second)
 	dirAtime := testNow.Add(3 * time.Second)
-	logger := logrus.WithField(trace.Component, "t:send")
-	var testCases = []struct {
+	logger := utils.NewSlogLoggerForTests().With(teleport.ComponentKey, "send")
+	testCases := []struct {
 		desc   string
 		config Config
 		fs     *testFS
@@ -169,8 +113,8 @@ func TestReceive(t *testing.T) {
 	atime := testNow.Add(1 * time.Second)
 	dirModtime := testNow.Add(2 * time.Second)
 	dirAtime := testNow.Add(3 * time.Second)
-	logger := logrus.WithField(trace.Component, "t:recv")
-	var testCases = []struct {
+	logger := utils.NewSlogLoggerForTests().With(teleport.ComponentKey, "recv")
+	testCases := []struct {
 		desc       string
 		config     Config
 		source     string
@@ -229,7 +173,7 @@ func TestReceive(t *testing.T) {
 	for _, tt := range testCases {
 		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
-			logger := logger.WithField("test", tt.desc)
+			logger := logger.With("test", tt.desc)
 			t.Parallel()
 
 			sourceDir := t.TempDir()
@@ -292,7 +236,7 @@ func TestSCPFailsIfNoSource(t *testing.T) {
 //
 // See https://github.com/gravitational/teleport/issues/5497
 func TestReceiveIntoExistingDirectory(t *testing.T) {
-	logger := logrus.WithField("test", t.Name())
+	logger := utils.NewSlogLoggerForTests().With("test", t.Name())
 	config := newTargetConfigWithFS("dir",
 		Flags{PreserveAttrs: true, Recursive: true},
 		newTestFS(logger, newDir("dir")),
@@ -335,7 +279,7 @@ func TestReceiveIntoExistingDirectory(t *testing.T) {
 //
 // See https://github.com/gravitational/teleport/issues/5695
 func TestReceiveIntoNonExistingDirectoryFailsWithCorrectMessage(t *testing.T) {
-	logger := logrus.WithField("test", t.Name())
+	logger := utils.NewSlogLoggerForTests().With("test", t.Name())
 	// Target configuration with no existing directory
 	root := t.TempDir()
 	config := newTargetConfigWithFS(filepath.Join(root, "dir"),
@@ -363,7 +307,7 @@ func TestReceiveIntoNonExistingDirectoryFailsWithCorrectMessage(t *testing.T) {
 // TestCopyIntoNestedNonExistingDirectoriesDoesNotCreateIntermediateDirectories validates that copying a directory
 // into a remote '/path/to/remote' where '/path/to' does not exist causes an error.
 func TestCopyIntoNestedNonExistingDirectoriesDoesNotCreateIntermediateDirectories(t *testing.T) {
-	logger := logrus.WithField("test", t.Name())
+	logger := utils.NewSlogLoggerForTests().With("test", t.Name())
 
 	config := newTargetConfig("non-existing/remote_dir", Flags{Recursive: true})
 	sourceFS := newTestFS(logger, newDir("dir"))
@@ -451,7 +395,7 @@ func TestVerifyDirectoryModeFailsWithFile(t *testing.T) {
 	// Create temporary directory with a file "target" in it.
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")
-	err := os.WriteFile(target, []byte{}, 0666)
+	err := os.WriteFile(target, []byte{}, 0o666)
 	require.NoError(t, err)
 
 	cmd, err := CreateCommand(
@@ -477,7 +421,7 @@ func TestVerifyDirectoryModeIsRequiredForDirectory(t *testing.T) {
 	// Create temporary directory with a file "target" in it.
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")
-	err := os.WriteFile(target, []byte{}, 0666)
+	err := os.WriteFile(target, []byte{}, 0o666)
 	require.NoError(t, err)
 
 	cmd, err := CreateCommand(
@@ -495,66 +439,6 @@ func TestVerifyDirectoryModeIsRequiredForDirectory(t *testing.T) {
 	// it should fail.
 	err = runSCP(cmd, "-t", dir)
 	require.Regexp(t, fmt.Sprintf("%s is a directory, use -r flag to copy recursively", filepath.Base(dir)), err)
-}
-
-func TestSCPParsing(t *testing.T) {
-	t.Parallel()
-
-	var testCases = []struct {
-		comment string
-		in      string
-		dest    Destination
-		err     error
-	}{
-		{
-			comment: "full spec of the remote destination",
-			in:      "root@remote.host:/etc/nginx.conf",
-			dest:    Destination{Login: "root", Host: utils.NetAddr{Addr: "remote.host", AddrNetwork: "tcp"}, Path: "/etc/nginx.conf"},
-		},
-		{
-			comment: "spec with just the remote host",
-			in:      "remote.host:/etc/nginx.co:nf",
-			dest:    Destination{Host: utils.NetAddr{Addr: "remote.host", AddrNetwork: "tcp"}, Path: "/etc/nginx.co:nf"},
-		},
-		{
-			comment: "ipv6 remote destination address",
-			in:      "[::1]:/etc/nginx.co:nf",
-			dest:    Destination{Host: utils.NetAddr{Addr: "[::1]", AddrNetwork: "tcp"}, Path: "/etc/nginx.co:nf"},
-		},
-		{
-			comment: "full spec of the remote destination using ipv4 address",
-			in:      "root@123.123.123.123:/var/www/html/",
-			dest:    Destination{Login: "root", Host: utils.NetAddr{Addr: "123.123.123.123", AddrNetwork: "tcp"}, Path: "/var/www/html/"},
-		},
-		{
-			comment: "target location using wildcard",
-			in:      "myusername@myremotehost.com:/home/hope/*",
-			dest:    Destination{Login: "myusername", Host: utils.NetAddr{Addr: "myremotehost.com", AddrNetwork: "tcp"}, Path: "/home/hope/*"},
-		},
-		{
-			comment: "complex login",
-			in:      "complex@example.com@remote.com:/anything.txt",
-			dest:    Destination{Login: "complex@example.com", Host: utils.NetAddr{Addr: "remote.com", AddrNetwork: "tcp"}, Path: "/anything.txt"},
-		},
-		{
-			comment: "implicit user's home directory",
-			in:      "root@remote.host:",
-			dest:    Destination{Login: "root", Host: utils.NetAddr{Addr: "remote.host", AddrNetwork: "tcp"}, Path: "."},
-		},
-	}
-	for _, tt := range testCases {
-		tt := tt
-		t.Run(tt.comment, func(t *testing.T) {
-			resp, err := ParseSCPDestination(tt.in)
-			if tt.err != nil {
-				require.IsType(t, err, tt.err)
-				return
-			}
-			require.NoError(t, err)
-			require.Empty(t, cmp.Diff(resp, &tt.dest))
-		})
-
-	}
 }
 
 func runSCP(cmd Command, args ...string) error {
@@ -606,13 +490,13 @@ func fromOS(t *testing.T, dir string, fs *testFS) {
 		}
 		if fi.IsDir() {
 			require.NoError(t, fs.MkDir(relpath, int(fi.Mode())))
-			require.NoError(t, fs.Chtimes(relpath, atime(fi), fi.ModTime()))
+			require.NoError(t, fs.Chtimes(relpath, GetAtime(fi), fi.ModTime()))
 			return nil
 		}
 		wc, err := fs.CreateFile(relpath, uint64(fi.Size()))
 		require.NoError(t, err)
 		defer wc.Close()
-		require.NoError(t, fs.Chtimes(relpath, atime(fi), fi.ModTime()))
+		require.NoError(t, fs.Chtimes(relpath, GetAtime(fi), fi.ModTime()))
 		f, err := os.Open(path)
 		require.NoError(t, err)
 		defer f.Close()
@@ -748,14 +632,14 @@ func newCmd(name string, args ...string) (cmd *exec.Cmd, stdin io.WriteCloser, s
 
 // newTestFS creates a new test FileSystem using the specified logger
 // and the set of top-level files
-func newTestFS(logger logrus.FieldLogger, files ...*testFileInfo) *testFS {
+func newTestFS(logger *slog.Logger, files ...*testFileInfo) *testFS {
 	fs := newEmptyTestFS(logger)
 	addFiles(fs.fs, files...)
 	return fs
 }
 
 // newEmptyTestFS creates a new test FileSystem without content
-func newEmptyTestFS(logger logrus.FieldLogger) *testFS {
+func newEmptyTestFS(logger *slog.Logger) *testFS {
 	return &testFS{
 		fs: make(map[string]*testFileInfo),
 		l:  logger,
@@ -763,7 +647,7 @@ func newEmptyTestFS(logger logrus.FieldLogger) *testFS {
 }
 
 func (r *testFS) IsDir(path string) bool {
-	r.l.WithField("path", path).Debug("IsDir.")
+	r.l.DebugContext(context.Background(), "IsDir", "path", path)
 	if fi, exists := r.fs[path]; exists {
 		return fi.IsDir()
 	}
@@ -771,7 +655,7 @@ func (r *testFS) IsDir(path string) bool {
 }
 
 func (r *testFS) GetFileInfo(path string) (FileInfo, error) {
-	r.l.WithField("path", path).Debug("GetFileInfo.")
+	r.l.DebugContext(context.Background(), "GetFileInfo", "path", path)
 	fi, exists := r.fs[path]
 	if !exists {
 		return nil, newErrMissingFile(path)
@@ -780,7 +664,7 @@ func (r *testFS) GetFileInfo(path string) (FileInfo, error) {
 }
 
 func (r *testFS) MkDir(path string, mode int) error {
-	r.l.WithFields(logrus.Fields{"path": path, "mode": mode}).Debug("MkDir.")
+	r.l.DebugContext(context.Background(), "MkDir", "path", path, "mode", mode)
 	_, exists := r.fs[path]
 	if exists {
 		return trace.AlreadyExists("directory %v already exists", path)
@@ -794,7 +678,7 @@ func (r *testFS) MkDir(path string, mode int) error {
 }
 
 func (r *testFS) OpenFile(path string) (io.ReadCloser, error) {
-	r.l.WithField("path", path).Debug("OpenFile.")
+	r.l.DebugContext(context.Background(), "OpenFile", "path", path)
 	fi, exists := r.fs[path]
 	if !exists {
 		return nil, newErrMissingFile(path)
@@ -804,7 +688,7 @@ func (r *testFS) OpenFile(path string) (io.ReadCloser, error) {
 }
 
 func (r *testFS) CreateFile(path string, length uint64) (io.WriteCloser, error) {
-	r.l.WithFields(logrus.Fields{"path": path, "len": length}).Debug("CreateFile.")
+	r.l.DebugContext(context.Background(), "CreateFile", "path", path, "len", length)
 	baseDir := filepath.Dir(path)
 	if _, exists := r.fs[baseDir]; baseDir != "." && !exists {
 		return nil, newErrMissingFile(baseDir)
@@ -812,7 +696,7 @@ func (r *testFS) CreateFile(path string, length uint64) (io.WriteCloser, error) 
 	fi := &testFileInfo{
 		path:     path,
 		size:     int64(length),
-		perms:    0666,
+		perms:    0o666,
 		contents: new(bytes.Buffer),
 	}
 	r.fs[path] = fi
@@ -821,7 +705,7 @@ func (r *testFS) CreateFile(path string, length uint64) (io.WriteCloser, error) 
 }
 
 func (r *testFS) Chmod(path string, mode int) error {
-	r.l.WithFields(logrus.Fields{"path": path, "mode": mode}).Debug("Chmod.")
+	r.l.DebugContext(context.Background(), "Chmod", "path", path, "mode", mode)
 	fi, exists := r.fs[path]
 	if !exists {
 		return newErrMissingFile(path)
@@ -831,11 +715,7 @@ func (r *testFS) Chmod(path string, mode int) error {
 }
 
 func (r *testFS) Chtimes(path string, atime, mtime time.Time) error {
-	r.l.WithFields(logrus.Fields{
-		"path":  path,
-		"atime": atime,
-		"mtime": mtime,
-	}).Debug("Chtimes.")
+	r.l.DebugContext(context.Background(), "Chtimes", "path", path, "atime", atime, "mtime", mtime)
 	fi, exists := r.fs[path]
 	if !exists {
 		return newErrMissingFile(path)
@@ -847,7 +727,7 @@ func (r *testFS) Chtimes(path string, atime, mtime time.Time) error {
 
 // testFS implements a fake FileSystem
 type testFS struct {
-	l  logrus.FieldLogger
+	l  *slog.Logger
 	fs map[string]*testFileInfo
 }
 
@@ -925,14 +805,14 @@ func newDir(name string, ents ...*testFileInfo) *testFileInfo {
 		path:  name,
 		ents:  ents,
 		dir:   true,
-		perms: 0755,
+		perms: 0o755,
 	}
 }
 
 func newFile(name string, contents string) *testFileInfo {
 	return &testFileInfo{
 		path:     name,
-		perms:    0666,
+		perms:    0o666,
 		size:     int64(len(contents)),
 		contents: bytes.NewBufferString(contents),
 	}
@@ -945,7 +825,7 @@ func newDirTimes(name string, modtime, atime time.Time, ents ...*testFileInfo) *
 		modtime: modtime,
 		atime:   atime,
 		dir:     true,
-		perms:   0755,
+		perms:   0o755,
 	}
 }
 
@@ -954,7 +834,7 @@ func newFileTimes(name string, modtime, atime time.Time, contents string) *testF
 		path:     name,
 		modtime:  modtime,
 		atime:    atime,
-		perms:    0666,
+		perms:    0o666,
 		size:     int64(len(contents)),
 		contents: bytes.NewBufferString(contents),
 	}

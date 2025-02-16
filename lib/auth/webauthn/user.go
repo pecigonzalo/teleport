@@ -1,25 +1,27 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthn
 
 import (
-	"github.com/gravitational/teleport/api/types"
+	wan "github.com/go-webauthn/webauthn/webauthn"
 
-	wan "github.com/duo-labs/webauthn/webauthn"
+	"github.com/gravitational/teleport/api/types"
 )
 
 // webUser implements a WebAuthn protocol user.
@@ -31,18 +33,26 @@ type webUser struct {
 	webID       []byte
 }
 
-func newWebUser(name string, webID []byte, credentialIDOnly bool, devices []*types.MFADevice) *webUser {
+type webUserOpts struct {
+	name             string
+	webID            []byte
+	devices          []*types.MFADevice
+	credentialIDOnly bool
+	currentFlags     *credentialFlags
+}
+
+func newWebUser(opts webUserOpts) *webUser {
 	var credentials []wan.Credential
-	for _, dev := range devices {
-		c, ok := deviceToCredential(dev, credentialIDOnly)
+	for _, dev := range opts.devices {
+		c, ok := deviceToCredential(dev, opts.credentialIDOnly, opts.currentFlags)
 		if ok {
 			credentials = append(credentials, c)
 		}
 	}
 	return &webUser{
 		credentials: credentials,
-		name:        name,
-		webID:       webID,
+		name:        opts.name,
+		webID:       opts.webID,
 	}
 }
 

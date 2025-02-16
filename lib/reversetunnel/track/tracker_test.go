@@ -1,26 +1,26 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package track
 
 import (
-	"context"
 	"fmt"
-	pr "math/rand"
-	"os"
+	"math/rand/v2"
 	"sync"
 	"testing"
 	"time"
@@ -52,7 +52,7 @@ func (s *simpleTestProxies) RemoveRandProxies(n int) {
 	rms := make([]bool, len(s.proxies))
 	rmc := 0
 	for rmc < n {
-		i := pr.Int() % len(s.proxies)
+		i := rand.N(len(s.proxies))
 		if !rms[i] {
 			rms[i] = true
 			rmc++
@@ -74,11 +74,11 @@ func (s *simpleTestProxies) GetRandProxy() (p testProxy, ok bool) {
 		ok = false
 		return
 	}
-	i := pr.Int() % len(s.proxies)
+	i := rand.N(len(s.proxies))
 	return s.proxies[i], true
 }
 
-func (s *simpleTestProxies) Discover(tracker *Tracker, lease Lease) (ok bool) {
+func (s *simpleTestProxies) Discover(tracker *Tracker, lease *Lease) (ok bool) {
 	proxy, ok := s.GetRandProxy()
 	if !ok {
 		panic("discovery called with no available proxies")
@@ -86,24 +86,30 @@ func (s *simpleTestProxies) Discover(tracker *Tracker, lease Lease) (ok bool) {
 	return s.ProxyLoop(tracker, lease, proxy)
 }
 
-func (s *simpleTestProxies) ProxyLoop(tracker *Tracker, lease Lease, proxy testProxy) (ok bool) {
+func (s *simpleTestProxies) ProxyLoop(tracker *Tracker, lease *Lease, proxy testProxy) (ok bool) {
 	defer lease.Release()
 	timeout := time.After(proxy.life)
-	ok = tracker.WithProxy(func() {
-		ticker := time.NewTicker(jitter(time.Millisecond * 100))
-	Loop:
-		for {
-			select {
-			case <-ticker.C:
-				if p, ok := s.GetRandProxy(); ok {
-					tracker.TrackExpected(p.principals[0])
-				}
-			case <-timeout:
-				break Loop
+
+	if !lease.Claim(proxy.principals...) {
+		return false
+	}
+
+	ticker := time.NewTicker(jitter(time.Millisecond * 100))
+	defer ticker.Stop()
+
+Loop:
+	for {
+		select {
+		case <-ticker.C:
+			if p, ok := s.GetRandProxy(); ok {
+				tracker.TrackExpected(Proxy{Name: p.principals[0]})
 			}
+		case <-timeout:
+			break Loop
 		}
-	}, proxy.principals...)
-	return
+	}
+
+	return ok
 }
 
 type testProxy struct {
@@ -114,28 +120,18 @@ type testProxy struct {
 func newTestProxy(life time.Duration) testProxy {
 	principals := make([]string, 0, 3)
 	for i := 0; i < 3; i++ {
-		p := fmt.Sprintf("proxy-%d", pr.Int())
+		p := fmt.Sprintf("proxy-%d", rand.Int())
 		principals = append(principals, p)
 	}
 	return testProxy{principals, life}
 }
 
 func prDuration(min time.Duration, max time.Duration) time.Duration {
-	mn, mx := int64(min), int64(max)
-	rslt := pr.Int63n(mx-mn) + mn
-	return time.Duration(rslt)
+	return min + rand.N(max-min)
 }
 
 func jitter(t time.Duration) time.Duration {
-	maxJitter := t / 5
-	baseJitter := time.Duration(pr.Uint64())
-	j := baseJitter % maxJitter
-	return t + j
-}
-
-func TestMain(m *testing.M) {
-	pr.Seed(time.Now().UnixNano())
-	os.Exit(m.Run())
+	return t + rand.N(t/5)
 }
 
 func TestBasic(t *testing.T) {
@@ -144,29 +140,30 @@ func TestBasic(t *testing.T) {
 		proxyCount = 16
 	)
 
-	ctx := context.Background()
-
 	timeoutC := time.After(timeout)
-	ticker := time.NewTicker(time.Millisecond * 100)
+	ticker := time.NewTicker(time.Millisecond * 10)
 	t.Cleanup(ticker.Stop)
-	tracker, err := New(ctx, Config{ClusterName: "test-cluster"})
+	tracker, err := New(Config{ClusterName: "test-cluster"})
 	require.NoError(t, err)
-	t.Cleanup(tracker.StopAll)
-	tracker.Start()
 	min, max := time.Duration(0), timeout
 	var proxies simpleTestProxies
 	proxies.AddRandProxies(proxyCount, min, max)
-Discover:
+
 	for {
-		select {
-		case lease := <-tracker.Acquire():
+		if lease := tracker.TryAcquire(); lease != nil {
+			t.Logf("acquired lease %v", lease.ID())
 			go proxies.Discover(tracker, lease)
+			continue
+		}
+
+		if tracker.activeCount() == proxyCount {
+			t.Logf("activeCount: %v", tracker.activeCount())
+			break
+		}
+
+		select {
 		case <-ticker.C:
-			counts := tracker.wp.Get()
-			t.Logf("Counts: %+v", counts)
-			if counts.Active == proxyCount {
-				break Discover
-			}
+			t.Logf("activeCount: %v", tracker.activeCount())
 		case <-timeoutC:
 			t.Fatal("timeout")
 		}
@@ -183,20 +180,17 @@ func TestFullRotation(t *testing.T) {
 		timeout    = time.Second * 30
 	)
 
-	ctx := context.Background()
 	ticker := time.NewTicker(time.Millisecond * 100)
 	t.Cleanup(ticker.Stop)
+
 	var proxies simpleTestProxies
 	proxies.AddRandProxies(proxyCount, minConnA, maxConnA)
-	tracker, err := New(ctx, Config{ClusterName: "test-cluster"})
+	tracker, err := New(Config{ClusterName: "test-cluster"})
 	require.NoError(t, err)
-	t.Cleanup(tracker.StopAll)
-	tracker.Start()
+
 	timeoutC := time.After(timeout)
-Loop0:
 	for {
-		select {
-		case lease := <-tracker.Acquire():
+		if lease := tracker.TryAcquire(); lease != nil {
 			// get our "discovered" proxy in the foreground
 			// to prevent race with the call to RemoveRandProxies
 			// that comes after this loop.
@@ -205,42 +199,52 @@ Loop0:
 				t.Fatal("failed to get test proxy")
 			}
 			go proxies.ProxyLoop(tracker, lease, proxy)
+			continue
+		}
+
+		if tracker.activeCount() == proxyCount {
+			t.Logf("activeCount0: %v", tracker.activeCount())
+			break
+		}
+
+		select {
 		case <-ticker.C:
-			counts := tracker.wp.Get()
-			t.Logf("Counts0: %+v", counts)
-			if counts.Active == proxyCount {
-				break Loop0
-			}
+			t.Logf("activeCount0: %v", tracker.activeCount())
 		case <-timeoutC:
 			t.Fatal("timeout")
 		}
 	}
 	proxies.RemoveRandProxies(proxyCount)
-Loop1:
+
 	for {
+		if tracker.activeCount() < 1 {
+			t.Logf("activeCount1: %v", tracker.activeCount())
+			break
+		}
+
 		select {
 		case <-ticker.C:
-			counts := tracker.wp.Get()
-			t.Logf("Counts1: %+v", counts)
-			if counts.Active < 1 {
-				break Loop1
-			}
+			t.Logf("activeCount1: %v", tracker.activeCount())
 		case <-timeoutC:
 			t.Fatal("timeout")
 		}
 	}
 	proxies.AddRandProxies(proxyCount, minConnB, maxConnB)
-Loop2:
+
 	for {
-		select {
-		case lease := <-tracker.Acquire():
+		if lease := tracker.TryAcquire(); lease != nil {
 			go proxies.Discover(tracker, lease)
+			continue
+		}
+
+		if tracker.activeCount() >= proxyCount {
+			t.Logf("activeCount2: %v", tracker.activeCount())
+			break
+		}
+
+		select {
 		case <-ticker.C:
-			counts := tracker.wp.Get()
-			t.Logf("Counts2: %+v", counts)
-			if counts.Active >= proxyCount {
-				break Loop2
-			}
+			t.Logf("activeCount2: %v", tracker.activeCount())
 		case <-timeoutC:
 			t.Fatal("timeout")
 		}
@@ -251,54 +255,109 @@ Loop2:
 // from the expected teleport principal format, and that gossip messages
 // consisting only of uuid don't create duplicate entries.
 func TestUUIDHandling(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*6)
-	t.Cleanup(cancel)
-	ticker := time.NewTicker(time.Millisecond * 10)
-	t.Cleanup(ticker.Stop)
-	tracker, err := New(context.Background(), Config{ClusterName: "test-cluster"})
+	tracker, err := New(Config{ClusterName: "test-cluster"})
 	require.NoError(t, err)
-	t.Cleanup(tracker.StopAll)
-	tracker.Start()
-	<-tracker.Acquire()
-	// claim a proxy using principal of the form <uuid>.<cluster>
-	go tracker.WithProxy(func() {
-		t.Logf("Successfully claimed proxy")
-		<-ctx.Done()
-	}, "my-proxy.test-cluster")
 
-	// Wait for proxy to be claimed
-Wait:
-	for {
-		select {
-		case <-ticker.C:
-			counts := tracker.wp.Get()
-			t.Logf("Counts: %+v", counts)
-			if counts.Active == counts.Target {
-				break Wait
-			}
-		case <-ctx.Done():
-			t.Errorf("pool never reached expected state")
-		}
+	lease := tracker.TryAcquire()
+	require.NotNil(t, lease)
+	require.True(t, lease.Claim("my-proxy.test-cluster"))
+	require.Equal(t, "my-proxy", lease.claimName)
+
+	tracker.TrackExpected(Proxy{Name: "my-proxy"})
+
+	require.Nil(t, tracker.TryAcquire())
+}
+
+func TestIsClaimed(t *testing.T) {
+	tracker, err := New(Config{ClusterName: "test-cluster"})
+	require.NoError(t, err)
+
+	tracker.TrackExpected(Proxy{Name: "proxy1"}, Proxy{Name: "proxy2"})
+	require.False(t, tracker.IsClaimed("proxy1.test-cluster"))
+
+	lease := tracker.TryAcquire()
+	require.NotNil(t, lease)
+
+	ok := lease.Claim("proxy1.test-cluster")
+	require.True(t, ok)
+
+	require.True(t, tracker.IsClaimed("proxy1"))
+	require.True(t, tracker.IsClaimed("proxy1.test-cluster"))
+	require.False(t, tracker.IsClaimed("proxy2"))
+
+	lease.Release()
+
+	require.False(t, tracker.IsClaimed("proxy1"))
+	require.False(t, tracker.IsClaimed("proxy2"))
+}
+
+func (t *Tracker) activeCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return len(t.claimed) + t.inflight
+}
+
+func TestProxyGroups(t *testing.T) {
+	tracker, err := New(Config{ClusterName: "test-cluster"})
+	require.NoError(t, err)
+
+	tracker.SetConnectionCount(2)
+
+	tracker.TrackExpected(
+		Proxy{Name: "xa", Group: "x", Generation: 1},
+		Proxy{Name: "xb", Group: "x", Generation: 1},
+		Proxy{Name: "yc", Group: "y", Generation: 1},
+		Proxy{Name: "yd", Group: "y", Generation: 1},
+	)
+
+	requireAcquire := func() *Lease {
+		lease := tracker.TryAcquire()
+		require.NotNil(t, lease)
+		return lease
 	}
 
-	// Send a gossip message containing host UUID only
-	tracker.TrackExpected("my-proxy")
-	t.Logf("Sent uuid-only gossip message; watching status...")
-
-	// Let pool go through a few ticks, monitoring status to ensure that
-	// we don't incorrectly enter seek mode (entering seek mode here would
-	// indicate that a duplicate entry was created for the uuid-only gossip
-	// message).
-	for i := 0; i < 3; i++ {
-		select {
-		case <-ticker.C:
-			counts := tracker.wp.Get()
-			t.Logf("Counts: %+v", counts)
-			if counts.Active != counts.Target {
-				t.Errorf("incorrectly entered seek mode")
-			}
-		case <-ctx.Done():
-			t.Errorf("timeout")
-		}
+	requireNoAcquire := func() {
+		require.Nil(t, tracker.TryAcquire())
 	}
+
+	xa := requireAcquire()
+	xb := requireAcquire()
+
+	require.True(t, xa.Claim("xa"))
+	require.True(t, xb.Claim("xb"))
+
+	requireNoAcquire()
+
+	tracker.TrackExpected(
+		Proxy{Name: "xe", Group: "x", Generation: 2},
+		Proxy{Name: "xf", Group: "x", Generation: 2},
+	)
+
+	yc := requireAcquire()
+	yd := requireAcquire()
+
+	require.True(t, yc.Claim("yc"))
+	require.True(t, yd.Claim("yd"))
+
+	requireNoAcquire()
+
+	tracker.SetConnectionCount(0)
+
+	xe := requireAcquire()
+	xf := requireAcquire()
+
+	requireNoAcquire()
+
+	require.True(t, xe.Claim("xe"))
+	require.True(t, xf.Claim("xf"))
+
+	// releasing a proxy from a previous generation doesn't let a new connection
+	// spawn
+	xa.Release()
+	requireNoAcquire()
+
+	// whereas releasing a proxy from a current generation does
+	yc.Release()
+	requireAcquire()
 }

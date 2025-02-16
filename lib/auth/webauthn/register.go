@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthn
 
@@ -18,18 +22,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/duo-labs/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/protocol"
+	wan "github.com/go-webauthn/webauthn/webauthn"
+	gogotypes "github.com/gogo/protobuf/types"
 	"github.com/google/uuid"
-	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/trace"
 
-	wan "github.com/duo-labs/webauthn/webauthn"
-	wantypes "github.com/gravitational/teleport/api/types/webauthn"
-	log "github.com/sirupsen/logrus"
+	"github.com/gravitational/teleport/api/types"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 )
 
 // RegistrationIdentity represents the subset of Identity methods used by
@@ -103,16 +108,16 @@ func sessionDataKey(user, sessionID string) string {
 //
 // Registration consists of:
 //
-// 1. Client requests a CredentialCreation (containing a challenge and various
-//    settings that may constrain allowed authenticators).
-// 2. Server runs Begin(), generates a credential creation.
-// 3. Client validates the credential creation, performs a user presence test
-//    (usually by asking the user to touch a secure token), and replies with a
-//    CredentialCreationResponse (containing the signed challenge and
-//    information about the credential and authenticator)
-// 4. Server runs Finish()
-// 5. If all server-side checks are successful, then registration is complete
-//    and the authenticator may now be used to login.
+//  1. Client requests a CredentialCreation (containing a challenge and various
+//     settings that may constrain allowed authenticators).
+//  2. Server runs Begin(), generates a credential creation.
+//  3. Client validates the credential creation, performs a user presence test
+//     (usually by asking the user to touch a secure token), and replies with a
+//     CredentialCreationResponse (containing the signed challenge and
+//     information about the credential and authenticator)
+//  4. Server runs Finish()
+//  5. If all server-side checks are successful, then registration is complete
+//     and the authenticator may now be used to login.
 type RegistrationFlow struct {
 	Webauthn *types.Webauthn
 	Identity RegistrationIdentity
@@ -125,7 +130,7 @@ type RegistrationFlow struct {
 // resident key.
 // As a side effect Begin may assign (and record in storage) a WebAuthn ID for
 // the user.
-func (f *RegistrationFlow) Begin(ctx context.Context, user string, passwordless bool) (*CredentialCreation, error) {
+func (f *RegistrationFlow) Begin(ctx context.Context, user string, passwordless bool) (*wantypes.CredentialCreation, error) {
 	if user == "" {
 		return nil, trace.BadParameter("user required")
 	}
@@ -137,7 +142,25 @@ func (f *RegistrationFlow) Begin(ctx context.Context, user string, passwordless 
 	}
 	var exclusions []protocol.CredentialDescriptor
 	for _, dev := range devices {
-		cred, ok := deviceToCredential(dev, true /* idOnly */)
+		// Skip existing U2F devices, letting users "upgrade" their registration is
+		// good for us.
+		if dev.GetU2F() != nil {
+			continue
+		}
+
+		// Let authenticator "upgrades" from non-resident (MFA) to resident
+		// (passwordless) happen, but prevent "downgrades" from resident to
+		// non-resident.
+		//
+		// Modern passkey implementations will "disobey" our MFA registrations and
+		// actually create passkeys, silently replacing the old passkey with the new
+		// "MFA" key, which can make Teleport confused (for example, by letting the
+		// "MFA" key be deleted because Teleport thinks the passkey still exists).
+		if webDev := dev.GetWebauthn(); webDev != nil && !webDev.ResidentKey && passwordless {
+			continue
+		}
+
+		cred, ok := deviceToCredential(dev, true /* idOnly */, nil /* currentFlags */)
 		if !ok {
 			continue
 		}
@@ -151,7 +174,11 @@ func (f *RegistrationFlow) Begin(ctx context.Context, user string, passwordless 
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	u := newWebUser(user, webID, true /* credentialIDOnly */, nil /* devices */)
+	u := newWebUser(webUserOpts{
+		name:             user,
+		webID:            webID,
+		credentialIDOnly: true,
+	})
 
 	web, err := newWebAuthn(webAuthnParams{
 		cfg:                     f.Webauthn,
@@ -162,27 +189,31 @@ func (f *RegistrationFlow) Begin(ctx context.Context, user string, passwordless 
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	credentialCreation, sessionData, err := web.BeginRegistration(u, wan.WithExclusions(exclusions))
+	cc, sessionData, err := web.BeginRegistration(
+		u,
+		wan.WithExclusions(exclusions),
+		wan.WithExtensions(protocol.AuthenticationExtensions{
+			// Query authenticator on whether the resulting credential is resident,
+			// despite our requirements.
+			wantypes.CredPropsExtension: true,
+		}),
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-
-	// Copy settings manually, the framework doesn't do it.
-	credentialCreation.Response.AuthenticatorSelection = web.Config.AuthenticatorSelection
-	sessionData.UserVerification = web.Config.AuthenticatorSelection.UserVerification
 
 	// TODO(codingllama): Send U2F App ID back in creation requests too. Useful to
 	//  detect duplicate devices.
 
-	sessionDataPB, err := sessionToPB(sessionData)
+	sd, err := wantypes.SessionDataFromProtocol(sessionData)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := f.Identity.UpsertWebauthnSessionData(ctx, user, scopeSession, sessionDataPB); err != nil {
+	if err := f.Identity.UpsertWebauthnSessionData(ctx, user, scopeSession, sd); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return (*CredentialCreation)(credentialCreation), nil
+	return wantypes.CredentialCreationFromProtocol(cc), nil
 }
 
 func upsertOrGetWebID(ctx context.Context, user string, identity RegistrationIdentity) ([]byte, error) {
@@ -215,48 +246,72 @@ func upsertOrGetWebID(ctx context.Context, user string, identity RegistrationIde
 	return wla.UserID, nil
 }
 
+// RegisterResponse represents fields needed to finish registering a new
+// WebAuthn device.
+type RegisterResponse struct {
+	// User is the device owner.
+	User string
+	// DeviceName is the name for the new device.
+	DeviceName string
+	// CreationResponse is the response from the new device.
+	CreationResponse *wantypes.CredentialCreationResponse
+	// Passwordless is true if this is expected to be a passwordless registration.
+	// Callers may make certain concessions when processing passwordless
+	// registration (such as skipping password validation), this flag reflects that.
+	// The data stored in the Begin SessionData must match the passwordless flag,
+	// otherwise the registration is denied.
+	Passwordless bool
+}
+
 // Finish is the second and last step of the registration ceremony.
 // If successful, it returns the created MFADevice. Finish has the side effect
 // or writing the device to storage (using its Identity interface).
-func (f *RegistrationFlow) Finish(ctx context.Context, user, deviceName string, resp *CredentialCreationResponse) (*types.MFADevice, error) {
+func (f *RegistrationFlow) Finish(ctx context.Context, req RegisterResponse) (*types.MFADevice, error) {
 	switch {
-	case user == "":
+	case req.User == "":
 		return nil, trace.BadParameter("user required")
-	case deviceName == "":
+	case req.DeviceName == "":
 		return nil, trace.BadParameter("device name required")
-	case resp == nil:
+	case req.CreationResponse == nil:
 		return nil, trace.BadParameter("credential creation response required")
 	}
 
-	parsedResp, err := parseCredentialCreationResponse(resp)
+	parsedResp, err := parseCredentialCreationResponse(req.CreationResponse)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	origin := parsedResp.Response.CollectedClientData.Origin
 	if err := validateOrigin(origin, f.Webauthn.RPID); err != nil {
-		log.WithError(err).Debugf("WebAuthn: origin validation failed")
+		log.DebugContext(ctx, "origin validation failed", "error", err)
 		return nil, trace.Wrap(err)
 	}
 
 	// TODO(codingllama): Verify that the public key matches the allowed
 	//  credential params? It doesn't look like duo-labs/webauthn does that.
 
-	wla, err := f.Identity.GetWebauthnLocalAuth(ctx, user)
+	wla, err := f.Identity.GetWebauthnLocalAuth(ctx, req.User)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	u := newWebUser(user, wla.UserID, true /* credentialIDOnly */, nil /* devices */)
+	u := newWebUser(webUserOpts{
+		name:             req.User,
+		webID:            wla.UserID,
+		credentialIDOnly: true,
+	})
 
-	sessionDataPB, err := f.Identity.GetWebauthnSessionData(ctx, user, scopeSession)
+	sd, err := f.Identity.GetWebauthnSessionData(ctx, req.User, scopeSession)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sessionData := sessionFromPB(sessionDataPB)
+	sessionData := wantypes.SessionDataToProtocol(sd)
 
 	// Activate passwordless switches (resident key, user verification) if we
 	// required verification in the begin step.
 	passwordless := sessionData.UserVerification == protocol.VerificationRequired
+	if req.Passwordless && !passwordless {
+		return nil, trace.BadParameter("passwordless registration failed, requested CredentialCreation was for an MFA registration")
+	}
 
 	web, err := newWebAuthn(webAuthnParams{
 		cfg:                     f.Webauthn,
@@ -270,6 +325,16 @@ func (f *RegistrationFlow) Finish(ctx context.Context, user, deviceName string, 
 	}
 	credential, err := web.CreateCredential(u, *sessionData, parsedResp)
 	if err != nil {
+		// Use a more friendly message for certain verification errors.
+		protocolErr := &protocol.Error{}
+		if errors.As(err, &protocolErr) &&
+			protocolErr.Type == protocol.ErrVerification.Type &&
+			passwordless &&
+			!parsedResp.Response.AttestationObject.AuthData.Flags.UserVerified() {
+			log.DebugContext(ctx, "WebAuthn: Replacing verification error with PIN message", "error", err)
+			return nil, trace.BadParameter("authenticator doesn't support passwordless, setting up a PIN may fix this")
+		}
+
 		return nil, trace.Wrap(err)
 	}
 
@@ -280,35 +345,45 @@ func (f *RegistrationFlow) Finish(ctx context.Context, user, deviceName string, 
 		return nil, trace.Wrap(err)
 	}
 
-	newDevice := types.NewMFADevice(deviceName, uuid.NewString() /* id */, time.Now() /* addedAt */)
-	newDevice.Device = &types.MFADevice_Webauthn{
+	newDevice, err := types.NewMFADevice(req.DeviceName, uuid.NewString() /* id */, time.Now() /* addedAt */, &types.MFADevice_Webauthn{
 		Webauthn: &types.WebauthnDevice{
 			CredentialId:      credential.ID,
 			PublicKeyCbor:     credential.PublicKey,
 			AttestationType:   credential.AttestationType,
 			Aaguid:            credential.Authenticator.AAGUID,
 			SignatureCounter:  credential.Authenticator.SignCount,
-			AttestationObject: resp.AttestationResponse.AttestationObject,
-			ResidentKey:       passwordless,
+			AttestationObject: req.CreationResponse.AttestationResponse.AttestationObject,
+			ResidentKey:       req.Passwordless || hasCredPropsRK(req.CreationResponse),
+			CredentialRpId:    f.Webauthn.RPID,
+			CredentialBackupEligible: &gogotypes.BoolValue{
+				Value: credential.Flags.BackupEligible,
+			},
+			CredentialBackedUp: &gogotypes.BoolValue{
+				Value: credential.Flags.BackupState,
+			},
 		},
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
+
 	// We delegate a few checks to identity, including:
 	// * The validity of the created MFADevice
 	// * Uniqueness validation of the deviceName
 	// * Uniqueness validation of the Webauthn credential ID.
-	if err := f.Identity.UpsertMFADevice(ctx, user, newDevice); err != nil {
+	if err := f.Identity.UpsertMFADevice(ctx, req.User, newDevice); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	// Registration complete, remove the registration challenge we just used.
-	if err := f.Identity.DeleteWebauthnSessionData(ctx, user, scopeSession); err != nil {
-		log.Warnf("WebAuthn: failed to delete registration SessionData for user %v", user)
+	if err := f.Identity.DeleteWebauthnSessionData(ctx, req.User, scopeSession); err != nil {
+		log.WarnContext(ctx, "failed to delete registration SessionData for user", "user", req.User, "error", err)
 	}
 
 	return newDevice, nil
 }
 
-func parseCredentialCreationResponse(resp *CredentialCreationResponse) (*protocol.ParsedCredentialCreationData, error) {
+func parseCredentialCreationResponse(resp *wantypes.CredentialCreationResponse) (*protocol.ParsedCredentialCreationData, error) {
 	// Remove extensions before marshaling, duo-labs/webauthn isn't expecting it.
 	exts := resp.Extensions
 	resp.Extensions = nil
@@ -325,4 +400,11 @@ func parseCredentialCreationResponse(resp *CredentialCreationResponse) (*protoco
 	}
 	parsedResp, err := protocol.ParseCredentialCreationResponseBody(bytes.NewReader(body))
 	return parsedResp, trace.Wrap(err)
+}
+
+func hasCredPropsRK(ccr *wantypes.CredentialCreationResponse) bool {
+	return ccr != nil &&
+		ccr.Extensions != nil &&
+		ccr.Extensions.CredProps != nil &&
+		ccr.Extensions.CredProps.RK
 }

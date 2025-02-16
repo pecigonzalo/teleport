@@ -1,19 +1,22 @@
 /*
-Copyright 2016 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
+// Package csrf is used to protect against login CSRF in Teleport's SSO flows.
 package csrf
 
 import (
@@ -21,27 +24,24 @@ import (
 	"encoding/hex"
 	"net/http"
 
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/trace"
+
+	"github.com/gravitational/teleport/lib/utils"
 )
 
-const (
-	// CookieName is the name of the CSRF cookie. It's prefixed with "__Host-" as
-	// an additional defense in depth measure. It makes sure it is sent from a
-	// secure page (HTTPS), won't be sent to subdomains, and the path attribute
-	// is set to /.
-	CookieName = "__Host-grv_csrf"
-	// HeaderName is the default HTTP request header to inspect.
-	HeaderName = "X-CSRF-Token"
-	// tokenLenBytes is CSRF token length in bytes.
-	tokenLenBytes = 32
-	// defaultMaxAge is the default MaxAge for cookies.
-	defaultMaxAge = 0
-)
+// CookieName is the name of the CSRF cookie used to protect against login
+// CSRF in Teleport's SSO flows.
+//
+// It's prefixed with "__Host-" as an additional defense in depth measure.
+// This makes sure the cookie is sent from a secure page (HTTPS),
+// won't be sent to subdomains, and the path attribute is set to /.
+const CookieName = "__Host-grv_csrf"
 
-// AddCSRFProtection adds CSRF token into the user session via secure cookie,
-// it implements "double submit cookie" approach to check against CSRF attacks
-// https://www.owasp.org/index.php/Cross-Site_Request_Forgery_%28CSRF%29_Prevention_Cheat_Sheet#Double_Submit_Cookie
+// tokenLenBytes is the length of a raw CSRF token prior to encoding
+const tokenLenBytes = 32
+
+// AddCSRFProtection adds CSRF token into the user session via a secure cookie.
+// This CSRF token is used to protect against login CSRF in Teleport's SSO flows.
 func AddCSRFProtection(w http.ResponseWriter, r *http.Request) (string, error) {
 	token, err := ExtractTokenFromCookie(r)
 	// if there was an error retrieving the token, the token doesn't exist
@@ -53,21 +53,6 @@ func AddCSRFProtection(w http.ResponseWriter, r *http.Request) (string, error) {
 	}
 	save(token, w)
 	return token, nil
-}
-
-// VerifyHTTPHeader checks if HTTP header value matches the cookie.
-func VerifyHTTPHeader(r *http.Request) error {
-	token := r.Header.Get(HeaderName)
-	if len(token) == 0 {
-		return trace.BadParameter("cannot retrieve CSRF token from HTTP header %q", HeaderName)
-	}
-
-	err := VerifyToken(token, r)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	return nil
 }
 
 // VerifyToken validates given token based on HTTP request cookie
@@ -87,7 +72,7 @@ func VerifyToken(token string, r *http.Request) error {
 		return trace.Wrap(err, "unable to decode cookie CSRF token")
 	}
 
-	if !compareTokens(decodedTokenA, decodedTokenB) {
+	if subtle.ConstantTimeCompare(decodedTokenA, decodedTokenB) != 1 {
 		return trace.BadParameter("CSRF tokens do not match")
 	}
 
@@ -104,7 +89,7 @@ func ExtractTokenFromCookie(r *http.Request) (string, error) {
 	return cookie.Value, nil
 }
 
-// decode decodes a cookie using base64.
+// decode decodes a hex-encoded CSRF token.
 func decode(token string) ([]byte, error) {
 	decoded, err := hex.DecodeString(token)
 	if err != nil {
@@ -118,17 +103,11 @@ func decode(token string) ([]byte, error) {
 	return decoded, nil
 }
 
-// compareTokens securely (constant-time) compares CSRF tokens
-func compareTokens(a, b []byte) bool {
-	return subtle.ConstantTimeCompare(a, b) == 1
-}
-
 // save stores encoded CSRF token in the session cookie.
 func save(encodedToken string, w http.ResponseWriter) string {
 	cookie := &http.Cookie{
-		Name:   CookieName,
-		Value:  encodedToken,
-		MaxAge: defaultMaxAge,
+		Name:  CookieName,
+		Value: encodedToken,
 		// Set SameSite to none so browsers preserve gravitational CSRF cookie
 		// while processing SSO providers redirects.
 		SameSite: http.SameSiteNoneMode,

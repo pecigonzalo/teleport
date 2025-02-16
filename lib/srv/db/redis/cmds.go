@@ -1,20 +1,20 @@
 /*
-
- Copyright 2022 Gravitational, Inc.
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package redis
 
@@ -22,15 +22,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/gravitational/trace"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/common"
 	"github.com/gravitational/teleport/lib/srv/db/common/role"
 	"github.com/gravitational/teleport/lib/srv/db/redis/protocol"
-	"github.com/gravitational/trace"
 )
 
 // List of commands that Teleport handles in a special way by Redis standalone and cluster.
@@ -48,12 +50,17 @@ const (
 
 // processCmd processes commands received from connected client. Most commands are just passed to Redis instance,
 // but some require special actions:
-//  * Redis 7.0+ commands are rejected as at the moment of writing Redis 7.0 hasn't been released and go-redis doesn't support it.
-//  * RESP3 commands are rejected as Teleport/go-redis currently doesn't support this version of protocol.
-//  * Subscribe related commands created a new DB connection as they change Redis request-response model to Pub/Sub.
+//   - Redis 7.0+ commands are rejected as at the moment of writing Redis 7.0 hasn't been released and go-redis doesn't support it.
+//   - RESP3 commands are rejected as Teleport/go-redis currently doesn't support this version of protocol.
+//   - Subscribe related commands created a new DB connection as they change Redis request-response model to Pub/Sub.
 func (e *Engine) processCmd(ctx context.Context, cmd *redis.Cmd) error {
 	switch strings.ToLower(cmd.Name()) {
-	case helloCmd, punsubscribeCmd, ssubscribeCmd, sunsubscribeCmd:
+	case helloCmd:
+		// HELLO command is still not supported yet by Teleport. However, some
+		// Redis clients (e.g. go-redis) may explicitly look for the original
+		// Redis unknown command error so it can fallback to RESP2.
+		return protocol.MakeUnknownCommandErrorForCmd(cmd)
+	case punsubscribeCmd, ssubscribeCmd, sunsubscribeCmd:
 		return protocol.ErrCmdNotSupported
 	case authCmd:
 		return e.processAuth(ctx, cmd)
@@ -91,7 +98,7 @@ func (e *Engine) subscribeCmd(ctx context.Context, subscribeFn redisSubscribeFn,
 	pubSub := subscribeFn(ctx, args...)
 	defer func() {
 		if err := pubSub.Close(); err != nil {
-			e.Log.Errorf("failed to close Redis Pub/Sub connection: %v", err)
+			e.Log.ErrorContext(ctx, "Failed to close Redis Pub/Sub connection.", "error", err)
 		}
 	}()
 
@@ -167,12 +174,23 @@ func (e *Engine) processAuth(ctx context.Context, cmd *redis.Cmd) error {
 		}
 
 		err := e.sessionCtx.Checker.CheckAccess(e.sessionCtx.Database,
-			services.AccessMFAParams{Verified: true},
-			role.DatabaseRoleMatchers(
-				defaults.ProtocolRedis,
-				e.sessionCtx.DatabaseUser,
-				e.sessionCtx.DatabaseName,
-			)...)
+			services.AccessState{MFAVerified: true},
+			role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+				Database:     e.sessionCtx.Database,
+				DatabaseUser: e.sessionCtx.DatabaseUser,
+				DatabaseName: e.sessionCtx.DatabaseName,
+			})...)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		password, ok := cmd.Args()[1].(string)
+		if !ok {
+			return trace.BadParameter("password has a wrong type, expected string got %T", cmd.Args()[1])
+		}
+
+		// Pass empty username to login using AUTH <password> command.
+		e.redisClient, err = e.reconnect("", password)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -186,6 +204,15 @@ func (e *Engine) processAuth(ctx context.Context, cmd *redis.Cmd) error {
 			return trace.BadParameter("username has a wrong type, expected string got %T", cmd.Args()[1])
 		}
 
+		// For Teleport managed users, bypass the passwords sent here.
+		if slices.Contains(e.sessionCtx.Database.GetManagedUsers(), e.sessionCtx.DatabaseUser) {
+			return trace.Wrap(e.sendToClient([]string{
+				"OK",
+				fmt.Sprintf("Please note that AUTH commands are ignored for Teleport managed user '%s'.", e.sessionCtx.DatabaseUser),
+				"Teleport service automatically authenticates managed users with the Redis server.",
+			}))
+		}
+
 		e.Audit.OnQuery(e.Context, e.sessionCtx, common.Query{Query: fmt.Sprintf("AUTH %s ****", dbUser)})
 
 		if dbUser != e.sessionCtx.DatabaseUser {
@@ -194,12 +221,12 @@ func (e *Engine) processAuth(ctx context.Context, cmd *redis.Cmd) error {
 		}
 
 		err := e.sessionCtx.Checker.CheckAccess(e.sessionCtx.Database,
-			services.AccessMFAParams{Verified: true},
-			role.DatabaseRoleMatchers(
-				defaults.ProtocolRedis,
-				e.sessionCtx.DatabaseUser,
-				e.sessionCtx.DatabaseName,
-			)...)
+			services.AccessState{MFAVerified: true},
+			role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+				Database:     e.sessionCtx.Database,
+				DatabaseUser: e.sessionCtx.DatabaseUser,
+				DatabaseName: e.sessionCtx.DatabaseName,
+			})...)
 		if err != nil {
 			return trace.Wrap(err)
 		}

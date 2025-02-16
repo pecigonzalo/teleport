@@ -1,30 +1,32 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/defaults"
-	"github.com/gravitational/trace"
-
-	"github.com/google/uuid"
-	"github.com/stretchr/testify/require"
 )
 
 // TestMatchResourceLabels tests matching a resource against a selector.
@@ -130,7 +132,7 @@ func TestMatchResourceLabels(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			require.Equal(t, test.match, MatchResourceLabels(test.selectors, database))
+			require.Equal(t, test.match, MatchResourceLabels(test.selectors, database.GetAllLabels()))
 		})
 	}
 }
@@ -139,18 +141,20 @@ func TestMatchResourceByFilters_Helper(t *testing.T) {
 	t.Parallel()
 
 	server, err := types.NewServerWithLabels("banana", types.KindNode, types.ServerSpecV2{
-		Hostname: "foo",
-		Addr:     "bar",
+		Hostname:    "foo",
+		Addr:        "bar",
+		PublicAddrs: []string{"foo.example.com:3080"},
 	}, map[string]string{"env": "prod", "os": "mac"})
 	require.NoError(t, err)
 
 	resource := types.ResourceWithLabels(server)
 
 	testcases := []struct {
-		name        string
-		filters     MatchResourceFilter
-		assertErr   require.ErrorAssertionFunc
-		assertMatch require.BoolAssertionFunc
+		name                string
+		predicateExpression string
+		filters             MatchResourceFilter
+		assertErr           require.ErrorAssertionFunc
+		assertMatch         require.BoolAssertionFunc
 	}{
 		{
 			name:        "empty filters",
@@ -158,48 +162,66 @@ func TestMatchResourceByFilters_Helper(t *testing.T) {
 			assertMatch: require.True,
 		},
 		{
-			name: "all match",
+			name:                "all match",
+			predicateExpression: `resource.spec.hostname == "foo"`,
 			filters: MatchResourceFilter{
-				PredicateExpression: `resource.spec.hostname == "foo"`,
-				SearchKeywords:      []string{"banana"},
-				Labels:              map[string]string{"os": "mac"},
+				SearchKeywords: []string{"banana"},
+				Labels:         map[string]string{"os": "mac"},
 			},
 			assertErr:   require.NoError,
 			assertMatch: require.True,
 		},
 		{
-			name: "no match",
+			name:                "no match",
+			predicateExpression: `labels.env == "no-match"`,
 			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "no-match"`,
-				SearchKeywords:      []string{"no", "match"},
-				Labels:              map[string]string{"no": "match"},
+				SearchKeywords: []string{"no", "match"},
+				Labels:         map[string]string{"no": "match"},
 			},
 			assertErr:   require.NoError,
 			assertMatch: require.False,
 		},
 		{
-			name: "expression match",
+			name: "search keywords hostname match",
 			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "prod" && exists(labels.os)`,
+				SearchKeywords: []string{"foo"},
 			},
 			assertErr:   require.NoError,
 			assertMatch: require.True,
 		},
 		{
-			name: "no expression match",
+			name: "search keywords addr match",
 			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "no-match"`,
+				SearchKeywords: []string{"bar"},
 			},
 			assertErr:   require.NoError,
-			assertMatch: require.False,
+			assertMatch: require.True,
 		},
 		{
-			name: "error in expr",
+			name: "search keywords public addr match",
 			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == prod`,
+				SearchKeywords: []string{"foo.example.com"},
 			},
-			assertErr:   require.Error,
-			assertMatch: require.False,
+			assertErr:   require.NoError,
+			assertMatch: require.True,
+		},
+		{
+			name:                "expression match",
+			predicateExpression: `labels.env == "prod" && exists(labels.os)`,
+			assertErr:           require.NoError,
+			assertMatch:         require.True,
+		},
+		{
+			name:                "no expression match",
+			predicateExpression: `labels.env == "no-match"`,
+			assertErr:           require.NoError,
+			assertMatch:         require.False,
+		},
+		{
+			name:                "error in expr",
+			predicateExpression: `labels.env == prod`,
+			assertErr:           require.Error,
+			assertMatch:         require.False,
 		},
 		{
 			name: "label match",
@@ -234,31 +256,31 @@ func TestMatchResourceByFilters_Helper(t *testing.T) {
 			assertMatch: require.False,
 		},
 		{
-			name: "partial match is no match: search",
+			name:                "partial match is no match: search",
+			predicateExpression: `resource.spec.hostname == "foo"`,
 			filters: MatchResourceFilter{
-				PredicateExpression: `resource.spec.hostname == "foo"`,
-				Labels:              map[string]string{"os": "mac"},
-				SearchKeywords:      []string{"no", "match"},
+				Labels:         map[string]string{"os": "mac"},
+				SearchKeywords: []string{"no", "match"},
 			},
 			assertErr:   require.NoError,
 			assertMatch: require.False,
 		},
 		{
-			name: "partial match is no match: labels",
+			name:                "partial match is no match: labels",
+			predicateExpression: `resource.spec.hostname == "foo"`,
 			filters: MatchResourceFilter{
-				PredicateExpression: `resource.spec.hostname == "foo"`,
-				Labels:              map[string]string{"no": "match"},
-				SearchKeywords:      []string{"mac", "env"},
+				Labels:         map[string]string{"no": "match"},
+				SearchKeywords: []string{"mac", "env"},
 			},
 			assertErr:   require.NoError,
 			assertMatch: require.False,
 		},
 		{
-			name: "partial match is no match: expression",
+			name:                "partial match is no match: expression",
+			predicateExpression: `labels.env == "no-match"`,
 			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "no-match"`,
-				Labels:              map[string]string{"os": "mac"},
-				SearchKeywords:      []string{"mac", "env"},
+				Labels:         map[string]string{"os": "mac"},
+				SearchKeywords: []string{"mac", "env"},
 			},
 			assertErr:   require.NoError,
 			assertMatch: require.False,
@@ -269,6 +291,12 @@ func TestMatchResourceByFilters_Helper(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
+			if tc.predicateExpression != "" {
+				parser, err := NewResourceExpression(tc.predicateExpression)
+				require.NoError(t, err)
+				tc.filters.PredicateExpression = parser
+			}
 
 			match, err := matchResourceByFilters(resource, tc.filters)
 			tc.assertErr(t, err)
@@ -280,32 +308,47 @@ func TestMatchResourceByFilters_Helper(t *testing.T) {
 func TestMatchAndFilterKubeClusters(t *testing.T) {
 	t.Parallel()
 
-	getKubeService := func() types.Server {
-		kubeService, err := types.NewServer("_", types.KindKubeService, types.ServerSpecV2{
-			KubernetesClusters: []*types.KubernetesCluster{
-				{
-					Name:         "cluster-1",
-					StaticLabels: map[string]string{"env": "prod", "os": "mac"},
-				},
-				{
-					Name:         "cluster-2",
-					StaticLabels: map[string]string{"env": "staging", "os": "mac"},
-				},
-				{
-					Name:         "cluster-3",
-					StaticLabels: map[string]string{"env": "prod", "os": "mac"},
-				},
+	getKubeServers := func() []types.KubeServer {
+		cluster1, err := types.NewKubernetesClusterV3(
+			types.Metadata{
+				Name:   "cluster-1",
+				Labels: map[string]string{"env": "prod", "os": "mac"},
 			},
-		})
+			types.KubernetesClusterSpecV3{},
+		)
 		require.NoError(t, err)
-		return kubeService
+
+		cluster2, err := types.NewKubernetesClusterV3(
+			types.Metadata{
+				Name:   "cluster-2",
+				Labels: map[string]string{"env": "staging", "os": "mac"},
+			},
+			types.KubernetesClusterSpecV3{},
+		)
+		require.NoError(t, err)
+		cluster3, err := types.NewKubernetesClusterV3(
+			types.Metadata{
+				Name:   "cluster-3",
+				Labels: map[string]string{"env": "prod", "os": "mac"},
+			},
+			types.KubernetesClusterSpecV3{},
+		)
+
+		require.NoError(t, err)
+		var servers []types.KubeServer
+		for _, cluster := range []*types.KubernetesClusterV3{cluster1, cluster2, cluster3} {
+			server, err := types.NewKubernetesServerV3FromCluster(cluster, "_", "_")
+			require.NoError(t, err)
+			servers = append(servers, server)
+		}
+		return servers
 	}
 
 	testcases := []struct {
-		name        string
-		filters     MatchResourceFilter
-		expectedLen int
-		assertMatch require.BoolAssertionFunc
+		name                string
+		predicateExpression string
+		expectedLen         int
+		assertMatch         require.BoolAssertionFunc
 	}{
 		{
 			name:        "empty values",
@@ -313,35 +356,27 @@ func TestMatchAndFilterKubeClusters(t *testing.T) {
 			assertMatch: require.True,
 		},
 		{
-			name:        "all match",
-			expectedLen: 3,
-			filters: MatchResourceFilter{
-				PredicateExpression: `labels.os == "mac"`,
-			},
-			assertMatch: require.True,
+			name:                "all match",
+			expectedLen:         3,
+			predicateExpression: `labels.os == "mac"`,
+			assertMatch:         require.True,
 		},
 		{
-			name:        "some match",
-			expectedLen: 2,
-			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "prod"`,
-			},
-			assertMatch: require.True,
+			name:                "some match",
+			expectedLen:         2,
+			predicateExpression: `labels.env == "prod"`,
+			assertMatch:         require.True,
 		},
 		{
-			name:        "single match",
-			expectedLen: 1,
-			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "staging"`,
-			},
-			assertMatch: require.True,
+			name:                "single match",
+			expectedLen:         1,
+			predicateExpression: `labels.env == "staging"`,
+			assertMatch:         require.True,
 		},
 		{
-			name: "no match",
-			filters: MatchResourceFilter{
-				PredicateExpression: `labels.env == "no-match"`,
-			},
-			assertMatch: require.False,
+			name:                "no match",
+			predicateExpression: `labels.env == "no-match"`,
+			assertMatch:         require.False,
 		},
 	}
 
@@ -350,11 +385,28 @@ func TestMatchAndFilterKubeClusters(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			kubeService := getKubeService()
-			match, err := matchAndFilterKubeClusters(types.ResourceWithLabels(kubeService), tc.filters)
-			require.NoError(t, err)
-			tc.assertMatch(t, match)
-			require.Len(t, kubeService.GetKubernetesClusters(), tc.expectedLen)
+			var filters MatchResourceFilter
+			if tc.predicateExpression != "" {
+				expression, err := NewResourceExpression(tc.predicateExpression)
+				require.NoError(t, err)
+
+				filters.PredicateExpression = expression
+			}
+
+			kubeServers := getKubeServers()
+			atLeastOneMatch := false
+			matchedServers := make([]types.KubeServer, 0, len(kubeServers))
+			for _, kubeServer := range kubeServers {
+				match, err := matchAndFilterKubeClusters(types.ResourceWithLabels(kubeServer), filters)
+				require.NoError(t, err)
+				if match {
+					atLeastOneMatch = true
+					matchedServers = append(matchedServers, kubeServer)
+				}
+			}
+			tc.assertMatch(t, atLeastOneMatch)
+
+			require.Len(t, matchedServers, tc.expectedLen)
 		})
 	}
 }
@@ -365,23 +417,34 @@ func TestMatchAndFilterKubeClusters(t *testing.T) {
 func TestMatchResourceByFilters(t *testing.T) {
 	t.Parallel()
 
-	filterExpression := `resource.metadata.name == "foo"`
+	filterExpression, err := NewResourceExpression(`resource.metadata.name == "foo"`)
+	require.NoError(t, err)
 
 	testcases := []struct {
 		name           string
-		isKubeService  bool
 		wantNotImplErr bool
 		filters        MatchResourceFilter
 		resource       func() types.ResourceWithLabels
 	}{
 		{
-			name:     "empty filter",
-			resource: func() types.ResourceWithLabels { return nil },
-			filters:  MatchResourceFilter{},
+			name: "no filter should return true",
+			resource: func() types.ResourceWithLabels {
+				server, err := types.NewServer("foo", types.KindNode, types.ServerSpecV2{})
+				require.NoError(t, err)
+				return server
+			},
+			filters: MatchResourceFilter{ResourceKind: types.KindNode},
 		},
 		{
-			name:     "unsupported resource kind",
-			resource: func() types.ResourceWithLabels { return nil },
+			name: "unsupported resource kind",
+			resource: func() types.ResourceWithLabels {
+				badResource, err := types.NewConnectionDiagnosticV1("123", map[string]string{},
+					types.ConnectionDiagnosticSpecV1{
+						Message: types.DiagnosticMessageSuccess,
+					})
+				require.NoError(t, err)
+				return badResource
+			},
 			filters: MatchResourceFilter{
 				ResourceKind:   "unsupported",
 				SearchKeywords: []string{"nothing"},
@@ -432,29 +495,11 @@ func TestMatchResourceByFilters(t *testing.T) {
 				PredicateExpression: filterExpression,
 			},
 		},
-		{
-			name:          "kube service",
-			isKubeService: true,
-			resource: func() types.ResourceWithLabels {
-				dbServer, err := types.NewServer("_", types.KindKubeService, types.ServerSpecV2{
-					KubernetesClusters: []*types.KubernetesCluster{
-						{Name: "bar"},
-						{Name: "foo"},
-						{Name: "foo"},
-					},
-				})
-				require.NoError(t, err)
-				return dbServer
-			},
-			filters: MatchResourceFilter{
-				ResourceKind:        types.KindKubeService,
-				PredicateExpression: filterExpression,
-			},
-		},
+
 		{
 			name: "kube cluster",
 			resource: func() types.ResourceWithLabels {
-				cluster, err := types.NewKubernetesClusterV3FromLegacyCluster("_", &types.KubernetesCluster{
+				cluster, err := types.NewKubernetesClusterV3FromLegacyCluster("", &types.KubernetesCluster{
 					Name: "foo",
 				})
 				require.NoError(t, err)
@@ -489,6 +534,50 @@ func TestMatchResourceByFilters(t *testing.T) {
 				PredicateExpression: filterExpression,
 			},
 		},
+		{
+			name: "AppServerOrSAMLIdPServiceProvider (App Server)r",
+			resource: func() types.ResourceWithLabels {
+				appServer, err := types.NewAppServerV3(types.Metadata{
+					Name: "_",
+				}, types.AppServerSpecV3{
+					HostID: "_",
+					App: &types.AppV3{
+						Metadata: types.Metadata{Name: "foo"},
+						Spec:     types.AppSpecV3{URI: "_"},
+					},
+				})
+				require.NoError(t, err)
+				return appServer
+			},
+			filters: MatchResourceFilter{
+				ResourceKind:        types.KindAppOrSAMLIdPServiceProvider,
+				PredicateExpression: filterExpression,
+			},
+		},
+		{
+			name: "AppServerOrSAMLIdPServiceProvider (Service Provider)",
+			resource: func() types.ResourceWithLabels {
+				appOrSP, err := types.NewSAMLIdPServiceProvider(types.Metadata{Name: "foo"}, types.SAMLIdPServiceProviderSpecV1{EntityDescriptor: "<></>", EntityID: "_"})
+				require.NoError(t, err)
+				return appOrSP
+			},
+			filters: MatchResourceFilter{
+				ResourceKind:        types.KindAppOrSAMLIdPServiceProvider,
+				PredicateExpression: filterExpression,
+			},
+		},
+		{
+			name: "SAMLIdPServiceProvider",
+			resource: func() types.ResourceWithLabels {
+				sp, err := types.NewSAMLIdPServiceProvider(types.Metadata{Name: "foo"}, types.SAMLIdPServiceProviderSpecV1{ACSURL: "host", EntityID: "host"})
+				require.NoError(t, err)
+				return sp
+			},
+			filters: MatchResourceFilter{
+				ResourceKind:        types.KindSAMLIdPServiceProvider,
+				PredicateExpression: filterExpression,
+			},
+		},
 	}
 
 	for _, tc := range testcases {
@@ -497,7 +586,7 @@ func TestMatchResourceByFilters(t *testing.T) {
 			t.Parallel()
 
 			resource := tc.resource()
-			match, err := MatchResourceByFilters(resource, tc.filters)
+			match, err := MatchResourceByFilters(resource, tc.filters, nil)
 
 			switch tc.wantNotImplErr {
 			case true:
@@ -507,14 +596,55 @@ func TestMatchResourceByFilters(t *testing.T) {
 				require.NoError(t, err)
 				require.True(t, match)
 			}
+		})
+	}
+}
 
-			if tc.isKubeService {
-				server, ok := resource.(types.Server)
-				require.True(t, ok)
-				require.Len(t, server.GetKubernetesClusters(), 2)
-				require.Equal(t, server.GetKubernetesClusters()[0].Name, "foo")
-				require.Equal(t, server.GetKubernetesClusters()[1].Name, "foo")
-			}
+func TestResourceMatchersToTypes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   []ResourceMatcher
+		out  []*types.DatabaseResourceMatcher
+	}{
+		{
+			name: "empty",
+			in:   []ResourceMatcher{},
+			out:  []*types.DatabaseResourceMatcher{},
+		},
+		{
+			name: "single element with single label",
+			in: []ResourceMatcher{
+				{Labels: types.Labels{"elem1": []string{"elem1"}}},
+			},
+			out: []*types.DatabaseResourceMatcher{
+				{Labels: &types.Labels{"elem1": []string{"elem1"}}},
+			},
+		},
+		{
+			name: "single element with multiple labels",
+			in: []ResourceMatcher{
+				{Labels: types.Labels{"elem2": []string{"elem1", "elem2"}}},
+			},
+			out: []*types.DatabaseResourceMatcher{
+				{Labels: &types.Labels{"elem2": []string{"elem1", "elem2"}}},
+			},
+		},
+		{
+			name: "multiple elements",
+			in: []ResourceMatcher{
+				{Labels: types.Labels{"elem1": []string{"elem1"}}},
+				{Labels: types.Labels{"elem2": []string{"elem1", "elem2"}}},
+				{Labels: types.Labels{"elem3": []string{"elem1", "elem2", "elem3"}}},
+			},
+			out: []*types.DatabaseResourceMatcher{
+				{Labels: &types.Labels{"elem1": []string{"elem1"}}},
+				{Labels: &types.Labels{"elem2": []string{"elem1", "elem2"}}},
+				{Labels: &types.Labels{"elem3": []string{"elem1", "elem2", "elem3"}}},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.out, ResourceMatchersToTypes(tt.in))
 		})
 	}
 }

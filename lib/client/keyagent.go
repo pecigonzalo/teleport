@@ -1,57 +1,61 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
+	"runtime"
+	"slices"
 	"strings"
 
+	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
-	"github.com/gravitational/trace"
-
 	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/utils/prompt"
 	"github.com/gravitational/teleport/api/utils/sshutils"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/utils/prompt"
-
-	"github.com/sirupsen/logrus"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/tlsca"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // LocalKeyAgent holds Teleport certificates for a user connected to a cluster.
 type LocalKeyAgent struct {
 	// log holds the structured logger.
-	log *logrus.Entry
+	log *slog.Logger
 
-	// Agent is the teleport agent
-	agent.Agent
+	// ExtendedAgent is the teleport agent
+	agent.ExtendedAgent
 
-	// keyStore is the storage backend for certificates and keys
-	keyStore LocalKeyStore
+	// clientStore is the local storage backend for the client.
+	clientStore *Store
 
-	// sshAgent is the system ssh agent
-	sshAgent agent.Agent
+	// systemAgent is the system ssh agent
+	systemAgent agent.ExtendedAgent
 
 	// noHosts is a in-memory map used in tests to track which hosts a user has
 	// manually (via keyboard input) refused connecting to.
@@ -70,48 +74,12 @@ type LocalKeyAgent struct {
 	// insecure allows to accept public host keys.
 	insecure bool
 
-	// siteName specifies site to execute operation.
+	// siteName specifies the site to execute operation.
 	siteName string
-}
 
-// sshKnowHostGetter allows to fetch key for particular host - trusted cluster.
-type sshKnowHostGetter interface {
-	// GetKnownHostKeys returns all public keys for a hostname.
-	GetKnownHostKeys(hostname string) ([]ssh.PublicKey, error)
-}
-
-// NewKeyStoreCertChecker returns a new certificate checker
-// using trusted certs from key store
-func NewKeyStoreCertChecker(keyStore sshKnowHostGetter, host string) ssh.HostKeyCallback {
-	// CheckHostSignature checks if the given host key was signed by a Teleport
-	// certificate authority (CA) or a host certificate the user has seen before.
-	return func(addr string, remote net.Addr, key ssh.PublicKey) error {
-		certChecker := sshutils.CertChecker{
-			CertChecker: ssh.CertChecker{
-				IsHostAuthority: func(key ssh.PublicKey, addr string) bool {
-					keys, err := keyStore.GetKnownHostKeys(host)
-					if err != nil {
-						log.Errorf("Unable to fetch certificate authorities: %v.", err)
-						return false
-					}
-					for i := range keys {
-						if sshutils.KeysEqual(key, keys[i]) {
-							return true
-						}
-					}
-					return false
-				},
-			},
-			FIPS: isFIPS(),
-		}
-		err := certChecker.CheckHostKey(addr, remote, key)
-		if err != nil {
-			log.Debugf("Host validation failed: %v.", err)
-			return trace.Wrap(err)
-		}
-		log.Debugf("Validated host %v.", addr)
-		return nil
-	}
+	// loadAllCAs allows the agent to load all host CAs when checking a host
+	// signature.
+	loadAllCAs bool
 }
 
 func agentIsPresent() bool {
@@ -132,37 +100,45 @@ func shouldAddKeysToAgent(addKeysToAgent string) bool {
 
 // LocalAgentConfig contains parameters for creating the local keys agent.
 type LocalAgentConfig struct {
-	Keystore   LocalKeyStore
-	ProxyHost  string
-	Username   string
-	KeysOption string
-	Insecure   bool
-	SiteName   string
+	ClientStore *Store
+	Agent       agent.ExtendedAgent
+	ProxyHost   string
+	Username    string
+	KeysOption  string
+	Insecure    bool
+	Site        string
+	LoadAllCAs  bool
 }
 
 // NewLocalAgent reads all available credentials from the provided LocalKeyStore
 // and loads them into the local and system agent
 func NewLocalAgent(conf LocalAgentConfig) (a *LocalKeyAgent, err error) {
+	if conf.Agent == nil {
+		keyring, ok := agent.NewKeyring().(agent.ExtendedAgent)
+		if !ok {
+			return nil, trace.Errorf("unexpected keyring type: %T, expected agent.ExtendedKeyring", keyring)
+		}
+		conf.Agent = keyring
+	}
 	a = &LocalKeyAgent{
-		log: logrus.WithFields(logrus.Fields{
-			trace.Component: teleport.ComponentKeyAgent,
-		}),
-		Agent:     agent.NewKeyring(),
-		keyStore:  conf.Keystore,
-		noHosts:   make(map[string]bool),
-		username:  conf.Username,
-		proxyHost: conf.ProxyHost,
-		insecure:  conf.Insecure,
-		siteName:  conf.SiteName,
+		log:           slog.With(teleport.ComponentKey, teleport.ComponentKeyAgent),
+		ExtendedAgent: conf.Agent,
+		clientStore:   conf.ClientStore,
+		noHosts:       make(map[string]bool),
+		username:      conf.Username,
+		proxyHost:     conf.ProxyHost,
+		insecure:      conf.Insecure,
+		siteName:      conf.Site,
+		loadAllCAs:    conf.LoadAllCAs,
 	}
 
 	if shouldAddKeysToAgent(conf.KeysOption) {
-		a.sshAgent = connectToSSHAgent()
+		a.systemAgent = connectToSSHAgent()
 	} else {
-		log.Debug("Skipping connection to the local ssh-agent.")
+		log.DebugContext(context.Background(), "Skipping connection to the local ssh-agent.")
 
 		if !agentSupportsSSHCertificates() && agentIsPresent() {
-			log.Warn(`Certificate was not loaded into agent because the agent at SSH_AUTH_SOCK does not appear
+			log.WarnContext(context.Background(), `Certificate was not loaded into agent because the agent at SSH_AUTH_SOCK does not appear
 to support SSH certificates. To force load the certificate into the running agent, use
 the --add-keys-to-agent=yes flag.`)
 		}
@@ -175,75 +151,113 @@ func (a *LocalKeyAgent) UpdateProxyHost(proxyHost string) {
 	a.proxyHost = proxyHost
 }
 
-// LoadKeyForCluster fetches a cluster-specific SSH key and loads it into the
-// SSH agent.
-func (a *LocalKeyAgent) LoadKeyForCluster(clusterName string) (*agent.AddedKey, error) {
-	key, err := a.GetKey(clusterName, WithSSHCerts{})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return a.LoadKey(*key)
+// UpdateUsername changes username that the local agent operates on.
+func (a *LocalKeyAgent) UpdateUsername(username string) {
+	a.username = username
 }
 
-// LoadKey adds a key into the Teleport ssh agent as well as the system ssh
-// agent.
-func (a *LocalKeyAgent) LoadKey(key Key) (*agent.AddedKey, error) {
-	a.log.Infof("Loading SSH key for user %q and cluster %q.", a.username, key.ClusterName)
+// UpdateCluster changes the cluster that the local agent operates on.
+func (a *LocalKeyAgent) UpdateCluster(cluster string) {
+	a.siteName = cluster
+}
 
-	agents := []agent.Agent{a.Agent}
-	if a.sshAgent != nil {
-		agents = append(agents, a.sshAgent)
+// UpdateLoadAllCAs changes whether or not the local agent should load all
+// host CAs.
+func (a *LocalKeyAgent) UpdateLoadAllCAs(loadAllCAs bool) {
+	a.loadAllCAs = loadAllCAs
+}
+
+// LoadKeyRingForCluster fetches a cluster-specific SSH key and loads it into the
+// SSH agent.
+func (a *LocalKeyAgent) LoadKeyRingForCluster(clusterName string) error {
+	keyRing, err := a.GetKeyRing(clusterName, WithSSHCerts{})
+	if err != nil {
+		return trace.Wrap(err)
 	}
 
-	// convert keys into a format understood by the ssh agent
-	agentKeys, err := key.AsAgentKeys()
+	return a.LoadKeyRing(*keyRing)
+}
+
+// LoadKeyRing adds a key ring into the local agent as well as the system agent.
+// Some agent keys are only supported by the local agent, such as those
+// for a YubiKeyPrivateKey. Any failures to add the key will be aggregated
+// into the returned error to be handled by the caller if necessary.
+func (a *LocalKeyAgent) LoadKeyRing(keyRing KeyRing) error {
+	// convert key into a format understood by x/crypto/ssh/agent
+	agentKey, err := keyRing.AsAgentKey()
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return trace.Wrap(err)
 	}
 
 	// remove any keys that the user may already have loaded
-	err = a.UnloadKey()
-	if err != nil {
-		return nil, trace.Wrap(err)
+	if err = a.UnloadKeyRing(keyRing.KeyRingIndex); err != nil {
+		return trace.Wrap(err)
+	}
+
+	a.log.InfoContext(context.Background(), "Loading SSH key", "user", a.username, "cluster", keyRing.ClusterName)
+	agents := []agent.ExtendedAgent{a.ExtendedAgent}
+	if a.systemAgent != nil {
+		if canAddToSystemAgent(agentKey) {
+			agents = append(agents, a.systemAgent)
+		} else {
+			a.log.InfoContext(context.Background(), "Skipping adding key to SSH system agent for non-standard key type",
+				"key_type", logutils.TypeAttr(agentKey.PrivateKey),
+			)
+		}
+	}
+
+	// On all OS'es, load the certificate with the private key embedded.
+	agentKeys := []agent.AddedKey{agentKey}
+	if runtime.GOOS != constants.WindowsOS {
+		// On Unix, also load a lone private key.
+		//
+		// (2016-08-01) have a bug in how they use certificates that have been lo
+		// This is done because OpenSSH clients older than OpenSSH 7.3/7.3p1aded
+		// in an agent. Specifically when you add a certificate to an agent, you can't
+		// just embed the private key within the certificate, you have to add the
+		// certificate and private key to the agent separately. Teleport works around
+		// this behavior to ensure OpenSSH interoperability.
+		//
+		// For more details see the following: https://bugzilla.mindrot.org/show_bug.cgi?id=2550
+		// WARNING: callers expect the returned slice to be __exactly as it is__
+		agentKey.Certificate = nil
+		agentKeys = append(agentKeys, agentKey)
 	}
 
 	// iterate over all teleport and system agent and load key
+	var errs []error
 	for _, agent := range agents {
 		for _, agentKey := range agentKeys {
-			err = agent.Add(agentKey)
-			if err != nil {
-				a.log.Warnf("Unable to communicate with agent and add key: %v", err)
+			if err = agent.Add(agentKey); err != nil {
+				errs = append(errs, trace.Wrap(err))
 			}
 		}
 	}
 
-	// return the first key because it has the embedded private key in it.
-	// see docs for AsAgentKeys for more details.
-	return &agentKeys[0], nil
+	return trace.Wrap(trace.NewAggregate(errs...), "failed to add one or more keys to the agent.")
 }
 
-// UnloadKey will unload key for user from the teleport ssh agent as well as
-// the system agent.
-func (a *LocalKeyAgent) UnloadKey() error {
-	agents := []agent.Agent{a.Agent}
-	if a.sshAgent != nil {
-		agents = append(agents, a.sshAgent)
+// UnloadKeyRing will unload key rings matching the given KeyRingIndex from the
+// teleport ssh agent and the system agent.
+func (a *LocalKeyAgent) UnloadKeyRing(keyRing KeyRingIndex) error {
+	agents := []agent.Agent{a.ExtendedAgent}
+	if a.systemAgent != nil {
+		agents = append(agents, a.systemAgent)
 	}
 
-	// iterate over all agents we have and unload keys for this user
+	// iterate over all agents we have and unload keys matching the given key
 	for _, agent := range agents {
 		// get a list of all keys in the agent
 		keyList, err := agent.List()
 		if err != nil {
-			a.log.Warnf("Unable to communicate with agent and list keys: %v", err)
+			a.log.WarnContext(context.Background(), "Unable to communicate with agent and list keys", "error", err)
 		}
 
-		// remove any teleport keys we currently have loaded in the agent for this user
-		for _, key := range keyList {
-			if key.Comment == fmt.Sprintf("teleport:%v", a.username) {
-				err = agent.Remove(key)
-				if err != nil {
-					a.log.Warnf("Unable to communicate with agent and remove key: %v", err)
+		// remove any teleport keys we currently have loaded in the agent for this user and proxy
+		for _, agentKey := range keyList {
+			if agentKeyIdx, ok := parseTeleportAgentKeyComment(agentKey.Comment); ok && agentKeyIdx.Match(keyRing) {
+				if err = agent.Remove(agentKey); err != nil {
+					a.log.WarnContext(context.Background(), "Unable to communicate with agent and remove key", "error", err)
 				}
 			}
 		}
@@ -255,25 +269,24 @@ func (a *LocalKeyAgent) UnloadKey() error {
 // UnloadKeys will unload all Teleport keys from the teleport agent as well as
 // the system agent.
 func (a *LocalKeyAgent) UnloadKeys() error {
-	agents := []agent.Agent{a.Agent}
-	if a.sshAgent != nil {
-		agents = append(agents, a.sshAgent)
+	agents := []agent.ExtendedAgent{a.ExtendedAgent}
+	if a.systemAgent != nil {
+		agents = append(agents, a.systemAgent)
 	}
 
-	// iterate over all agents we have
+	// iterate over all agents we have and unload keys
 	for _, agent := range agents {
 		// get a list of all keys in the agent
 		keyList, err := agent.List()
 		if err != nil {
-			a.log.Warnf("Unable to communicate with agent and list keys: %v", err)
+			a.log.WarnContext(context.Background(), "Unable to communicate with agent and list keys", "error", err)
 		}
 
 		// remove any teleport keys we currently have loaded in the agent
 		for _, key := range keyList {
-			if strings.HasPrefix(key.Comment, "teleport:") {
-				err = agent.Remove(key)
-				if err != nil {
-					a.log.Warnf("Unable to communicate with agent and remove key: %v", err)
+			if isTeleportAgentKey(key) {
+				if err = agent.Remove(key); err != nil {
+					a.log.WarnContext(context.Background(), "Unable to communicate with agent and remove key", "error", err)
 				}
 			}
 		}
@@ -282,52 +295,35 @@ func (a *LocalKeyAgent) UnloadKeys() error {
 	return nil
 }
 
-// GetKey returns the key for the given cluster of the proxy from
-// the backing keystore.
-func (a *LocalKeyAgent) GetKey(clusterName string, opts ...CertOption) (*Key, error) {
-	idx := KeyIndex{a.proxyHost, a.username, clusterName}
-	return a.keyStore.GetKey(idx, opts...)
-}
-
-// GetCoreKey returns the key without any cluster-dependent certificates,
-// i.e. including only the RSA keypair and the Teleport TLS certificate.
-func (a *LocalKeyAgent) GetCoreKey() (*Key, error) {
-	return a.GetKey("")
-}
-
-// AddHostSignersToCache takes a list of CAs whom we trust. This list is added to a database
-// of "seen" CAs.
-//
-// Every time we connect to a new host, we'll request its certificate to be signed by one
-// of these trusted CAs.
-//
-// Why do we trust these CAs? Because we received them from a trusted Teleport Proxy.
-// Why do we trust the proxy? Because we've connected to it via HTTPS + username + Password + HOTP.
-func (a *LocalKeyAgent) AddHostSignersToCache(certAuthorities []auth.TrustedCerts) error {
-	for _, ca := range certAuthorities {
-		publicKeys, err := ca.SSHCertPublicKeys()
-		if err != nil {
-			a.log.Error(err)
-			return trace.Wrap(err)
-		}
-		a.log.Debugf("Adding CA key for %s", ca.ClusterName)
-		err = a.keyStore.AddKnownHostKeys(ca.ClusterName, a.proxyHost, publicKeys)
-		if err != nil {
-			return trace.Wrap(err)
-		}
+// GetKeyRing returns the key ring for the given cluster of the proxy from the
+// backing keystore.
+func (a *LocalKeyAgent) GetKeyRing(clusterName string, opts ...CertOption) (*KeyRing, error) {
+	idx := KeyRingIndex{a.proxyHost, a.username, clusterName}
+	keyRing, err := a.clientStore.GetKeyRing(idx, opts...)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return nil
+	return keyRing, nil
 }
 
-// SaveTrustedCerts saves trusted TLS certificates of certificate authorities.
-func (a *LocalKeyAgent) SaveTrustedCerts(certAuthorities []auth.TrustedCerts) error {
-	return a.keyStore.SaveTrustedCerts(a.proxyHost, certAuthorities)
+// GetCoreKeyRing returns the key ring without any cluster-dependent certificates,
+// i.e. including only the private key and the Teleport TLS certificate.
+func (a *LocalKeyAgent) GetCoreKeyRing() (*KeyRing, error) {
+	return a.GetKeyRing("")
+}
+
+// SaveTrustedCerts saves trusted TLS certificates and host keys of certificate authorities.
+// SaveTrustedCerts adds the given trusted CA TLS certificates and SSH host keys to the store.
+// Existing TLS certificates for the given trusted certs will be overwritten, while host keys
+// will be appended to existing entries.
+func (a *LocalKeyAgent) SaveTrustedCerts(certAuthorities []authclient.TrustedCerts) error {
+	return a.clientStore.SaveTrustedCerts(a.proxyHost, certAuthorities)
 }
 
 // GetTrustedCertsPEM returns trusted TLS certificates of certificate authorities PEM
 // blocks.
 func (a *LocalKeyAgent) GetTrustedCertsPEM() ([][]byte, error) {
-	return a.keyStore.GetTrustedCertsPEM(a.proxyHost)
+	return a.clientStore.GetTrustedCertsPEM(a.proxyHost)
 }
 
 // UserRefusedHosts returns 'true' if a user refuses connecting to remote hosts
@@ -336,20 +332,25 @@ func (a *LocalKeyAgent) UserRefusedHosts() bool {
 	return len(a.noHosts) > 0
 }
 
-// CheckHostSignature checks if the given host key was signed by a Teleport
+// HostKeyCallback checks if the given host key was signed by a Teleport
 // certificate authority (CA) or a host certificate the user has seen before.
-func (a *LocalKeyAgent) CheckHostSignature(addr string, remote net.Addr, hostKey ssh.PublicKey) error {
-	key, err := a.GetCoreKey()
+func (a *LocalKeyAgent) HostKeyCallback(addr string, remote net.Addr, hostKey ssh.PublicKey) error {
+	keyRing, err := a.GetCoreKeyRing()
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	rootCluster, err := key.RootClusterName()
+	rootCluster, err := keyRing.RootClusterName()
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	clusters := []string{rootCluster}
-	if rootCluster != a.siteName {
+	if a.loadAllCAs {
+		clusters, err = a.GetClusterNames()
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	} else if rootCluster != a.siteName {
 		// In case of establishing connection to leaf cluster the client validate ssh cert against root
 		// cluster proxy cert and leaf cluster cert.
 		clusters = append(clusters, a.siteName)
@@ -362,13 +363,15 @@ func (a *LocalKeyAgent) CheckHostSignature(addr string, remote net.Addr, hostKey
 		},
 		FIPS: isFIPS(),
 	}
-	a.log.Debugf("Checking key: %s.", ssh.MarshalAuthorizedKey(hostKey))
+
+	ctx := context.Background()
+	a.log.DebugContext(ctx, "Checking key", "host_key", string(ssh.MarshalAuthorizedKey(hostKey)))
 	err = certChecker.CheckHostKey(addr, remote, hostKey)
 	if err != nil {
-		a.log.Debugf("Host validation failed: %v.", err)
+		a.log.DebugContext(ctx, "Host validation failed", "error", err)
 		return trace.Wrap(err)
 	}
-	a.log.Debugf("Validated host %v.", addr)
+	a.log.DebugContext(ctx, "Validated host", "host_addr", addr)
 	return nil
 }
 
@@ -377,19 +380,32 @@ func (a *LocalKeyAgent) CheckHostSignature(addr string, remote net.Addr, hostKey
 // reject the server key.
 func (a *LocalKeyAgent) checkHostCertificateForClusters(clusters ...string) func(key ssh.PublicKey, addr string) bool {
 	return func(key ssh.PublicKey, addr string) bool {
+		ctx := context.Background()
+
 		// Check the local cache (where all Teleport CAs are placed upon login) to
 		// see if any of them match.
-
 		var keys []ssh.PublicKey
-		for _, cluster := range clusters {
-			key, err := a.keyStore.GetKnownHostKeys(cluster)
+		trustedCerts, err := a.clientStore.GetTrustedCerts(a.proxyHost)
+		if err != nil {
+			a.log.ErrorContext(ctx, "Failed to get trusted certs", "error", err)
+			return false
+		}
+
+		// In case of a know host entry added by insecure flow (checkHostKey function)
+		// the parsed know_hosts entry (trustedCerts.ClusterName) contains node address.
+		clusters = append(clusters, addr)
+		for _, cert := range trustedCerts {
+			if !a.loadAllCAs && !slices.Contains(clusters, cert.ClusterName) {
+				continue
+			}
+			key, err := sshutils.ParseAuthorizedKeys(cert.AuthorizedKeys)
 			if err != nil {
-				a.log.Errorf("Unable to fetch certificate authorities: %v.", err)
+				a.log.ErrorContext(ctx, "Failed to parse authorized keys", "error", err)
 				return false
 			}
 			keys = append(keys, key...)
-
 		}
+
 		for i := range keys {
 			if sshutils.KeysEqual(key, keys[i]) {
 				return true
@@ -398,7 +414,7 @@ func (a *LocalKeyAgent) checkHostCertificateForClusters(clusters ...string) func
 
 		// If this certificate was not seen before, prompt the user essentially
 		// treating it like a key.
-		err := a.checkHostKey(addr, nil, key)
+		err = a.checkHostKey(addr, nil, key)
 		return err == nil
 	}
 }
@@ -407,22 +423,29 @@ func (a *LocalKeyAgent) checkHostCertificateForClusters(clusters ...string) func
 // ~/.tsh/known_hosts cache and if not found, prompts the user to accept
 // or reject.
 func (a *LocalKeyAgent) checkHostKey(addr string, remote net.Addr, key ssh.PublicKey) error {
-	var err error
+	ctx := context.Background()
+	logger := a.log.With("host_addr", addr)
 
 	// Unless --insecure flag was given, prohibit public keys or host certs
 	// not signed by Teleport.
 	if !a.insecure {
-		a.log.Debugf("Host %s presented a public key not signed by Teleport. Rejecting due to insecure mode being OFF.", addr)
+		logger.DebugContext(ctx, "Host presented a public key not signed by Teleport - Rejecting due to insecure mode being OFF")
 		return trace.BadParameter("host %s presented a public key not signed by Teleport", addr)
 	}
 
-	a.log.Warnf("Host %s presented a public key not signed by Teleport. Proceeding due to insecure mode being ON.", addr)
+	logger.WarnContext(ctx, "Host presented a public key not signed by Teleport - Proceeding due to insecure mode being ON")
 
 	// Check if this exact host is in the local cache.
-	keys, _ := a.keyStore.GetKnownHostKeys(addr)
-	if len(keys) > 0 && sshutils.KeysEqual(key, keys[0]) {
-		a.log.Debugf("Verified host %s.", addr)
-		return nil
+	keys, err := a.clientStore.GetTrustedHostKeys(addr)
+	if err != nil {
+		logger.DebugContext(ctx, "Failed to retrieve client's trusted host keys", "error", err)
+	} else {
+		for _, trustedHostKey := range keys {
+			if sshutils.KeysEqual(key, trustedHostKey) {
+				logger.DebugContext(ctx, "Verified host")
+				return nil
+			}
+		}
 	}
 
 	// If this key was not seen before, prompt the user with a fingerprint.
@@ -436,11 +459,10 @@ func (a *LocalKeyAgent) checkHostKey(addr string, remote net.Addr, key ssh.Publi
 		return trace.Wrap(err)
 	}
 
-	// If the user trusts the key, store the key in the local known hosts
-	// cache ~/.tsh/known_hosts.
-	err = a.keyStore.AddKnownHostKeys(addr, a.proxyHost, []ssh.PublicKey{key})
+	// If the user trusts the key, store the key in the client trusted certs store.
+	err = a.clientStore.AddTrustedHostKeys(a.proxyHost, addr, key)
 	if err != nil {
-		a.log.Warnf("Failed to save the host key: %v.", err)
+		logger.WarnContext(ctx, "Failed to save the host key", "error", err)
 		return trace.Wrap(err)
 	}
 	return nil
@@ -469,59 +491,80 @@ func (a *LocalKeyAgent) defaultHostPromptFunc(host string, key ssh.PublicKey, wr
 	return nil
 }
 
-// AddKey activates a new signed session key by adding it into the keystore and also
+// AddKeyRing activates a new signed session key by adding it into the keystore and also
 // by loading it into the SSH agent.
-func (a *LocalKeyAgent) AddKey(key *Key) (*agent.AddedKey, error) {
-	if err := a.addKey(key); err != nil {
-		return nil, trace.Wrap(err)
+func (a *LocalKeyAgent) AddKeyRing(keyRing *KeyRing) error {
+	if err := a.addKeyRing(keyRing); err != nil {
+		return trace.Wrap(err)
 	}
-
 	// Load key into the teleport agent and system agent.
-	return a.LoadKey(*key)
+	if err := a.LoadKeyRing(*keyRing); err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
 }
 
-// AddDatabaseKey activates a new signed database key by adding it into the keystore.
+// AddDatabaseKeyRing activates a new signed database key by adding it into the keystore.
 // key must contain at least one db cert. ssh cert is not required.
-func (a *LocalKeyAgent) AddDatabaseKey(key *Key) error {
-	if len(key.DBTLSCerts) == 0 {
-		return trace.BadParameter("key must contains at least one database access certificate")
+func (a *LocalKeyAgent) AddDatabaseKeyRing(keyRing *KeyRing) error {
+	if len(keyRing.DBTLSCredentials) == 0 {
+		return trace.BadParameter("key ring must contain at least one Database access certificate")
 	}
-	return a.addKey(key)
+	return a.addKeyRing(keyRing)
 }
 
-// addKey activates a new signed session key by adding it into the keystore.
-func (a *LocalKeyAgent) addKey(key *Key) error {
-	if key == nil {
-		return trace.BadParameter("key is nil")
+// AddKubeKeyRing activates a new signed Kubernetes key by adding it into the keystore.
+// key must contain at least one Kubernetes cert. ssh cert is not required.
+func (a *LocalKeyAgent) AddKubeKeyRing(keyRing *KeyRing) error {
+	if len(keyRing.KubeTLSCredentials) == 0 {
+		return trace.BadParameter("key ring must contain at least one Kubernetes access certificate")
 	}
-	if key.ProxyHost == "" {
-		key.ProxyHost = a.proxyHost
+	return a.addKeyRing(keyRing)
+}
+
+// AddAppKeyRing activates a new signed app key by adding it into the keystore.
+// key must contain at least one app credential. ssh cert is not required.
+func (a *LocalKeyAgent) AddAppKeyRing(keyRing *KeyRing) error {
+	if len(keyRing.AppTLSCredentials) == 0 {
+		return trace.BadParameter("key ring must contain at least one App access certificate")
 	}
-	if key.Username == "" {
-		key.Username = a.username
+	return a.addKeyRing(keyRing)
+}
+
+// addKeyRing activates a new signed session key ring by adding it into the keystore.
+func (a *LocalKeyAgent) addKeyRing(keyRing *KeyRing) error {
+	if keyRing == nil {
+		return trace.BadParameter("key ring is nil")
+	}
+	if keyRing.ProxyHost == "" {
+		keyRing.ProxyHost = a.proxyHost
+	}
+	if keyRing.Username == "" {
+		keyRing.Username = a.username
 	}
 
 	// In order to prevent unrelated key data to be left over after the new
 	// key is added, delete any already stored key with the same index if their
 	// RSA private keys do not match.
-	storedKey, err := a.keyStore.GetKey(key.KeyIndex)
+	storedKeyRing, err := a.clientStore.GetKeyRing(keyRing.KeyRingIndex)
 	if err != nil {
 		if !trace.IsNotFound(err) {
 			return trace.Wrap(err)
 		}
 	} else {
-		if subtle.ConstantTimeCompare(storedKey.Priv, key.Priv) == 0 {
-			a.log.Debugf("Deleting obsolete stored key with index %+v.", storedKey.KeyIndex)
-			if err := a.keyStore.DeleteKey(storedKey.KeyIndex); err != nil {
+		if !keyRing.EqualPrivateKey(storedKeyRing) {
+			a.log.DebugContext(context.Background(), "Deleting obsolete stored keyring", "keyring_index", storedKeyRing.KeyRingIndex)
+			if err := a.clientStore.DeleteKeyRing(storedKeyRing.KeyRingIndex); err != nil {
 				return trace.Wrap(err)
 			}
 		}
 	}
 
 	// Save the new key to the keystore (usually into ~/.tsh).
-	if err := a.keyStore.AddKey(key); err != nil {
+	if err := a.clientStore.AddKeyRing(keyRing); err != nil {
 		return trace.Wrap(err)
 	}
+
 	return nil
 }
 
@@ -529,14 +572,14 @@ func (a *LocalKeyAgent) addKey(key *Key) error {
 // and unloads the key from the agent.
 func (a *LocalKeyAgent) DeleteKey() error {
 	// remove key from key store
-	err := a.keyStore.DeleteKey(KeyIndex{ProxyHost: a.proxyHost, Username: a.username})
+	err := a.clientStore.DeleteKeyRing(KeyRingIndex{ProxyHost: a.proxyHost, Username: a.username})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	// remove any keys that are loaded for this user from the teleport and
 	// system agents
-	err = a.UnloadKey()
+	err = a.UnloadKeyRing(KeyRingIndex{ProxyHost: a.proxyHost, Username: a.username})
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -547,7 +590,7 @@ func (a *LocalKeyAgent) DeleteKey() error {
 // DeleteUserCerts deletes only the specified certs of the user's key,
 // keeping the private key intact.
 func (a *LocalKeyAgent) DeleteUserCerts(clusterName string, opts ...CertOption) error {
-	err := a.keyStore.DeleteUserCerts(KeyIndex{a.proxyHost, a.username, clusterName}, opts...)
+	err := a.clientStore.DeleteUserCerts(KeyRingIndex{a.proxyHost, a.username, clusterName}, opts...)
 	return trace.Wrap(err)
 }
 
@@ -555,7 +598,7 @@ func (a *LocalKeyAgent) DeleteUserCerts(clusterName string, opts ...CertOption) 
 // from the agent.
 func (a *LocalKeyAgent) DeleteKeys() error {
 	// Remove keys from the filesystem.
-	err := a.keyStore.DeleteKeys()
+	err := a.clientStore.DeleteKeys()
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -569,57 +612,98 @@ func (a *LocalKeyAgent) DeleteKeys() error {
 	return nil
 }
 
-// certsForCluster returns a set of ssh.Signers using certificates for a
-// specific cluster. If clusterName is empty, certsForCluster returns
-// ssh.Signers for all known clusters.
-func (a *LocalKeyAgent) certsForCluster(clusterName string) ([]ssh.Signer, error) {
-	if clusterName != "" {
-		k, err := a.GetKey(clusterName, WithSSHCerts{})
+// Signers returns a set of ssh.Signers using all certificates
+// for the current proxy and user.
+func (a *LocalKeyAgent) Signers() ([]ssh.Signer, error) {
+	var signers []ssh.Signer
+
+	// If we find a valid key ring, load all valid ssh certificates as signers.
+	if k, err := a.GetCoreKeyRing(); err == nil {
+		certs, err := a.clientStore.GetSSHCertificates(a.proxyHost, a.username)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		signer, err := k.AsSigner()
-		if err != nil {
-			return nil, trace.Wrap(err)
+
+		for _, cert := range certs {
+			if err := k.checkCert(cert); err != nil {
+				return nil, trace.Wrap(err)
+			}
+			signer, err := sshutils.SSHSigner(cert, k.SSHPrivateKey.Signer)
+			if err != nil {
+				return nil, trace.Wrap(err)
+			}
+			signers = append(signers, signer)
 		}
-		return []ssh.Signer{signer}, nil
 	}
 
-	// Load all certs, including the ones from a local SSH agent.
-	var signers []ssh.Signer
-	if a.sshAgent != nil {
-		if sshAgentCerts, _ := a.sshAgent.Signers(); sshAgentCerts != nil {
-			signers = append(signers, sshAgentCerts...)
+	// Load all agent certs, including the ones from a local SSH agent.
+	agentSigners, err := a.ExtendedAgent.Signers()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if a.systemAgent != nil {
+		sshAgentSigners, err := a.systemAgent.Signers()
+		if err != nil {
+			return nil, trace.Wrap(err)
 		}
+		agentSigners = append(signers, sshAgentSigners...)
 	}
-	if ourCerts, _ := a.Signers(); ourCerts != nil {
-		signers = append(signers, ourCerts...)
-	}
+
 	// Filter out non-certificates (like regular public SSH keys stored in the SSH agent).
-	certs := make([]ssh.Signer, 0, len(signers))
-	for _, s := range signers {
-		if _, ok := s.PublicKey().(*ssh.Certificate); !ok {
-			continue
+	for _, s := range agentSigners {
+		if _, ok := s.PublicKey().(*ssh.Certificate); ok {
+			signers = append(signers, s)
+		} else if k, ok := s.PublicKey().(*agent.Key); ok && sshutils.IsSSHCertType(k.Type()) {
+			signers = append(signers, s)
 		}
-		certs = append(certs, s)
 	}
-	if len(certs) == 0 {
-		return nil, trace.NotFound("no auth method available")
+
+	return signers, nil
+}
+
+// signersForCluster returns a set of ssh.Signers using certificates for a specific cluster.
+func (a *LocalKeyAgent) signersForCluster(clusterName string) ([]ssh.Signer, error) {
+	k, err := a.GetKeyRing(clusterName, WithSSHCerts{})
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return certs, nil
+	signer, err := k.SSHSigner()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return []ssh.Signer{signer}, nil
 }
 
 // ClientCertPool returns x509.CertPool containing trusted CA.
 func (a *LocalKeyAgent) ClientCertPool(cluster string) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
-	key, err := a.GetKey(cluster)
+	keyRing, err := a.GetKeyRing(cluster)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	for _, caPEM := range key.TLSCAs() {
+	for _, caPEM := range keyRing.TLSCAs() {
 		if !pool.AppendCertsFromPEM(caPEM) {
 			return nil, trace.BadParameter("failed to parse TLS CA certificate")
 		}
 	}
 	return pool, nil
+}
+
+// GetClusterNames gets the names of the Teleport clusters this
+// key agent knows about.
+func (a *LocalKeyAgent) GetClusterNames() ([]string, error) {
+	certs, err := a.GetTrustedCertsPEM()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	var clusters []string
+	for _, cert := range certs {
+		cert, err := tlsca.ParseCertificatePEM(cert)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		clusters = append(clusters, cert.Subject.CommonName)
+	}
+	return clusters, nil
 }

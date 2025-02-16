@@ -1,103 +1,75 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
-	"context"
-	"fmt"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
+	"testing"
 	"time"
 
-	"gopkg.in/check.v1"
+	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/require"
 )
 
-// TimeoutSuite helps us to test ObeyTimeout mechanism. We use HTTP server/client
-// machinery to test timeouts
-type TimeoutSuite struct {
-	server *httptest.Server
-}
+func TestObeyIdleTimeout(t *testing.T) {
+	clock := clockwork.NewFakeClock()
+	t.Cleanup(func() { clock.Advance(time.Hour) })
 
-var _ = check.Suite(&TimeoutSuite{})
+	c1, c2 := net.Pipe()
+	c1 = obeyIdleTimeoutClock(c1, time.Minute, clock)
+	t.Cleanup(func() { c1.Close() })
+	t.Cleanup(func() { c2.Close() })
 
-func (s *TimeoutSuite) SetUpSuite(c *check.C) {
-	//
-	// set up an HTTP server which listens and responds to queries
-	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		// GET /slow?delay=10ms sleeps for a given delay, then returns word "slow"
-		case "/slow":
-			delay, err := time.ParseDuration(r.URL.Query().Get("delay"))
-			c.Assert(err, check.IsNil)
-			time.Sleep(delay)
-			fmt.Fprintf(w, "slow")
+	go func() {
+		c2.Write([]byte{0})
+		clock.Sleep(30 * time.Second)
+		c2.Write([]byte{0})
+	}()
 
-		// GET /ping returns "pong"
-		case "/ping":
-			fmt.Fprintf(w, "pong")
+	errC := make(chan error, 3)
+	go func() {
+		var b [1]byte
+		for i := 0; i < 3; i++ {
+			_, err := io.ReadFull(c1, b[:])
+			errC <- err
 		}
-	}))
-}
+	}()
 
-func (s *TimeoutSuite) TearDownSuite(c *check.C) {
-	s.server.Close()
-}
-
-func (s *TimeoutSuite) TestSlowOperation(c *check.C) {
-	client := newClient(time.Millisecond * 5)
-	resp, err := client.Get(s.server.URL + "/slow?delay=20ms")
-	if err == nil {
-		resp.Body.Close()
+	err1 := <-errC
+	// wait for the writing goroutine to be waiting as well (the watchdog counts
+	// as a waiter)
+	clock.BlockUntil(2)
+	clock.Advance(30 * time.Second)
+	err2 := <-errC
+	clock.Advance(30 * time.Second)
+	select {
+	case err := <-errC:
+		require.FailNow(t, "expected Read to block", "got err %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
-	// must fail with I/O timeout
-	c.Assert(err, check.NotNil)
-	c.Assert(err.Error(), check.Matches, "^.*i/o timeout$")
-}
+	clock.Advance(30 * time.Second)
+	err3 := <-errC
 
-func (s *TimeoutSuite) TestNormalOperation(c *check.C) {
-	client := newClient(time.Millisecond * 100)
-	resp, err := client.Get(s.server.URL + "/ping")
-	c.Assert(err, check.IsNil)
-	c.Assert(bodyText(resp), check.Equals, "pong")
-}
-
-// newClient helper returns HTTP client configured to use a connection
-// which drops itself after N idle time
-func newClient(timeout time.Duration) *http.Client {
-	var t http.Transport
-	t.DialContext = func(ctx context.Context, network string, addr string) (net.Conn, error) {
-		var d net.Dialer
-		conn, err := d.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		return ObeyIdleTimeout(conn, timeout, "test"), nil
-	}
-	return &http.Client{Transport: &t}
-}
-
-// bodyText helper returns a body string from an http response
-func bodyText(resp *http.Response) string {
-	bytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	return string(bytes)
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+	// this should be net.ErrClosed, but net.Pipe uses io.ErrClosedPipe and it
+	// can't be changed
+	require.ErrorIs(t, err3, io.ErrClosedPipe)
 }

@@ -1,34 +1,36 @@
 /*
-Copyright 2018-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
 import (
 	"context"
-	"time"
-
-	"github.com/gravitational/teleport/api/types"
-	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/session"
+	"io"
 
 	"github.com/gravitational/trace"
+
+	auditlogpb "github.com/gravitational/teleport/api/gen/proto/go/teleport/auditlog/v1"
+	"github.com/gravitational/teleport/api/internalutils/stream"
+	apievents "github.com/gravitational/teleport/api/types/events"
 )
 
 // NewMultiLog returns a new instance of a multi logger
-func NewMultiLog(loggers ...IAuditLog) (*MultiLog, error) {
+func NewMultiLog(loggers ...AuditLogger) (*MultiLog, error) {
 	emitters := make([]apievents.Emitter, 0, len(loggers))
 	for _, logger := range loggers {
 		emitter, ok := logger.(apievents.Emitter)
@@ -47,14 +49,8 @@ func NewMultiLog(loggers ...IAuditLog) (*MultiLog, error) {
 // to all loggers, and performs all read and search operations
 // on the first logger that implements the operation
 type MultiLog struct {
-	loggers []IAuditLog
+	loggers []AuditLogger
 	*MultiEmitter
-}
-
-// WaitForDelivery waits for resources to be released and outstanding requests to
-// complete after calling Close method
-func (m *MultiLog) WaitForDelivery(ctx context.Context) error {
-	return nil
 }
 
 // Close releases connections and resources associated with logs if any
@@ -66,68 +62,6 @@ func (m *MultiLog) Close() error {
 	return trace.NewAggregate(errors...)
 }
 
-// EmitAuditEventLegacy emits audit event
-func (m *MultiLog) EmitAuditEventLegacy(event Event, fields EventFields) error {
-	var errors []error
-	for _, log := range m.loggers {
-		errors = append(errors, log.EmitAuditEventLegacy(event, fields))
-	}
-	return trace.NewAggregate(errors...)
-}
-
-// UploadSessionRecording uploads session recording to the audit server
-func (m *MultiLog) UploadSessionRecording(rec SessionRecording) error {
-	var errors []error
-	for _, log := range m.loggers {
-		errors = append(errors, log.UploadSessionRecording(rec))
-	}
-	return trace.NewAggregate(errors...)
-}
-
-// DELETE IN: 2.7.0
-// This method is no longer necessary as nodes and proxies >= 2.7.0
-// use UploadSessionRecording method.
-// PostSessionSlice sends chunks of recorded session to the event log
-func (m *MultiLog) PostSessionSlice(slice SessionSlice) error {
-	var errors []error
-	for _, log := range m.loggers {
-		errors = append(errors, log.PostSessionSlice(slice))
-	}
-	return trace.NewAggregate(errors...)
-}
-
-// GetSessionChunk returns a reader which can be used to read a byte stream
-// of a recorded session starting from 'offsetBytes' (pass 0 to start from the
-// beginning) up to maxBytes bytes.
-//
-// If maxBytes > MaxChunkBytes, it gets rounded down to MaxChunkBytes
-func (m *MultiLog) GetSessionChunk(namespace string, sid session.ID, offsetBytes, maxBytes int) (data []byte, err error) {
-	for _, log := range m.loggers {
-		data, err = log.GetSessionChunk(namespace, sid, offsetBytes, maxBytes)
-		if !trace.IsNotImplemented(err) {
-			return data, err
-		}
-	}
-	return data, err
-}
-
-// Returns all events that happen during a session sorted by time
-// (oldest first).
-//
-// after tells to use only return events after a specified cursor Id
-//
-// This function is usually used in conjunction with GetSessionReader to
-// replay recorded session streams.
-func (m *MultiLog) GetSessionEvents(namespace string, sid session.ID, after int, fetchPrintEvents bool) (events []EventFields, err error) {
-	for _, log := range m.loggers {
-		events, err = log.GetSessionEvents(namespace, sid, after, fetchPrintEvents)
-		if !trace.IsNotImplemented(err) {
-			return events, err
-		}
-	}
-	return events, err
-}
-
 // SearchEvents is a flexible way to find events.
 //
 // Event types to filter can be specified and pagination is handled by an iterator key that allows
@@ -136,14 +70,70 @@ func (m *MultiLog) GetSessionEvents(namespace string, sid session.ID, after int,
 // The only mandatory requirement is a date range (UTC).
 //
 // This function may never return more than 1 MiB of event data.
-func (m *MultiLog) SearchEvents(fromUTC, toUTC time.Time, namespace string, eventTypes []string, limit int, order types.EventOrder, startKey string) (events []apievents.AuditEvent, lastKey string, err error) {
+func (m *MultiLog) SearchEvents(ctx context.Context, req SearchEventsRequest) (events []apievents.AuditEvent, lastKey string, err error) {
 	for _, log := range m.loggers {
-		events, lastKey, err := log.SearchEvents(fromUTC, toUTC, namespace, eventTypes, limit, order, startKey)
+		events, lastKey, err := log.SearchEvents(ctx, req)
 		if !trace.IsNotImplemented(err) {
 			return events, lastKey, err
 		}
 	}
 	return events, lastKey, err
+}
+
+func (m *MultiLog) ExportUnstructuredEvents(ctx context.Context, req *auditlogpb.ExportUnstructuredEventsRequest) stream.Stream[*auditlogpb.ExportEventUnstructured] {
+	var foundImplemented bool
+	var pos int
+	// model our iteration through sub-loggers as a stream of streams that terminates after the first stream
+	// is reached that results in something other than a not implemented error, then flatten the stream of streams
+	// to produce the effect of creating a single stream of events originating solely from the first logger that
+	// implements the ExportUnstructuredEvents method.
+	return stream.Flatten(stream.Func(func() (stream.Stream[*auditlogpb.ExportEventUnstructured], error) {
+		if foundImplemented {
+			// an implementing stream has already been found and consumed.
+			return nil, io.EOF
+		}
+		if pos >= len(m.loggers) {
+			// we've reached the end of the list of loggers and none of them implement ExportUnstructuredEvents
+			return nil, trace.NotImplemented("no loggers implement ExportUnstructuredEvents")
+		}
+		log := m.loggers[pos]
+		pos++
+		return stream.MapErr(log.ExportUnstructuredEvents(ctx, req), func(err error) error {
+			if trace.IsNotImplemented(err) {
+				return nil
+			}
+			foundImplemented = true
+			return err
+		}), nil
+	}))
+}
+
+func (m *MultiLog) GetEventExportChunks(ctx context.Context, req *auditlogpb.GetEventExportChunksRequest) stream.Stream[*auditlogpb.EventExportChunk] {
+	var foundImplemented bool
+	var pos int
+	// model our iteration through sub-loggers as a stream of streams that terminates after the first stream
+	// is reached that results in something other than a not implemented error, then flatten the stream of streams
+	// to produce the effect of creating a single stream of chunks originating solely from the first logger that
+	// implements the GetEventExportChunks method.
+	return stream.Flatten(stream.Func(func() (stream.Stream[*auditlogpb.EventExportChunk], error) {
+		if foundImplemented {
+			// an implementing stream has already been found and consumed.
+			return nil, io.EOF
+		}
+		if pos >= len(m.loggers) {
+			// we've reached the end of the list of loggers and none of them implement GetEventExportChunks
+			return nil, trace.NotImplemented("no loggers implement GetEventExportChunks")
+		}
+		log := m.loggers[pos]
+		pos++
+		return stream.MapErr(log.GetEventExportChunks(ctx, req), func(err error) error {
+			if trace.IsNotImplemented(err) {
+				return nil
+			}
+			foundImplemented = true
+			return err
+		}), nil
+	}))
 }
 
 // SearchSessionEvents is a flexible way to find session events.
@@ -152,47 +142,12 @@ func (m *MultiLog) SearchEvents(fromUTC, toUTC time.Time, namespace string, even
 //
 // Event types to filter can be specified and pagination is handled by an iterator key that allows
 // a query to be resumed.
-func (m *MultiLog) SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startKey string, cond *types.WhereExpr) (events []apievents.AuditEvent, lastKey string, err error) {
+func (m *MultiLog) SearchSessionEvents(ctx context.Context, req SearchSessionEventsRequest) (events []apievents.AuditEvent, lastKey string, err error) {
 	for _, log := range m.loggers {
-		events, lastKey, err = log.SearchSessionEvents(fromUTC, toUTC, limit, order, startKey, cond)
+		events, lastKey, err = log.SearchSessionEvents(ctx, req)
 		if !trace.IsNotImplemented(err) {
 			return events, lastKey, err
 		}
 	}
 	return events, lastKey, err
-}
-
-// StreamSessionEvents streams all events from a given session recording. An error is returned on the first
-// channel if one is encountered. Otherwise the event channel is closed when the stream ends.
-// The event channel is not closed on error to prevent race conditions in downstream select statements.
-func (m *MultiLog) StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
-	c, e := make(chan apievents.AuditEvent), make(chan error, 1)
-
-	go func() {
-	loggers:
-		for _, log := range m.loggers {
-			subCh, subErrCh := log.StreamSessionEvents(ctx, sessionID, startIndex)
-
-			for {
-				select {
-				case event, more := <-subCh:
-					if !more {
-						close(c)
-						return
-					}
-
-					c <- event
-				case err := <-subErrCh:
-					if !trace.IsNotImplemented(err) {
-						e <- trace.Wrap(err)
-						return
-					}
-
-					continue loggers
-				}
-			}
-		}
-	}()
-
-	return c, e
 }

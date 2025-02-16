@@ -1,28 +1,29 @@
 /*
-Copyright 2017-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/google/uuid"
 )
 
 // NewClusterNameWithRandomID creates a ClusterName, supplying a random
@@ -48,7 +49,7 @@ func UnmarshalClusterName(bytes []byte, opts ...MarshalOption) (types.ClusterNam
 	}
 
 	if err := utils.FastUnmarshal(bytes, &clusterName); err != nil {
-		return nil, trace.BadParameter(err.Error())
+		return nil, trace.BadParameter("%s", err)
 	}
 
 	err = clusterName.CheckAndSetDefaults()
@@ -56,8 +57,8 @@ func UnmarshalClusterName(bytes []byte, opts ...MarshalOption) (types.ClusterNam
 		return nil, trace.Wrap(err)
 	}
 
-	if cfg.ID != 0 {
-		clusterName.SetResourceID(cfg.ID)
+	if cfg.Revision != "" {
+		clusterName.SetRevision(cfg.Revision)
 	}
 	if !cfg.Expires.IsZero() {
 		clusterName.SetExpiry(cfg.Expires)
@@ -68,10 +69,6 @@ func UnmarshalClusterName(bytes []byte, opts ...MarshalOption) (types.ClusterNam
 
 // MarshalClusterName marshals the ClusterName resource to JSON.
 func MarshalClusterName(clusterName types.ClusterName, opts ...MarshalOption) ([]byte, error) {
-	if err := clusterName.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -79,14 +76,11 @@ func MarshalClusterName(clusterName types.ClusterName, opts ...MarshalOption) ([
 
 	switch clusterName := clusterName.(type) {
 	case *types.ClusterNameV2:
-		if !cfg.PreserveResourceID {
-			// avoid modifying the original object
-			// to prevent unexpected data races
-			copy := *clusterName
-			copy.SetResourceID(0)
-			clusterName = &copy
+		if err := clusterName.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(clusterName)
+
+		return utils.FastMarshal(maybeResetProtoRevision(cfg.PreserveRevision, clusterName))
 	default:
 		return nil, trace.BadParameter("unrecognized cluster name version %T", clusterName)
 	}

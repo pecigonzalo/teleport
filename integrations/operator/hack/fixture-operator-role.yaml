@@ -1,0 +1,85 @@
+kind: role
+metadata:
+  name: operator
+spec:
+  allow:
+    # The operator role can see all nodes.
+    # This is required to reconcile OpenSSH and OpenSSHEICE nodes.
+    # However, it has no login set, so it cannot SSH on them
+    node_labels:
+      "*": ["*"]
+    rules:
+      - resources:
+          - role
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - user
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - auth_connector
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - login_rule
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - token
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - okta_import_rule
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - access_list
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - node
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+      - resources:
+          - trusted_cluster
+        verbs:
+          - list
+          - create
+          - read
+          - update
+          - delete
+  deny: {}
+version: v7

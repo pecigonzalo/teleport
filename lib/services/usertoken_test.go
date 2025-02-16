@@ -1,37 +1,40 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package services
 
 import (
+	"fmt"
+	"testing"
 	"time"
 
-	"gopkg.in/check.v1"
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/fixtures"
 )
 
-type UserTokenSuite struct{}
+func TestUserTokenUnmarshal(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&UserTokenSuite{})
-
-func (r *UserTokenSuite) TestUnmarshal(c *check.C) {
 	created, err := time.Parse(time.RFC3339, "2020-01-14T18:52:39.523076855Z")
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	type testCase struct {
 		description string
@@ -73,14 +76,14 @@ func (r *UserTokenSuite) TestUnmarshal(c *check.C) {
 	}
 
 	for _, tc := range testCases {
-		comment := check.Commentf("test case %q", tc.description)
+		comment := fmt.Sprintf("test case %q", tc.description)
 		out, err := UnmarshalUserToken([]byte(tc.input))
-		c.Assert(err, check.IsNil, comment)
-		fixtures.DeepCompare(c, tc.expected, out)
+		require.NoError(t, err, comment)
+		require.Empty(t, cmp.Diff(tc.expected, out))
 		data, err := MarshalUserToken(out)
-		c.Assert(err, check.IsNil, comment)
+		require.NoError(t, err, comment)
 		out2, err := UnmarshalUserToken(data)
-		c.Assert(err, check.IsNil, comment)
-		fixtures.DeepCompare(c, tc.expected, out2)
+		require.NoError(t, err, comment)
+		require.Empty(t, cmp.Diff(tc.expected, out2))
 	}
 }

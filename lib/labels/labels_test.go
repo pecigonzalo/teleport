@@ -1,33 +1,34 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package labels
 
 import (
 	"context"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/google/uuid"
-	"gopkg.in/check.v1"
 )
 
 func TestMain(m *testing.M) {
@@ -35,14 +36,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-type LabelSuite struct {
-}
-
-var _ = check.Suite(&LabelSuite{})
-
-func TestLabels(t *testing.T) { check.TestingT(t) }
-
-func (s *LabelSuite) TestSync(c *check.C) {
+func TestSync(t *testing.T) {
 	// Create dynamic labels and sync right away.
 	l, err := NewDynamic(context.Background(), &DynamicConfig{
 		Labels: map[string]types.CommandLabel{
@@ -52,14 +46,14 @@ func (s *LabelSuite) TestSync(c *check.C) {
 			},
 		},
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	l.Sync()
 
 	// Check that the result contains the output of the command.
-	c.Assert(l.Get()["foo"].GetResult(), check.Equals, "4")
+	require.Equal(t, "4", l.Get()["foo"].GetResult())
 }
 
-func (s *LabelSuite) TestStart(c *check.C) {
+func TestStart(t *testing.T) {
 	// Create dynamic labels and setup async update.
 	l, err := NewDynamic(context.Background(), &DynamicConfig{
 		Labels: map[string]types.CommandLabel{
@@ -69,24 +63,18 @@ func (s *LabelSuite) TestStart(c *check.C) {
 			},
 		},
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	l.Start()
 
-	// Wait a maximum of 5 seconds for dynamic labels to be updated.
-	select {
-	case <-time.Tick(50 * time.Millisecond):
+	require.Eventually(t, func() bool {
 		val, ok := l.Get()["foo"]
-		c.Assert(ok, check.Equals, true)
-		if val.GetResult() == "4" {
-			break
-		}
-	case <-time.After(5 * time.Second):
-		c.Fatalf("Timed out waiting for label to be updated.")
-	}
+		require.True(t, ok)
+		return val.GetResult() == "4"
+	}, 5*time.Second, 50*time.Millisecond)
 }
 
 // TestInvalidCommand makes sure that invalid commands return a error message.
-func (s *LabelSuite) TestInvalidCommand(c *check.C) {
+func TestInvalidCommand(t *testing.T) {
 	// Create invalid labels and sync right away.
 	l, err := NewDynamic(context.Background(), &DynamicConfig{
 		Labels: map[string]types.CommandLabel{
@@ -95,11 +83,11 @@ func (s *LabelSuite) TestInvalidCommand(c *check.C) {
 				Command: []string{uuid.New().String()}},
 		},
 	})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 	l.Sync()
 
 	// Check that the output contains that the command was not found.
 	val, ok := l.Get()["foo"]
-	c.Assert(ok, check.Equals, true)
-	c.Assert(strings.Contains(val.GetResult(), "output:"), check.Equals, true)
+	require.True(t, ok)
+	require.Contains(t, val.GetResult(), "output:")
 }

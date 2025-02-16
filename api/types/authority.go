@@ -18,17 +18,17 @@ package types
 
 import (
 	"fmt"
+	"slices"
 	"time"
+
+	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/utils"
-
-	"github.com/gogo/protobuf/proto"
-	"github.com/gravitational/trace"
 )
 
-// CertAuthority is a host or user certificate authority that
-// can check and if it has private key stored as well, sign it too
+// CertAuthority is a host or user certificate authority that can check and if
+// it has private key stored as well, sign it too.
 type CertAuthority interface {
 	// ResourceWithSecrets sets common resource properties
 	ResourceWithSecrets
@@ -71,12 +71,8 @@ type CertAuthority interface {
 	GetRotation() Rotation
 	// SetRotation sets rotation state.
 	SetRotation(Rotation)
-	// GetSigningAlg returns the signing algorithm used by signing keys.
-	GetSigningAlg() CertAuthoritySpecV2_SigningAlgType
-	// SetSigningAlg sets the signing algorithm used by signing keys.
-	SetSigningAlg(CertAuthoritySpecV2_SigningAlgType)
-	// AllKeyTypesMatch returns true if all keys in the CA are of the same type.
-	AllKeyTypesMatch() bool
+	// AllKeyTypes returns the set of all different key types in the CA.
+	AllKeyTypes() []string
 	// Clone returns a copy of the cert authority object.
 	Clone() CertAuthority
 }
@@ -112,7 +108,7 @@ func (ca *CertAuthorityV2) SetSubKind(s string) {
 
 // Clone returns a copy of the cert authority object.
 func (ca *CertAuthorityV2) Clone() CertAuthority {
-	return proto.Clone(ca).(*CertAuthorityV2)
+	return utils.CloneProtoMsg(ca)
 }
 
 // GetRotation returns rotation state.
@@ -148,14 +144,14 @@ func (ca *CertAuthorityV2) Expiry() time.Time {
 	return ca.Metadata.Expiry()
 }
 
-// GetResourceID returns resource ID
-func (ca *CertAuthorityV2) GetResourceID() int64 {
-	return ca.Metadata.ID
+// GetRevision returns the revision
+func (ca *CertAuthorityV2) GetRevision() string {
+	return ca.Metadata.GetRevision()
 }
 
-// SetResourceID sets resource ID
-func (ca *CertAuthorityV2) SetResourceID(id int64) {
-	ca.Metadata.ID = id
+// SetRevision sets the revision
+func (ca *CertAuthorityV2) SetRevision(rev string) {
+	ca.Metadata.SetRevision(rev)
 }
 
 // WithoutSecrets returns an instance of resource without secrets.
@@ -172,16 +168,6 @@ func RemoveCASecrets(ca CertAuthority) {
 	if !ok {
 		return
 	}
-	cav2.Spec.SigningKeys = nil
-
-	for i := range cav2.Spec.TLSKeyPairs {
-		cav2.Spec.TLSKeyPairs[i].Key = nil
-	}
-
-	for i := range cav2.Spec.JWTKeyPairs {
-		cav2.Spec.JWTKeyPairs[i].PrivateKey = nil
-	}
-
 	cav2.Spec.ActiveKeys = cav2.Spec.ActiveKeys.WithoutSecrets()
 	cav2.Spec.AdditionalTrustedKeys = cav2.Spec.AdditionalTrustedKeys.WithoutSecrets()
 }
@@ -263,48 +249,8 @@ func (ca *CertAuthorityV2) ID() *CertAuthID {
 	return &CertAuthID{DomainName: ca.Spec.ClusterName, Type: ca.Spec.Type}
 }
 
-// GetSigningAlg returns the CA's signing algorithm type
-func (ca *CertAuthorityV2) GetSigningAlg() CertAuthoritySpecV2_SigningAlgType {
-	return ca.Spec.SigningAlg
-}
-
-// SetSigningAlg sets the CA's signing algorith type
-func (ca *CertAuthorityV2) SetSigningAlg(alg CertAuthoritySpecV2_SigningAlgType) {
-	ca.Spec.SigningAlg = alg
-}
-
-func (ca *CertAuthorityV2) getOldKeySet(index int) (keySet CAKeySet) {
-	// in the "old" CA schema, index 0 contains the active keys and index 1 the
-	// additional trusted keys
-	if index < 0 || index > 1 {
-		return
-	}
-	if len(ca.Spec.CheckingKeys) > index {
-		kp := &SSHKeyPair{
-			PrivateKeyType: PrivateKeyType_RAW,
-			PublicKey:      utils.CopyByteSlice(ca.Spec.CheckingKeys[index]),
-		}
-		if len(ca.Spec.SigningKeys) > index {
-			kp.PrivateKey = utils.CopyByteSlice(ca.Spec.SigningKeys[index])
-		}
-		keySet.SSH = []*SSHKeyPair{kp}
-	}
-	if len(ca.Spec.TLSKeyPairs) > index {
-		keySet.TLS = []*TLSKeyPair{ca.Spec.TLSKeyPairs[index].Clone()}
-	}
-	if len(ca.Spec.JWTKeyPairs) > index {
-		keySet.JWT = []*JWTKeyPair{ca.Spec.JWTKeyPairs[index].Clone()}
-	}
-	return keySet
-}
-
 func (ca *CertAuthorityV2) GetActiveKeys() CAKeySet {
-	haveNewCAKeys := len(ca.Spec.ActiveKeys.SSH) > 0 || len(ca.Spec.ActiveKeys.TLS) > 0 || len(ca.Spec.ActiveKeys.JWT) > 0
-	if haveNewCAKeys {
-		return ca.Spec.ActiveKeys
-	}
-	// fall back to old schema
-	return ca.getOldKeySet(0)
+	return ca.Spec.ActiveKeys
 }
 
 func (ca *CertAuthorityV2) SetActiveKeys(ks CAKeySet) error {
@@ -316,12 +262,7 @@ func (ca *CertAuthorityV2) SetActiveKeys(ks CAKeySet) error {
 }
 
 func (ca *CertAuthorityV2) GetAdditionalTrustedKeys() CAKeySet {
-	haveNewCAKeys := len(ca.Spec.AdditionalTrustedKeys.SSH) > 0 || len(ca.Spec.AdditionalTrustedKeys.TLS) > 0 || len(ca.Spec.AdditionalTrustedKeys.JWT) > 0
-	if haveNewCAKeys {
-		return ca.Spec.AdditionalTrustedKeys
-	}
-	// fall back to old schema
-	return ca.getOldKeySet(1)
+	return ca.Spec.AdditionalTrustedKeys
 }
 
 func (ca *CertAuthorityV2) SetAdditionalTrustedKeys(ks CAKeySet) error {
@@ -402,17 +343,15 @@ func (ca *CertAuthorityV2) CheckAndSetDefaults() error {
 		return trace.Wrap(err)
 	}
 
-	switch ca.GetType() {
-	case UserCA, HostCA, JWTSigner:
-	default:
-		return trace.BadParameter("invalid CA type %q", ca.GetType())
+	if err := ca.GetType().Check(); err != nil {
+		return trace.Wrap(err)
 	}
 
 	return nil
 }
 
-// AllKeyTypesMatch returns true if all private keys in the given CA are of the same type.
-func (ca *CertAuthorityV2) AllKeyTypesMatch() bool {
+// AllKeyTypes returns the set of all different key types in the CA.
+func (ca *CertAuthorityV2) AllKeyTypes() []string {
 	keyTypes := make(map[PrivateKeyType]struct{})
 	for _, keySet := range []CAKeySet{ca.Spec.ActiveKeys, ca.Spec.AdditionalTrustedKeys} {
 		for _, keyPair := range keySet.SSH {
@@ -425,7 +364,11 @@ func (ca *CertAuthorityV2) AllKeyTypesMatch() bool {
 			keyTypes[keyPair.PrivateKeyType] = struct{}{}
 		}
 	}
-	return len(keyTypes) == 1
+	var strs []string
+	for k := range keyTypes {
+		strs = append(strs, k.String())
+	}
+	return strs
 }
 
 const (
@@ -479,6 +422,16 @@ func (r *Rotation) Matches(rotation Rotation) bool {
 	return r.CurrentID == rotation.CurrentID && r.State == rotation.State && r.Phase == rotation.Phase
 }
 
+// IsZero checks if this is the zero value of Rotation. Works on nil and non-nil rotation
+// values.
+func (r *Rotation) IsZero() bool {
+	if r == nil {
+		return true
+	}
+
+	return r.Matches(Rotation{})
+}
+
 // LastRotatedDescription returns human friendly description.
 func (r *Rotation) LastRotatedDescription() string {
 	if r.LastRotated.IsZero() {
@@ -510,16 +463,20 @@ func (r *Rotation) String() string {
 	switch r.State {
 	case "", RotationStateStandby:
 		if r.LastRotated.IsZero() {
-			return "never updated"
+			return "standby (never rotated)"
 		}
-		return fmt.Sprintf("rotated %v", r.LastRotated.Format(constants.HumanDateFormatSeconds))
+		return fmt.Sprintf("standby (last rotated: %v)", r.LastRotated.Format(constants.HumanDateFormatSeconds))
 	case RotationStateInProgress:
-		return fmt.Sprintf("%v (mode: %v, started: %v, ending: %v)",
-			r.PhaseDescription(),
-			r.Mode,
-			r.Started.Format(constants.HumanDateFormatSeconds),
-			r.Started.Add(r.GracePeriod.Duration()).Format(constants.HumanDateFormatSeconds),
-		)
+		switch r.Mode {
+		case RotationModeManual:
+			return fmt.Sprintf("in progress (mode: manual, phase: %s)", r.Phase)
+		default:
+			return fmt.Sprintf("in progress (mode: automatic, phase: %s, started: %v, ending: %v)",
+				r.Phase,
+				r.Started.Format(constants.HumanDateFormatSeconds),
+				r.Started.Add(r.GracePeriod.Duration()).Format(constants.HumanDateFormatSeconds),
+			)
+		}
 	default:
 		return "unknown"
 	}
@@ -592,21 +549,13 @@ func (s *RotationSchedule) CheckAndSetDefaults(now time.Time) error {
 	return nil
 }
 
-// CertRoles defines certificate roles
-type CertRoles struct {
-	// Version is current version of the roles
-	Version string `json:"version"`
-	// Roles is a list of roles
-	Roles []string `json:"roles"`
-}
-
 // Clone returns a deep copy of TLSKeyPair that can be mutated without
 // modifying the original.
 func (k *TLSKeyPair) Clone() *TLSKeyPair {
 	return &TLSKeyPair{
 		KeyType: k.KeyType,
-		Key:     utils.CopyByteSlice(k.Key),
-		Cert:    utils.CopyByteSlice(k.Cert),
+		Key:     slices.Clone(k.Key),
+		Cert:    slices.Clone(k.Cert),
 	}
 }
 
@@ -615,8 +564,8 @@ func (k *TLSKeyPair) Clone() *TLSKeyPair {
 func (k *JWTKeyPair) Clone() *JWTKeyPair {
 	return &JWTKeyPair{
 		PrivateKeyType: k.PrivateKeyType,
-		PrivateKey:     utils.CopyByteSlice(k.PrivateKey),
-		PublicKey:      utils.CopyByteSlice(k.PublicKey),
+		PrivateKey:     slices.Clone(k.PrivateKey),
+		PublicKey:      slices.Clone(k.PublicKey),
 	}
 }
 
@@ -625,8 +574,8 @@ func (k *JWTKeyPair) Clone() *JWTKeyPair {
 func (k *SSHKeyPair) Clone() *SSHKeyPair {
 	return &SSHKeyPair{
 		PrivateKeyType: k.PrivateKeyType,
-		PrivateKey:     utils.CopyByteSlice(k.PrivateKey),
-		PublicKey:      utils.CopyByteSlice(k.PublicKey),
+		PrivateKey:     slices.Clone(k.PrivateKey),
+		PublicKey:      slices.Clone(k.PublicKey),
 	}
 }
 
@@ -764,5 +713,40 @@ func (f *CertAuthorityFilter) FromMap(m map[string]string) {
 	for key, val := range m {
 		(*f)[CertAuthType(key)] = val
 	}
+}
 
+// Contains checks if the CA filter contains another CA filter as a subset.
+// Unlike other filters, a CA filter's scope becomes more broad as map keys
+// are added to it.
+// Therefore, to check if kind's filter contains the subset's filter,
+// we should check that the subset's keys are all present in kind and as
+// narrow or narrower.
+// A special case is when kind's filter is either empty or specifies all
+// authorities, in which case it is as broad as possible and subset's filter
+// is always contained within it.
+func (f CertAuthorityFilter) Contains(other CertAuthorityFilter) bool {
+	if len(f) == 0 {
+		// f has no filter, which is as broad as possible.
+		return true
+	}
+
+	if len(other) == 0 {
+		// f has a filter, but other does not.
+		// treat this as "contained" if f's filter is for all authorities.
+		for _, caType := range CertAuthTypes {
+			clusterName, ok := f[caType]
+			if !ok || clusterName != Wildcard {
+				return false
+			}
+		}
+		return true
+	}
+
+	for k, v := range other {
+		v2, ok := f[k]
+		if !ok || (v2 != Wildcard && v2 != v) {
+			return false
+		}
+	}
+	return true
 }

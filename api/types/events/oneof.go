@@ -17,11 +17,12 @@ limitations under the License.
 package events
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"reflect"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 )
 
 // MustToOneOf converts audit event to OneOf
@@ -46,6 +47,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *UserCreate:
 		out.Event = &OneOf_UserCreate{
 			UserCreate: e,
+		}
+	case *UserUpdate:
+		out.Event = &OneOf_UserUpdate{
+			UserUpdate: e,
 		}
 	case *UserDelete:
 		out.Event = &OneOf_UserDelete{
@@ -131,9 +136,21 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_AccessRequestCreate{
 			AccessRequestCreate: e,
 		}
+	case *AccessRequestExpire:
+		out.Event = &OneOf_AccessRequestExpire{
+			AccessRequestExpire: e,
+		}
+	case *AccessRequestResourceSearch:
+		out.Event = &OneOf_AccessRequestResourceSearch{
+			AccessRequestResourceSearch: e,
+		}
 	case *RoleCreate:
 		out.Event = &OneOf_RoleCreate{
 			RoleCreate: e,
+		}
+	case *RoleUpdate:
+		out.Event = &OneOf_RoleUpdate{
+			RoleUpdate: e,
 		}
 	case *RoleDelete:
 		out.Event = &OneOf_RoleDelete{
@@ -155,9 +172,17 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_TrustedClusterTokenCreate{
 			TrustedClusterTokenCreate: e,
 		}
+	case *ProvisionTokenCreate:
+		out.Event = &OneOf_ProvisionTokenCreate{
+			ProvisionTokenCreate: e,
+		}
 	case *GithubConnectorCreate:
 		out.Event = &OneOf_GithubConnectorCreate{
 			GithubConnectorCreate: e,
+		}
+	case *GithubConnectorUpdate:
+		out.Event = &OneOf_GithubConnectorUpdate{
+			GithubConnectorUpdate: e,
 		}
 	case *GithubConnectorDelete:
 		out.Event = &OneOf_GithubConnectorDelete{
@@ -167,6 +192,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_OIDCConnectorCreate{
 			OIDCConnectorCreate: e,
 		}
+	case *OIDCConnectorUpdate:
+		out.Event = &OneOf_OIDCConnectorUpdate{
+			OIDCConnectorUpdate: e,
+		}
 	case *OIDCConnectorDelete:
 		out.Event = &OneOf_OIDCConnectorDelete{
 			OIDCConnectorDelete: e,
@@ -174,6 +203,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *SAMLConnectorCreate:
 		out.Event = &OneOf_SAMLConnectorCreate{
 			SAMLConnectorCreate: e,
+		}
+	case *SAMLConnectorUpdate:
+		out.Event = &OneOf_SAMLConnectorUpdate{
+			SAMLConnectorUpdate: e,
 		}
 	case *SAMLConnectorDelete:
 		out.Event = &OneOf_SAMLConnectorDelete{
@@ -187,6 +220,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_AppSessionStart{
 			AppSessionStart: e,
 		}
+	case *AppSessionEnd:
+		out.Event = &OneOf_AppSessionEnd{
+			AppSessionEnd: e,
+		}
 	case *AppSessionChunk:
 		out.Event = &OneOf_AppSessionChunk{
 			AppSessionChunk: e,
@@ -194,6 +231,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *AppSessionRequest:
 		out.Event = &OneOf_AppSessionRequest{
 			AppSessionRequest: e,
+		}
+	case *AppSessionDynamoDBRequest:
+		out.Event = &OneOf_AppSessionDynamoDBRequest{
+			AppSessionDynamoDBRequest: e,
 		}
 	case *AppCreate:
 		out.Event = &OneOf_AppCreate{
@@ -231,6 +272,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_DatabaseSessionQuery{
 			DatabaseSessionQuery: e,
 		}
+	case *DatabasePermissionUpdate:
+		out.Event = &OneOf_DatabasePermissionUpdate{
+			DatabasePermissionUpdate: e,
+		}
 	case *PostgresParse:
 		out.Event = &OneOf_PostgresParse{
 			PostgresParse: e,
@@ -262,6 +307,14 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *MFADeviceDelete:
 		out.Event = &OneOf_MFADeviceDelete{
 			MFADeviceDelete: e,
+		}
+	case *DeviceEvent:
+		out.Event = &OneOf_DeviceEvent{
+			DeviceEvent: e,
+		}
+	case *DeviceEvent2:
+		out.Event = &OneOf_DeviceEvent2{
+			DeviceEvent2: e,
 		}
 	case *BillingCardCreate:
 		out.Event = &OneOf_BillingCardCreate{
@@ -351,16 +404,443 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_MySQLStatementBulkExecute{
 			MySQLStatementBulkExecute: e,
 		}
+	case *MySQLInitDB:
+		out.Event = &OneOf_MySQLInitDB{
+			MySQLInitDB: e,
+		}
+	case *MySQLCreateDB:
+		out.Event = &OneOf_MySQLCreateDB{
+			MySQLCreateDB: e,
+		}
+	case *MySQLDropDB:
+		out.Event = &OneOf_MySQLDropDB{
+			MySQLDropDB: e,
+		}
+	case *MySQLShutDown:
+		out.Event = &OneOf_MySQLShutDown{
+			MySQLShutDown: e,
+		}
+	case *MySQLProcessKill:
+		out.Event = &OneOf_MySQLProcessKill{
+			MySQLProcessKill: e,
+		}
+	case *MySQLDebug:
+		out.Event = &OneOf_MySQLDebug{
+			MySQLDebug: e,
+		}
+	case *MySQLRefresh:
+		out.Event = &OneOf_MySQLRefresh{
+			MySQLRefresh: e,
+		}
+	case *SQLServerRPCRequest:
+		out.Event = &OneOf_SQLServerRPCRequest{
+			SQLServerRPCRequest: e,
+		}
+	case *ElasticsearchRequest:
+		out.Event = &OneOf_ElasticsearchRequest{
+			ElasticsearchRequest: e,
+		}
+	case *OpenSearchRequest:
+		out.Event = &OneOf_OpenSearchRequest{
+			OpenSearchRequest: e,
+		}
+	case *DynamoDBRequest:
+		out.Event = &OneOf_DynamoDBRequest{
+			DynamoDBRequest: e,
+		}
+	case *DatabaseSessionMalformedPacket:
+		out.Event = &OneOf_DatabaseSessionMalformedPacket{
+			DatabaseSessionMalformedPacket: e,
+		}
 	case *RenewableCertificateGenerationMismatch:
 		out.Event = &OneOf_RenewableCertificateGenerationMismatch{
 			RenewableCertificateGenerationMismatch: e,
+		}
+	case *SFTP:
+		out.Event = &OneOf_SFTP{
+			SFTP: e,
+		}
+	case *UpgradeWindowStartUpdate:
+		out.Event = &OneOf_UpgradeWindowStartUpdate{
+			UpgradeWindowStartUpdate: e,
+		}
+	case *SessionRecordingAccess:
+		out.Event = &OneOf_SessionRecordingAccess{
+			SessionRecordingAccess: e,
+		}
+	case *SSMRun:
+		out.Event = &OneOf_SSMRun{
+			SSMRun: e,
 		}
 	case *Unknown:
 		out.Event = &OneOf_Unknown{
 			Unknown: e,
 		}
+	case *CassandraBatch:
+		out.Event = &OneOf_CassandraBatch{
+			CassandraBatch: e,
+		}
+	case *CassandraPrepare:
+		out.Event = &OneOf_CassandraPrepare{
+			CassandraPrepare: e,
+		}
+	case *CassandraRegister:
+		out.Event = &OneOf_CassandraRegister{
+			CassandraRegister: e,
+		}
+	case *CassandraExecute:
+		out.Event = &OneOf_CassandraExecute{
+			CassandraExecute: e,
+		}
+	case *KubernetesClusterCreate:
+		out.Event = &OneOf_KubernetesClusterCreate{
+			KubernetesClusterCreate: e,
+		}
+	case *KubernetesClusterUpdate:
+		out.Event = &OneOf_KubernetesClusterUpdate{
+			KubernetesClusterUpdate: e,
+		}
+	case *KubernetesClusterDelete:
+		out.Event = &OneOf_KubernetesClusterDelete{
+			KubernetesClusterDelete: e,
+		}
+	case *DesktopSharedDirectoryStart:
+		out.Event = &OneOf_DesktopSharedDirectoryStart{
+			DesktopSharedDirectoryStart: e,
+		}
+	case *DesktopSharedDirectoryRead:
+		out.Event = &OneOf_DesktopSharedDirectoryRead{
+			DesktopSharedDirectoryRead: e,
+		}
+	case *DesktopSharedDirectoryWrite:
+		out.Event = &OneOf_DesktopSharedDirectoryWrite{
+			DesktopSharedDirectoryWrite: e,
+		}
+	case *BotJoin:
+		out.Event = &OneOf_BotJoin{
+			BotJoin: e,
+		}
+	case *InstanceJoin:
+		out.Event = &OneOf_InstanceJoin{
+			InstanceJoin: e,
+		}
+	case *BotCreate:
+		out.Event = &OneOf_BotCreate{
+			BotCreate: e,
+		}
+	case *BotUpdate:
+		out.Event = &OneOf_BotUpdate{
+			BotUpdate: e,
+		}
+	case *BotDelete:
+		out.Event = &OneOf_BotDelete{
+			BotDelete: e,
+		}
+	case *LoginRuleCreate:
+		out.Event = &OneOf_LoginRuleCreate{
+			LoginRuleCreate: e,
+		}
+	case *LoginRuleDelete:
+		out.Event = &OneOf_LoginRuleDelete{
+			LoginRuleDelete: e,
+		}
+	case *SAMLIdPAuthAttempt:
+		out.Event = &OneOf_SAMLIdPAuthAttempt{
+			SAMLIdPAuthAttempt: e,
+		}
+	case *SAMLIdPServiceProviderCreate:
+		out.Event = &OneOf_SAMLIdPServiceProviderCreate{
+			SAMLIdPServiceProviderCreate: e,
+		}
+	case *SAMLIdPServiceProviderUpdate:
+		out.Event = &OneOf_SAMLIdPServiceProviderUpdate{
+			SAMLIdPServiceProviderUpdate: e,
+		}
+	case *SAMLIdPServiceProviderDelete:
+		out.Event = &OneOf_SAMLIdPServiceProviderDelete{
+			SAMLIdPServiceProviderDelete: e,
+		}
+	case *SAMLIdPServiceProviderDeleteAll:
+		out.Event = &OneOf_SAMLIdPServiceProviderDeleteAll{
+			SAMLIdPServiceProviderDeleteAll: e,
+		}
+	case *OktaResourcesUpdate:
+		out.Event = &OneOf_OktaResourcesUpdate{
+			OktaResourcesUpdate: e,
+		}
+	case *OktaSyncFailure:
+		out.Event = &OneOf_OktaSyncFailure{
+			OktaSyncFailure: e,
+		}
+	case *OktaAssignmentResult:
+		out.Event = &OneOf_OktaAssignmentResult{
+			OktaAssignmentResult: e,
+		}
+	case *AccessListCreate:
+		out.Event = &OneOf_AccessListCreate{
+			AccessListCreate: e,
+		}
+	case *AccessListUpdate:
+		out.Event = &OneOf_AccessListUpdate{
+			AccessListUpdate: e,
+		}
+	case *AccessListDelete:
+		out.Event = &OneOf_AccessListDelete{
+			AccessListDelete: e,
+		}
+	case *AccessListReview:
+		out.Event = &OneOf_AccessListReview{
+			AccessListReview: e,
+		}
+	case *AccessListMemberCreate:
+		out.Event = &OneOf_AccessListMemberCreate{
+			AccessListMemberCreate: e,
+		}
+	case *AccessListMemberUpdate:
+		out.Event = &OneOf_AccessListMemberUpdate{
+			AccessListMemberUpdate: e,
+		}
+	case *AccessListMemberDelete:
+		out.Event = &OneOf_AccessListMemberDelete{
+			AccessListMemberDelete: e,
+		}
+	case *AccessListMemberDeleteAllForAccessList:
+		out.Event = &OneOf_AccessListMemberDeleteAllForAccessList{
+			AccessListMemberDeleteAllForAccessList: e,
+		}
+	case *UserLoginAccessListInvalid:
+		out.Event = &OneOf_UserLoginAccessListInvalid{
+			UserLoginAccessListInvalid: e,
+		}
+	case *AuditQueryRun:
+		out.Event = &OneOf_AuditQueryRun{
+			AuditQueryRun: e,
+		}
+	case *SecurityReportRun:
+		out.Event = &OneOf_SecurityReportRun{
+			SecurityReportRun: e,
+		}
+	case *ExternalAuditStorageEnable:
+		out.Event = &OneOf_ExternalAuditStorageEnable{
+			ExternalAuditStorageEnable: e,
+		}
+	case *ExternalAuditStorageDisable:
+		out.Event = &OneOf_ExternalAuditStorageDisable{
+			ExternalAuditStorageDisable: e,
+		}
+	case *CreateMFAAuthChallenge:
+		out.Event = &OneOf_CreateMFAAuthChallenge{
+			CreateMFAAuthChallenge: e,
+		}
+	case *ValidateMFAAuthResponse:
+		out.Event = &OneOf_ValidateMFAAuthResponse{
+			ValidateMFAAuthResponse: e,
+		}
+	case *OktaAccessListSync:
+		out.Event = &OneOf_OktaAccessListSync{
+			OktaAccessListSync: e,
+		}
+	case *OktaUserSync:
+		out.Event = &OneOf_OktaUserSync{
+			OktaUserSync: e,
+		}
+	case *SPIFFESVIDIssued:
+		out.Event = &OneOf_SPIFFESVIDIssued{
+			SPIFFESVIDIssued: e,
+		}
+	case *AuthPreferenceUpdate:
+		out.Event = &OneOf_AuthPreferenceUpdate{
+			AuthPreferenceUpdate: e,
+		}
+	case *ClusterNetworkingConfigUpdate:
+		out.Event = &OneOf_ClusterNetworkingConfigUpdate{
+			ClusterNetworkingConfigUpdate: e,
+		}
+	case *SessionRecordingConfigUpdate:
+		out.Event = &OneOf_SessionRecordingConfigUpdate{
+			SessionRecordingConfigUpdate: e,
+		}
+	case *AccessGraphSettingsUpdate:
+		out.Event = &OneOf_AccessGraphSettingsUpdate{
+			AccessGraphSettingsUpdate: e,
+		}
+	case *DatabaseUserCreate:
+		out.Event = &OneOf_DatabaseUserCreate{
+			DatabaseUserCreate: e,
+		}
+	case *DatabaseUserDeactivate:
+		out.Event = &OneOf_DatabaseUserDeactivate{
+			DatabaseUserDeactivate: e,
+		}
+	case *AccessPathChanged:
+		out.Event = &OneOf_AccessPathChanged{
+			AccessPathChanged: e,
+		}
+	case *SpannerRPC:
+		out.Event = &OneOf_SpannerRPC{
+			SpannerRPC: e,
+		}
+	case *DatabaseSessionCommandResult:
+		out.Event = &OneOf_DatabaseSessionCommandResult{
+			DatabaseSessionCommandResult: e,
+		}
+	case *DiscoveryConfigCreate:
+		out.Event = &OneOf_DiscoveryConfigCreate{
+			DiscoveryConfigCreate: e,
+		}
+	case *DiscoveryConfigUpdate:
+		out.Event = &OneOf_DiscoveryConfigUpdate{
+			DiscoveryConfigUpdate: e,
+		}
+	case *DiscoveryConfigDelete:
+		out.Event = &OneOf_DiscoveryConfigDelete{
+			DiscoveryConfigDelete: e,
+		}
+	case *DiscoveryConfigDeleteAll:
+		out.Event = &OneOf_DiscoveryConfigDeleteAll{
+			DiscoveryConfigDeleteAll: e,
+		}
+	case *IntegrationCreate:
+		out.Event = &OneOf_IntegrationCreate{
+			IntegrationCreate: e,
+		}
+	case *IntegrationUpdate:
+		out.Event = &OneOf_IntegrationUpdate{
+			IntegrationUpdate: e,
+		}
+	case *IntegrationDelete:
+		out.Event = &OneOf_IntegrationDelete{
+			IntegrationDelete: e,
+		}
+	case *SPIFFEFederationCreate:
+		out.Event = &OneOf_SPIFFEFederationCreate{
+			SPIFFEFederationCreate: e,
+		}
+	case *SPIFFEFederationDelete:
+		out.Event = &OneOf_SPIFFEFederationDelete{
+			SPIFFEFederationDelete: e,
+		}
+
+	case *PluginCreate:
+		out.Event = &OneOf_PluginCreate{
+			PluginCreate: e,
+		}
+	case *PluginUpdate:
+		out.Event = &OneOf_PluginUpdate{
+			PluginUpdate: e,
+		}
+	case *PluginDelete:
+		out.Event = &OneOf_PluginDelete{
+			PluginDelete: e,
+		}
+	case *StaticHostUserCreate:
+		out.Event = &OneOf_StaticHostUserCreate{
+			StaticHostUserCreate: e,
+		}
+	case *StaticHostUserUpdate:
+		out.Event = &OneOf_StaticHostUserUpdate{
+			StaticHostUserUpdate: e,
+		}
+	case *StaticHostUserDelete:
+		out.Event = &OneOf_StaticHostUserDelete{
+			StaticHostUserDelete: e,
+		}
+	case *CrownJewelCreate:
+		out.Event = &OneOf_CrownJewelCreate{
+			CrownJewelCreate: e,
+		}
+	case *CrownJewelUpdate:
+		out.Event = &OneOf_CrownJewelUpdate{
+			CrownJewelUpdate: e,
+		}
+	case *CrownJewelDelete:
+		out.Event = &OneOf_CrownJewelDelete{
+			CrownJewelDelete: e,
+		}
+	case *UserTaskCreate:
+		out.Event = &OneOf_UserTaskCreate{
+			UserTaskCreate: e,
+		}
+	case *UserTaskUpdate:
+		out.Event = &OneOf_UserTaskUpdate{
+			UserTaskUpdate: e,
+		}
+	case *UserTaskDelete:
+		out.Event = &OneOf_UserTaskDelete{
+			UserTaskDelete: e,
+		}
+	case *SFTPSummary:
+		out.Event = &OneOf_SFTPSummary{
+			SFTPSummary: e,
+		}
+	case *AutoUpdateConfigCreate:
+		out.Event = &OneOf_AutoUpdateConfigCreate{
+			AutoUpdateConfigCreate: e,
+		}
+	case *AutoUpdateConfigUpdate:
+		out.Event = &OneOf_AutoUpdateConfigUpdate{
+			AutoUpdateConfigUpdate: e,
+		}
+	case *AutoUpdateConfigDelete:
+		out.Event = &OneOf_AutoUpdateConfigDelete{
+			AutoUpdateConfigDelete: e,
+		}
+
+	case *AutoUpdateVersionCreate:
+		out.Event = &OneOf_AutoUpdateVersionCreate{
+			AutoUpdateVersionCreate: e,
+		}
+	case *AutoUpdateVersionUpdate:
+		out.Event = &OneOf_AutoUpdateVersionUpdate{
+			AutoUpdateVersionUpdate: e,
+		}
+	case *AutoUpdateVersionDelete:
+		out.Event = &OneOf_AutoUpdateVersionDelete{
+			AutoUpdateVersionDelete: e,
+		}
+	case *ContactCreate:
+		out.Event = &OneOf_ContactCreate{
+			ContactCreate: e,
+		}
+	case *ContactDelete:
+		out.Event = &OneOf_ContactDelete{
+			ContactDelete: e,
+		}
+
+	case *WorkloadIdentityCreate:
+		out.Event = &OneOf_WorkloadIdentityCreate{
+			WorkloadIdentityCreate: e,
+		}
+	case *WorkloadIdentityUpdate:
+		out.Event = &OneOf_WorkloadIdentityUpdate{
+			WorkloadIdentityUpdate: e,
+		}
+	case *WorkloadIdentityDelete:
+		out.Event = &OneOf_WorkloadIdentityDelete{
+			WorkloadIdentityDelete: e,
+		}
+	case *GitCommand:
+		out.Event = &OneOf_GitCommand{
+			GitCommand: e,
+		}
+	case *StableUNIXUserCreate:
+		out.Event = &OneOf_StableUNIXUserCreate{
+			StableUNIXUserCreate: e,
+		}
+	case *WorkloadIdentityX509RevocationCreate:
+		out.Event = &OneOf_WorkloadIdentityX509RevocationCreate{
+			WorkloadIdentityX509RevocationCreate: e,
+		}
+	case *WorkloadIdentityX509RevocationDelete:
+		out.Event = &OneOf_WorkloadIdentityX509RevocationDelete{
+			WorkloadIdentityX509RevocationDelete: e,
+		}
+	case *WorkloadIdentityX509RevocationUpdate:
+		out.Event = &OneOf_WorkloadIdentityX509RevocationUpdate{
+			WorkloadIdentityX509RevocationUpdate: e,
+		}
 	default:
-		log.Errorf("Attempted to convert dynamic event of unknown type \"%v\" into protobuf event.", in.GetType())
+		slog.ErrorContext(context.Background(), "Attempted to convert dynamic event of unknown type into protobuf event.", "event_type", in.GetType())
 		unknown := &Unknown{}
 		unknown.Type = UnknownEvent
 		unknown.Code = UnknownCode
@@ -394,7 +874,7 @@ func FromOneOf(in OneOf) (AuditEvent, error) {
 	// OneOfs only have one inner field, verify and then read it.
 	if elem.NumField() != 1 {
 		// This should never happen for proto one-ofs.
-		return nil, trace.BadParameter("unexpect number in value %v: %v != 1", elem.Kind(), elem.NumField())
+		return nil, trace.BadParameter("unexpected number in value %v: %v != 1", elem.Kind(), elem.NumField())
 	}
 
 	auditEvent, ok := elem.Field(0).Interface().(AuditEvent)

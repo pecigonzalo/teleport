@@ -1,20 +1,22 @@
 /*
-Copyright 2020 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package events
+package events_test
 
 import (
 	"bufio"
@@ -26,15 +28,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/gravitational/teleport"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/events"
+	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/google/go-cmp/cmp"
-	"github.com/jonboulle/clockwork"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/atomic"
 )
 
 // TestProtoStreamer tests edge cases of proto streamer implementation
@@ -49,17 +50,17 @@ func TestProtoStreamer(t *testing.T) {
 		{
 			name:           "5MB similar to S3 min size in bytes",
 			minUploadBytes: 1024 * 1024 * 5,
-			events:         GenerateTestSession(SessionParams{PrintEvents: 1}),
+			events:         eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1}),
 		},
 		{
 			name:           "get a part per message",
 			minUploadBytes: 1,
-			events:         GenerateTestSession(SessionParams{PrintEvents: 1}),
+			events:         eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1}),
 		},
 		{
 			name:           "small load test with some uneven numbers",
 			minUploadBytes: 1024,
-			events:         GenerateTestSession(SessionParams{PrintEvents: 1000}),
+			events:         eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1000}),
 		},
 		{
 			name:           "no events",
@@ -68,90 +69,90 @@ func TestProtoStreamer(t *testing.T) {
 		{
 			name:           "one event using the whole part",
 			minUploadBytes: 1,
-			events:         GenerateTestSession(SessionParams{PrintEvents: 0})[:1],
+			events:         eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 0})[:1],
 		},
 	}
 
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	for i, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			uploader := NewMemoryUploader()
-			streamer, err := NewProtoStreamer(ProtoStreamerConfig{
+			uploader := eventstest.NewMemoryUploader()
+			streamer, err := events.NewProtoStreamer(events.ProtoStreamerConfig{
 				Uploader:       uploader,
 				MinUploadBytes: tc.minUploadBytes,
 			})
-			require.Nil(t, err)
+			require.NoError(t, err)
 
 			sid := session.ID(fmt.Sprintf("test-%v", i))
 			stream, err := streamer.CreateAuditStream(ctx, sid)
-			require.Nil(t, err)
+			require.NoError(t, err)
 
-			events := tc.events
-			for _, event := range events {
-				err := stream.EmitAuditEvent(ctx, event)
+			evts := tc.events
+			for _, event := range evts {
+				err := stream.RecordEvent(ctx, eventstest.PrepareEvent(event))
 				if tc.err != nil {
 					require.IsType(t, tc.err, err)
 					return
 				}
-				require.Nil(t, err)
+				require.NoError(t, err)
 			}
 			err = stream.Complete(ctx)
-			require.Nil(t, err)
+			require.NoError(t, err)
 
 			var outEvents []apievents.AuditEvent
 			uploads, err := uploader.ListUploads(ctx)
-			require.Nil(t, err)
+			require.NoError(t, err)
 			parts, err := uploader.GetParts(uploads[0].ID)
-			require.Nil(t, err)
+			require.NoError(t, err)
 
 			for _, part := range parts {
-				reader := NewProtoReader(bytes.NewReader(part))
+				reader := events.NewProtoReader(bytes.NewReader(part))
 				out, err := reader.ReadAll(ctx)
-				require.Nil(t, err, "part crash %#v", part)
+				require.NoError(t, err, "part crash %#v", part)
 				outEvents = append(outEvents, out...)
 			}
 
-			require.Equal(t, events, outEvents)
+			require.Equal(t, evts, outEvents)
 		})
 	}
 }
 
 func TestWriterEmitter(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	events := GenerateTestSession(SessionParams{PrintEvents: 0})
+	evts := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 0})
 	buf := &bytes.Buffer{}
-	emitter := NewWriterEmitter(utils.NopWriteCloser(buf))
+	emitter := events.NewWriterEmitter(utils.NopWriteCloser(buf))
 
-	for _, event := range events {
+	for _, event := range evts {
 		err := emitter.EmitAuditEvent(ctx, event)
 		require.NoError(t, err)
 	}
 
 	scanner := bufio.NewScanner(buf)
 	for i := 0; scanner.Scan(); i++ {
-		require.Contains(t, scanner.Text(), events[i].GetCode())
+		require.Contains(t, scanner.Text(), evts[i].GetCode())
 	}
 }
 
 func TestAsyncEmitter(t *testing.T) {
-	clock := clockwork.NewRealClock()
-	events := GenerateTestSession(SessionParams{PrintEvents: 20})
+	ctx := context.Background()
+	evts := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 20})
 
 	// Slow tests that async emitter does not block
 	// on slow emitters
 	t.Run("Slow", func(t *testing.T) {
-		emitter, err := NewAsyncEmitter(AsyncEmitterConfig{
-			Inner: &slowEmitter{clock: clock, timeout: time.Hour},
+		emitter, err := events.NewAsyncEmitter(events.AsyncEmitterConfig{
+			Inner: eventstest.NewSlowEmitter(time.Hour),
 		})
 		require.NoError(t, err)
 		defer emitter.Close()
-		ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
-		for _, event := range events {
+		for _, event := range evts {
 			err := emitter.EmitAuditEvent(ctx, event)
 			require.NoError(t, err)
 		}
@@ -160,24 +161,24 @@ func TestAsyncEmitter(t *testing.T) {
 
 	// Receive makes sure all events are recevied in the same order as they are sent
 	t.Run("Receive", func(t *testing.T) {
-		chanEmitter := &channelEmitter{eventsCh: make(chan apievents.AuditEvent, len(events))}
-		emitter, err := NewAsyncEmitter(AsyncEmitterConfig{
+		chanEmitter := eventstest.NewChannelEmitter(len(evts))
+		emitter, err := events.NewAsyncEmitter(events.AsyncEmitterConfig{
 			Inner: chanEmitter,
 		})
 
 		require.NoError(t, err)
 		defer emitter.Close()
-		ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
-		for _, event := range events {
+		for _, event := range evts {
 			err := emitter.EmitAuditEvent(ctx, event)
 			require.NoError(t, err)
 		}
 
-		for i := 0; i < len(events); i++ {
+		for i := 0; i < len(evts); i++ {
 			select {
-			case event := <-chanEmitter.eventsCh:
-				require.Equal(t, events[i], event)
+			case event := <-chanEmitter.C():
+				require.Equal(t, evts[i], event)
 			case <-time.After(time.Second):
 				t.Fatalf("timeout at event %v", i)
 			}
@@ -186,18 +187,18 @@ func TestAsyncEmitter(t *testing.T) {
 
 	// Close makes sure that close cancels operations and context
 	t.Run("Close", func(t *testing.T) {
-		counter := &counterEmitter{count: atomic.NewInt64(0)}
-		emitter, err := NewAsyncEmitter(AsyncEmitterConfig{
+		counter := eventstest.NewCountingEmitter()
+		emitter, err := events.NewAsyncEmitter(events.AsyncEmitterConfig{
 			Inner:      counter,
-			BufferSize: len(events),
+			BufferSize: len(evts),
 		})
 		require.NoError(t, err)
 
-		ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
 		defer cancel()
 
-		emitsDoneC := make(chan struct{}, len(events))
-		for _, e := range events {
+		emitsDoneC := make(chan struct{}, len(evts))
+		for _, e := range evts {
 			go func(event apievents.AuditEvent) {
 				emitter.EmitAuditEvent(ctx, event)
 				emitsDoneC <- struct{}{}
@@ -206,17 +207,10 @@ func TestAsyncEmitter(t *testing.T) {
 
 		// context will not wait until all events have been submitted
 		emitter.Close()
-		require.True(t, int(counter.count.Load()) <= len(events))
-
-		// make sure context is done to prevent context leaks
-		select {
-		case <-emitter.ctx.Done():
-		default:
-			t.Fatal("Context leak, should be closed")
-		}
+		require.LessOrEqual(t, int(counter.Count()), len(evts))
 
 		// make sure all emit calls returned after context is done
-		for range events {
+		for range evts {
 			select {
 			case <-time.After(time.Second):
 				t.Fatal("Timed out waiting for emit events.")
@@ -226,54 +220,22 @@ func TestAsyncEmitter(t *testing.T) {
 	})
 }
 
-type slowEmitter struct {
-	clock   clockwork.Clock
-	timeout time.Duration
-}
-
-func (s *slowEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	<-s.clock.After(s.timeout)
-	return nil
-}
-
-type counterEmitter struct {
-	count *atomic.Int64
-}
-
-func (c *counterEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	c.count.Inc()
-	return nil
-}
-
-type channelEmitter struct {
-	eventsCh chan apievents.AuditEvent
-}
-
-func (c *channelEmitter) EmitAuditEvent(ctx context.Context, event apievents.AuditEvent) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case c.eventsCh <- event:
-		return nil
-	}
-}
-
 // TestExport tests export to JSON format.
 func TestExport(t *testing.T) {
 	sid := session.NewID()
-	events := GenerateTestSession(SessionParams{PrintEvents: 1, SessionID: sid.String()})
-	uploader := NewMemoryUploader()
-	streamer, err := NewProtoStreamer(ProtoStreamerConfig{
+	evts := eventstest.GenerateTestSession(eventstest.SessionParams{PrintEvents: 1, SessionID: sid.String()})
+	uploader := eventstest.NewMemoryUploader()
+	streamer, err := events.NewProtoStreamer(events.ProtoStreamerConfig{
 		Uploader: uploader,
 	})
 	require.NoError(t, err)
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	stream, err := streamer.CreateAuditStream(ctx, sid)
 	require.NoError(t, err)
 
-	for _, event := range events {
-		err := stream.EmitAuditEvent(ctx, event)
+	for _, event := range evts {
+		err := stream.RecordEvent(ctx, eventstest.PrepareEvent(event))
 		require.NoError(t, err)
 	}
 	err = stream.Complete(ctx)
@@ -294,7 +256,7 @@ func TestExport(t *testing.T) {
 		_, err := f.Write(part)
 		require.NoError(t, err)
 	}
-	reader := NewProtoReader(io.MultiReader(readers...))
+	reader := events.NewProtoReader(io.MultiReader(readers...))
 	outEvents, err := reader.ReadAll(ctx)
 	require.NoError(t, err)
 
@@ -302,7 +264,7 @@ func TestExport(t *testing.T) {
 	require.NoError(t, err)
 
 	buf := &bytes.Buffer{}
-	err = Export(ctx, f, buf, teleport.JSON)
+	err = events.Export(ctx, f, buf, teleport.JSON)
 	require.NoError(t, err)
 
 	count := 0
@@ -312,90 +274,5 @@ func TestExport(t *testing.T) {
 		count++
 	}
 	require.NoError(t, snl.Err())
-	require.Equal(t, len(outEvents), count)
-}
-
-// TestEnforcesClusterNameDefault validates that different emitter/stream/streamer
-// implementations enforce cluster name defaults
-func TestEnforcesClusterNameDefault(t *testing.T) {
-	clock := clockwork.NewFakeClock()
-
-	t.Run("CheckingStream", func(t *testing.T) {
-		emitter := NewCheckingStream(&DiscardStream{}, clock, "cluster")
-		event := &apievents.SessionStart{
-			Metadata: apievents.Metadata{
-				ID:   "event.id",
-				Code: "event.code",
-				Type: "event.type",
-			},
-		}
-		require.NoError(t, emitter.EmitAuditEvent(context.Background(), event))
-		require.Empty(t, cmp.Diff(event, &apievents.SessionStart{
-			Metadata: apievents.Metadata{
-				ID:          "event.id",
-				Code:        "event.code",
-				Type:        "event.type",
-				Time:        clock.Now(),
-				ClusterName: "cluster",
-			},
-		}))
-	})
-	t.Run("CheckingStreamer.CreateAuditStream", func(t *testing.T) {
-		streamer := &CheckingStreamer{
-			CheckingStreamerConfig: CheckingStreamerConfig{
-				Inner:        &DiscardEmitter{},
-				Clock:        clock,
-				ClusterName:  "cluster",
-				UIDGenerator: utils.NewFakeUID(),
-			},
-		}
-		emitter, err := streamer.CreateAuditStream(context.Background(), "session.id")
-		require.NoError(t, err)
-		event := &apievents.SessionStart{
-			Metadata: apievents.Metadata{
-				ID:   "event.id",
-				Code: "event.code",
-				Type: "event.type",
-			},
-		}
-		require.NoError(t, emitter.EmitAuditEvent(context.Background(), event))
-		require.Empty(t, cmp.Diff(event, &apievents.SessionStart{
-			Metadata: apievents.Metadata{
-				ID:          "event.id",
-				Code:        "event.code",
-				Type:        "event.type",
-				Time:        clock.Now(),
-				ClusterName: "cluster",
-			},
-		}))
-	})
-	t.Run("CheckingStreamer.ResumeAuditStream", func(t *testing.T) {
-		streamer := &CheckingStreamer{
-			CheckingStreamerConfig: CheckingStreamerConfig{
-				Inner:        &DiscardEmitter{},
-				Clock:        clock,
-				ClusterName:  "cluster",
-				UIDGenerator: utils.NewFakeUID(),
-			},
-		}
-		emitter, err := streamer.ResumeAuditStream(context.Background(), "session.id", "upload.id")
-		require.NoError(t, err)
-		event := &apievents.SessionStart{
-			Metadata: apievents.Metadata{
-				ID:   "event.id",
-				Code: "event.code",
-				Type: "event.type",
-			},
-		}
-		require.NoError(t, emitter.EmitAuditEvent(context.Background(), event))
-		require.Empty(t, cmp.Diff(event, &apievents.SessionStart{
-			Metadata: apievents.Metadata{
-				ID:          "event.id",
-				Code:        "event.code",
-				Type:        "event.type",
-				Time:        clock.Now(),
-				ClusterName: "cluster",
-			},
-		}))
-	})
+	require.Len(t, outEvents, count)
 }

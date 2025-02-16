@@ -1,41 +1,41 @@
 /*
-Copyright 2015-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"encoding/json"
 	"fmt"
-
-	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"testing"
 
 	"github.com/coreos/go-oidc/jose"
+	"github.com/google/go-cmp/cmp"
 	saml2 "github.com/russellhaering/gosaml2"
 	samltypes "github.com/russellhaering/gosaml2/types"
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 )
 
-type UserSuite struct {
-}
+func TestTraits(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&UserSuite{})
-
-func (s *UserSuite) TestTraits(c *check.C) {
 	var tests = []struct {
 		traitName string
 	}{
@@ -65,184 +65,216 @@ func (s *UserSuite) TestTraits(c *check.C) {
 		}
 
 		data, err := json.Marshal(user)
-		c.Assert(err, check.IsNil)
+		require.NoError(t, err)
 
 		_, err = UnmarshalUser(data)
-		c.Assert(err, check.IsNil)
+		require.NoError(t, err)
 	}
 }
 
-func (s *UserSuite) TestOIDCMapping(c *check.C) {
-	type input struct {
-		comment       string
-		claims        jose.Claims
-		expectedRoles []string
-		warnings      []string
-	}
-	testCases := []struct {
-		comment  string
-		mappings []types.ClaimMapping
-		inputs   []input
-	}{
-		{
-			comment: "no mappings",
-			inputs: []input{
-				{
-					claims:        jose.Claims{"a": "b"},
-					expectedRoles: nil,
-				},
-			},
-		},
-		{
-			comment: "simple mappings",
-			mappings: []types.ClaimMapping{
-				{Claim: "role", Value: "admin", Roles: []string{"admin", "bob"}},
-				{Claim: "role", Value: "user", Roles: []string{"user"}},
-			},
-			inputs: []input{
-				{
-					comment:       "no match",
-					claims:        jose.Claims{"a": "b"},
-					expectedRoles: nil,
-				},
-				{
-					comment:       "no value match",
-					claims:        jose.Claims{"role": "b"},
-					expectedRoles: nil,
-				},
-				{
-					comment:       "direct admin value match",
-					claims:        jose.Claims{"role": "admin"},
-					expectedRoles: []string{"admin", "bob"},
-				},
-				{
-					comment:       "direct user value match",
-					claims:        jose.Claims{"role": "user"},
-					expectedRoles: []string{"user"},
-				},
-				{
-					comment:       "direct user value match with array",
-					claims:        jose.Claims{"role": []string{"user"}},
-					expectedRoles: []string{"user"},
-				},
-			},
-		},
-		{
-			comment: "regexp mappings match",
-			mappings: []types.ClaimMapping{
-				{Claim: "role", Value: "^admin-(.*)$", Roles: []string{"role-$1", "bob"}},
-			},
-			inputs: []input{
-				{
-					comment:       "no match",
-					claims:        jose.Claims{"a": "b"},
-					expectedRoles: nil,
-				},
-				{
-					comment:       "no match - subprefix",
-					claims:        jose.Claims{"role": "adminz"},
-					expectedRoles: nil,
-				},
-				{
-					comment:       "value with capture match",
-					claims:        jose.Claims{"role": "admin-hello"},
-					expectedRoles: []string{"role-hello", "bob"},
-				},
-				{
-					comment:       "multiple value with capture match, deduplication",
-					claims:        jose.Claims{"role": []string{"admin-hello", "admin-ola"}},
-					expectedRoles: []string{"role-hello", "bob", "role-ola"},
-				},
-				{
-					comment:       "first matches, second does not",
-					claims:        jose.Claims{"role": []string{"hello", "admin-ola"}},
-					expectedRoles: []string{"role-ola", "bob"},
-				},
-			},
-		},
-		{
-			comment: "empty expands are skipped",
-			mappings: []types.ClaimMapping{
-				{Claim: "role", Value: "^admin-(.*)$", Roles: []string{"$2", "bob"}},
-			},
-			inputs: []input{
-				{
-					comment:       "value with capture match",
-					claims:        jose.Claims{"role": "admin-hello"},
-					expectedRoles: []string{"bob"},
-				},
-			},
-		},
-		{
-			comment: "glob wildcard match",
-			mappings: []types.ClaimMapping{
-				{Claim: "role", Value: "*", Roles: []string{"admin"}},
-			},
-			inputs: []input{
-				{
-					comment:       "empty value match",
-					claims:        jose.Claims{"role": ""},
-					expectedRoles: []string{"admin"},
-				},
-				{
-					comment:       "any value match",
-					claims:        jose.Claims{"role": "zz"},
-					expectedRoles: []string{"admin"},
-				},
-			},
-		},
-		{
-			comment: "Whitespace/dashes",
-			mappings: []types.ClaimMapping{
-				{Claim: "groups", Value: "DemoCorp - Backend Engineers", Roles: []string{"backend"}},
-				{Claim: "groups", Value: "DemoCorp - SRE Managers", Roles: []string{"approver"}},
-				{Claim: "groups", Value: "DemoCorp - SRE", Roles: []string{"approver"}},
-				{Claim: "groups", Value: "DemoCorp Infrastructure", Roles: []string{"approver", "backend"}},
-			},
-			inputs: []input{
-				{
-					comment: "Matches multiple groups",
-					claims: jose.Claims{
-						"groups": []string{"DemoCorp - Backend Engineers", "DemoCorp Infrastructure"},
-					},
-					expectedRoles: []string{"backend", "approver"},
-				},
-				{
-					comment: "Matches one group",
-					claims: jose.Claims{
-						"groups": []string{"DemoCorp - SRE"},
-					},
-					expectedRoles: []string{"approver"},
-				},
-				{
-					comment: "Matches one group with multiple roles",
-					claims: jose.Claims{
-						"groups": []string{"DemoCorp Infrastructure"},
-					},
-					expectedRoles: []string{"approver", "backend"},
-				},
-				{
-					comment: "No match only due to case-sensitivity",
-					claims: jose.Claims{
-						"groups": []string{"Democorp - SRE"},
-					},
-					expectedRoles: []string(nil),
-					warnings:      []string{`trait "Democorp - SRE" matches value "DemoCorp - SRE" case-insensitively and would have yielded "approver" role`},
-				},
-			},
-		},
-	}
+type oidcInput struct {
+	comment       string
+	claims        jose.Claims
+	expectedRoles []string
+	warnings      []string
+}
 
-	for i, testCase := range testCases {
+var oidcTestCases = []struct {
+	comment  string
+	mappings []types.ClaimMapping
+	inputs   []oidcInput
+}{
+	{
+		comment: "no mappings",
+		inputs: []oidcInput{
+			{
+				comment:       "no match",
+				claims:        jose.Claims{"a": "b"},
+				expectedRoles: nil,
+			},
+		},
+	},
+	{
+		comment: "simple mappings",
+		mappings: []types.ClaimMapping{
+			{Claim: "role", Value: "admin", Roles: []string{"admin", "bob"}},
+			{Claim: "role", Value: "user", Roles: []string{"user"}},
+		},
+		inputs: []oidcInput{
+			{
+				comment:       "no match",
+				claims:        jose.Claims{"a": "b"},
+				expectedRoles: nil,
+			},
+			{
+				comment:       "no value match",
+				claims:        jose.Claims{"role": "b"},
+				expectedRoles: nil,
+			},
+			{
+				comment:       "direct admin value match",
+				claims:        jose.Claims{"role": "admin"},
+				expectedRoles: []string{"admin", "bob"},
+			},
+			{
+				comment:       "direct user value match",
+				claims:        jose.Claims{"role": "user"},
+				expectedRoles: []string{"user"},
+			},
+			{
+				comment:       "direct user value match with array",
+				claims:        jose.Claims{"role": []string{"user"}},
+				expectedRoles: []string{"user"},
+			},
+		},
+	},
+	{
+		comment: "regexp mappings match",
+		mappings: []types.ClaimMapping{
+			{Claim: "role", Value: "^admin-(.*)$", Roles: []string{"role-$1", "bob"}},
+		},
+		inputs: []oidcInput{
+			{
+				comment:       "no match",
+				claims:        jose.Claims{"a": "b"},
+				expectedRoles: nil,
+			},
+			{
+				comment:       "no match - subprefix",
+				claims:        jose.Claims{"role": "adminz"},
+				expectedRoles: nil,
+			},
+			{
+				comment:       "value with capture match",
+				claims:        jose.Claims{"role": "admin-hello"},
+				expectedRoles: []string{"role-hello", "bob"},
+			},
+			{
+				comment:       "multiple value with capture match, deduplication",
+				claims:        jose.Claims{"role": []string{"admin-hello", "admin-ola"}},
+				expectedRoles: []string{"role-hello", "bob", "role-ola"},
+			},
+			{
+				comment:       "first matches, second does not",
+				claims:        jose.Claims{"role": []string{"hello", "admin-ola"}},
+				expectedRoles: []string{"role-ola", "bob"},
+			},
+		},
+	},
+	{
+		comment: "regexp compilation",
+		mappings: []types.ClaimMapping{
+			{Claim: "role", Value: `^admin-(?!)$`, Roles: []string{"admin"}}, // "?!" is invalid.
+			{Claim: "role", Value: "^admin-(.*)$", Roles: []string{"role-$1", "bob"}},
+			{Claim: "role", Value: `^admin2-(?!)$`, Roles: []string{"admin2"}}, // "?!" is invalid.
+		},
+		inputs: []oidcInput{
+			{
+				comment:       "invalid regexp",
+				claims:        jose.Claims{"role": []string{"admin-hello", "dev"}},
+				expectedRoles: []string{"role-hello", "bob"},
+				warnings: []string{
+					`case-insensitive expression "^admin-(?!)$" is not a valid regexp`,
+					`case-insensitive expression "^admin2-(?!)$" is not a valid regexp`,
+				},
+			},
+			{
+				comment:       "regexp are not compiled if not needed",
+				claims:        jose.Claims{},
+				expectedRoles: nil,
+				// if the regexp were compiled, we would have the same warnings as above
+				warnings: nil,
+			},
+		},
+	},
+	{
+		comment: "empty expands are skipped",
+		mappings: []types.ClaimMapping{
+			{Claim: "role", Value: "^admin-(.*)$", Roles: []string{"$2", "bob"}},
+		},
+		inputs: []oidcInput{
+			{
+				comment:       "value with capture match",
+				claims:        jose.Claims{"role": "admin-hello"},
+				expectedRoles: []string{"bob"},
+			},
+		},
+	},
+	{
+		comment: "glob wildcard match",
+		mappings: []types.ClaimMapping{
+			{Claim: "role", Value: "*", Roles: []string{"admin"}},
+		},
+		inputs: []oidcInput{
+			{
+				comment:       "empty value match",
+				claims:        jose.Claims{"role": ""},
+				expectedRoles: []string{"admin"},
+			},
+			{
+				comment:       "any value match",
+				claims:        jose.Claims{"role": "zz"},
+				expectedRoles: []string{"admin"},
+			},
+		},
+	},
+	{
+		comment: "Whitespace/dashes",
+		mappings: []types.ClaimMapping{
+			{Claim: "groups", Value: "DemoCorp - Backend Engineers", Roles: []string{"backend"}},
+			{Claim: "groups", Value: "DemoCorp - SRE Managers", Roles: []string{"approver"}},
+			{Claim: "groups", Value: "DemoCorp - SRE", Roles: []string{"approver"}},
+			{Claim: "groups", Value: "DemoCorp Infrastructure", Roles: []string{"approver", "backend"}},
+		},
+		inputs: []oidcInput{
+			{
+				comment: "Matches multiple groups",
+				claims: jose.Claims{
+					"groups": []string{"DemoCorp - Backend Engineers", "DemoCorp Infrastructure"},
+				},
+				expectedRoles: []string{"backend", "approver"},
+			},
+			{
+				comment: "Matches one group",
+				claims: jose.Claims{
+					"groups": []string{"DemoCorp - SRE"},
+				},
+				expectedRoles: []string{"approver"},
+			},
+			{
+				comment: "Matches one group with multiple roles",
+				claims: jose.Claims{
+					"groups": []string{"DemoCorp Infrastructure"},
+				},
+				expectedRoles: []string{"approver", "backend"},
+			},
+			{
+				comment: "No match only due to case-sensitivity",
+				claims: jose.Claims{
+					"groups": []string{"Democorp - SRE"},
+				},
+				expectedRoles: []string(nil),
+				warnings: []string{
+					`trait "Democorp - SRE" matches value "DemoCorp - SRE" case-insensitively and would have yielded "approver" role`,
+				},
+			},
+		},
+	},
+}
+
+func TestOIDCMapping(t *testing.T) {
+	t.Parallel()
+
+	for i, testCase := range oidcTestCases {
 		conn := types.OIDCConnectorV3{
 			Spec: types.OIDCConnectorSpecV3{
 				ClaimsToRoles: testCase.mappings,
 			},
 		}
 		for _, input := range testCase.inputs {
-			comment := check.Commentf("OIDC Test case %v %q, input %q", i, testCase.comment, input.comment)
-			_, outRoles := TraitsToRoles(conn.GetTraitMappings(), OIDCClaimsToTraits(input.claims))
-			c.Assert(outRoles, check.DeepEquals, input.expectedRoles, comment)
+			comment := fmt.Sprintf("OIDC Test case %v %q, input %q", i, testCase.comment, input.comment)
+			_, outRoles := TraitsToRoles(conn.GetTraitMappings(), oidcClaimsToTraits(input.claims))
+			require.Empty(t, cmp.Diff(outRoles, input.expectedRoles), comment)
 		}
 
 		samlConn := types.SAMLConnectorV2{
@@ -251,10 +283,30 @@ func (s *UserSuite) TestOIDCMapping(c *check.C) {
 			},
 		}
 		for _, input := range testCase.inputs {
-			comment := check.Commentf("SAML Test case %v %v, input %#v", i, testCase.comment, input)
+			comment := fmt.Sprintf("SAML Test case %v %v, input %#v", i, testCase.comment, input)
 			warnings, outRoles := TraitsToRoles(samlConn.GetTraitMappings(), SAMLAssertionsToTraits(claimsToAttributes(input.claims)))
-			c.Assert(outRoles, check.DeepEquals, input.expectedRoles, comment)
-			c.Assert(warnings, check.DeepEquals, input.warnings, comment)
+			require.Empty(t, cmp.Diff(outRoles, input.expectedRoles), comment)
+			require.Empty(t, cmp.Diff(warnings, input.warnings), comment)
+		}
+	}
+}
+func BenchmarkTraitToRoles(b *testing.B) {
+	for _, testCase := range oidcTestCases {
+		samlConn := types.SAMLConnectorV2{
+			Spec: types.SAMLConnectorSpecV2{
+				AttributesToRoles: claimMappingsToAttributeMappings(testCase.mappings),
+			},
+		}
+		mappings := samlConn.GetTraitMappings()
+		for _, input := range testCase.inputs {
+			testCaseInputName := fmt.Sprintf("%s %s", testCase.comment, input.comment)
+			traits := SAMLAssertionsToTraits(claimsToAttributes(input.claims))
+
+			b.Run(testCaseInputName, func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					TraitsToRoles(mappings, traits)
+				}
+			})
 		}
 	}
 }
@@ -271,6 +323,25 @@ func claimMappingsToAttributeMappings(in []types.ClaimMapping) []types.Attribute
 		})
 	}
 	return out
+}
+
+// oidcClaimsToTraits converts OIDC-style claims into teleport-specific trait format
+func oidcClaimsToTraits(claims jose.Claims) map[string][]string {
+	traits := make(map[string][]string)
+
+	for claimName := range claims {
+		claimValue, ok, _ := claims.StringClaim(claimName)
+		if ok {
+			traits[claimName] = []string{claimValue}
+			continue
+		}
+		claimValues, ok, _ := claims.StringsClaim(claimName)
+		if ok {
+			traits[claimName] = claimValues
+		}
+	}
+
+	return traits
 }
 
 // claimsToAttributes maps jose.Claims type to attributes for testing

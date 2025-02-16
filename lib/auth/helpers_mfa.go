@@ -1,18 +1,20 @@
 /*
-Copyright 2017-2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -20,14 +22,18 @@ import (
 	"context"
 	"time"
 
-	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth/mocku2f"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
+
+	"github.com/gravitational/teleport/api/client/proto"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
+	"github.com/gravitational/teleport/api/mfa"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/mocku2f"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
+	"github.com/gravitational/teleport/lib/utils/clocki"
 )
 
 // TestDevice is a test MFA device.
@@ -36,8 +42,9 @@ type TestDevice struct {
 	TOTPSecret string
 	Key        *mocku2f.Key
 
-	clock  clockwork.Clock
-	origin string
+	clock        clockwork.Clock
+	origin       string
+	passwordless bool
 }
 
 // TestDeviceOpt is a creation option for TestDevice.
@@ -46,6 +53,12 @@ type TestDeviceOpt func(d *TestDevice)
 func WithTestDeviceClock(clock clockwork.Clock) TestDeviceOpt {
 	return func(d *TestDevice) {
 		d.clock = clock
+	}
+}
+
+func WithPasswordless() TestDeviceOpt {
+	return func(d *TestDevice) {
+		d.passwordless = true
 	}
 }
 
@@ -66,7 +79,8 @@ func NewTestDeviceFromChallenge(c *proto.MFARegisterChallenge, opts ...TestDevic
 // RegisterTestDevice creates and registers a TestDevice.
 // TOTP devices require a clock option.
 func RegisterTestDevice(
-	ctx context.Context, clt authClient, devName string, devType proto.DeviceType, authenticator *TestDevice, opts ...TestDeviceOpt) (*TestDevice, error) {
+	ctx context.Context, clt authClientI, devName string, devType proto.DeviceType, authenticator *TestDevice, opts ...TestDeviceOpt,
+) (*TestDevice, error) {
 	dev := &TestDevice{} // Remaining parameters set during registration
 	for _, opt := range opts {
 		opt(dev)
@@ -74,7 +88,7 @@ func RegisterTestDevice(
 	if devType == proto.DeviceType_DEVICE_TYPE_TOTP && dev.clock == nil {
 		return nil, trace.BadParameter("TOTP devices require the WithTestDeviceClock option")
 	}
-	return dev, dev.registerStream(ctx, clt, devName, devType, authenticator)
+	return dev, dev.registerDevice(ctx, clt, devName, devType, authenticator)
 }
 
 func (d *TestDevice) Origin() string {
@@ -84,72 +98,60 @@ func (d *TestDevice) Origin() string {
 	return d.origin
 }
 
-type authClient interface {
-	AddMFADevice(ctx context.Context) (proto.AuthService_AddMFADeviceClient, error)
+type authClientI interface {
+	CreateAuthenticateChallenge(context.Context, *proto.CreateAuthenticateChallengeRequest) (*proto.MFAAuthenticateChallenge, error)
+	CreateRegisterChallenge(context.Context, *proto.CreateRegisterChallengeRequest) (*proto.MFARegisterChallenge, error)
+	AddMFADeviceSync(context.Context, *proto.AddMFADeviceSyncRequest) (*proto.AddMFADeviceSyncResponse, error)
 }
 
-func (d *TestDevice) registerStream(
-	ctx context.Context, clt authClient, devName string, devType proto.DeviceType, authenticator *TestDevice) error {
-	stream, err := clt.AddMFADevice(ctx)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	// Inform device name and type.
-	if err := stream.Send(&proto.AddMFADeviceRequest{
-		Request: &proto.AddMFADeviceRequest_Init{
-			Init: &proto.AddMFADeviceRequestInit{
-				DeviceName: devName,
-				DeviceType: devType,
-			},
+func (d *TestDevice) registerDevice(ctx context.Context, authClient authClientI, devName string, devType proto.DeviceType, authenticator *TestDevice) error {
+	mfaCeremony := &mfa.Ceremony{
+		PromptConstructor: func(opts ...mfa.PromptOpt) mfa.Prompt {
+			return mfa.PromptFunc(func(ctx context.Context, chal *proto.MFAAuthenticateChallenge) (*proto.MFAAuthenticateResponse, error) {
+				return authenticator.SolveAuthn(chal)
+			})
 		},
-	}); err != nil {
-		return trace.Wrap(err)
+		CreateAuthenticateChallenge: authClient.CreateAuthenticateChallenge,
 	}
 
-	// Solve authn challenge.
-	resp, err := stream.Recv()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	authResp, err := authenticator.SolveAuthn(resp.GetExistingMFAChallenge())
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if err := stream.Send(&proto.AddMFADeviceRequest{
-		Request: &proto.AddMFADeviceRequest_ExistingMFAResponse{
-			ExistingMFAResponse: authResp,
+	authnSolved, err := mfaCeremony.Run(ctx, &proto.CreateAuthenticateChallengeRequest{
+		ChallengeExtensions: &mfav1.ChallengeExtensions{
+			Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_MANAGE_DEVICES,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	// Solve register challenge.
-	resp, err = stream.Recv()
+	// Acquire and solve registration challenge.
+	usage := proto.DeviceUsage_DEVICE_USAGE_MFA
+	if d.passwordless {
+		usage = proto.DeviceUsage_DEVICE_USAGE_PASSWORDLESS
+	}
+	registerChal, err := authClient.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+		ExistingMFAResponse: authnSolved,
+		DeviceType:          devType,
+		DeviceUsage:         usage,
+	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	registerResp, err := d.solveRegister(resp.GetNewMFARegisterChallenge())
+	registerSolved, err := d.solveRegister(registerChal)
 	if err != nil {
-		return trace.Wrap(err)
-	}
-	if err := stream.Send(&proto.AddMFADeviceRequest{
-		Request: &proto.AddMFADeviceRequest_NewMFARegisterResponse{
-			NewMFARegisterResponse: registerResp,
-		},
-	}); err != nil {
 		return trace.Wrap(err)
 	}
 
-	// Receive Ack.
-	resp, err = stream.Recv()
+	// Register.
+	addResp, err := authClient.AddMFADeviceSync(ctx, &proto.AddMFADeviceSyncRequest{
+		NewDeviceName:  devName,
+		NewMFAResponse: registerSolved,
+		DeviceUsage:    usage,
+	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if resp.GetAck() == nil {
-		return trace.BadParameter("expected ack, got %T", resp.Response)
-	}
-	d.MFA = resp.GetAck().GetDevice()
+
+	d.MFA = addResp.Device
 	return nil
 }
 
@@ -170,13 +172,13 @@ func (d *TestDevice) solveAuthnKey(c *proto.MFAAuthenticateChallenge) (*proto.MF
 	if c.WebauthnChallenge == nil {
 		return nil, trace.BadParameter("key-based challenge not present")
 	}
-	resp, err := d.Key.SignAssertion(d.Origin(), wanlib.CredentialAssertionFromProto(c.WebauthnChallenge))
+	resp, err := d.Key.SignAssertion(d.Origin(), wantypes.CredentialAssertionFromProto(c.WebauthnChallenge))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return &proto.MFAAuthenticateResponse{
 		Response: &proto.MFAAuthenticateResponse_Webauthn{
-			Webauthn: wanlib.CredentialAssertionResponseToProto(resp),
+			Webauthn: wantypes.CredentialAssertionResponseToProto(resp),
 		},
 	}, nil
 }
@@ -189,9 +191,8 @@ func (d *TestDevice) solveAuthnTOTP(c *proto.MFAAuthenticateChallenge) (*proto.M
 	if d.clock == nil {
 		return nil, trace.BadParameter("clock not set")
 	}
-	if c, ok := d.clock.(clockwork.FakeClock); ok {
-		c.Advance(30 * time.Second)
-	}
+	clocki.Advance(d.clock, 30*time.Second)
+
 	code, err := totp.GenerateCode(d.TOTPSecret, d.clock.Now())
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -214,7 +215,6 @@ func (d *TestDevice) solveRegister(c *proto.MFARegisterChallenge) (*proto.MFAReg
 	default:
 		return nil, trace.BadParameter("unexpected challenge type: %T", c.Request)
 	}
-
 }
 
 func (d *TestDevice) solveRegisterWebauthn(c *proto.MFARegisterChallenge) (*proto.MFARegisterResponse, error) {
@@ -225,13 +225,17 @@ func (d *TestDevice) solveRegisterWebauthn(c *proto.MFARegisterChallenge) (*prot
 	}
 	d.Key.PreferRPID = true
 
-	resp, err := d.Key.SignCredentialCreation(d.Origin(), wanlib.CredentialCreationFromProto(c.GetWebauthn()))
+	if d.passwordless {
+		d.Key.SetPasswordless()
+	}
+
+	resp, err := d.Key.SignCredentialCreation(d.Origin(), wantypes.CredentialCreationFromProto(c.GetWebauthn()))
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return &proto.MFARegisterResponse{
 		Response: &proto.MFARegisterResponse_Webauthn{
-			Webauthn: wanlib.CredentialCreationResponseToProto(resp),
+			Webauthn: wantypes.CredentialCreationResponseToProto(resp),
 		},
 	}, nil
 }
@@ -240,9 +244,7 @@ func (d *TestDevice) solveRegisterTOTP(c *proto.MFARegisterChallenge) (*proto.MF
 	if d.clock == nil {
 		return nil, trace.BadParameter("clock not set")
 	}
-	if c, ok := d.clock.(clockwork.FakeClock); ok {
-		c.Advance(30 * time.Second)
-	}
+	clocki.Advance(d.clock, 30*time.Second)
 
 	if c.GetTOTP().Algorithm != otp.AlgorithmSHA1.String() {
 		return nil, trace.BadParameter("unexpected TOTP challenge algorithm: %s", c.GetTOTP().Algorithm)
@@ -261,6 +263,7 @@ func (d *TestDevice) solveRegisterTOTP(c *proto.MFARegisterChallenge) (*proto.MF
 		Response: &proto.MFARegisterResponse_TOTP{
 			TOTP: &proto.TOTPRegisterResponse{
 				Code: code,
+				ID:   c.GetTOTP().ID,
 			},
 		},
 	}, nil

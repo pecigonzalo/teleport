@@ -31,7 +31,7 @@ type ProtoMarshaler interface {
 	MarshalTo(dAtA []byte) (int, error)
 }
 
-// AuditEvent represents audit event
+// AuditEvent represents an audit event.
 type AuditEvent interface {
 	// ProtoMarshaler implements efficient
 	// protobuf marshaling methods
@@ -49,7 +49,7 @@ type AuditEvent interface {
 
 	// GetType returns event type
 	GetType() string
-	// SetCode sets unique type
+	// SetType sets unique type
 	SetType(string)
 
 	// GetTime returns event time
@@ -69,19 +69,38 @@ type AuditEvent interface {
 	GetClusterName() string
 	// SetClusterName sets the name of the teleport cluster on the event.
 	SetClusterName(string)
+
+	// TrimToMaxSize returns a copy of the event trimmed to a smaller
+	// size. The desired size may not be achievable so callers
+	// should always check the size of the returned event before
+	// using it. Generally fields that are unique to the event
+	// will be trimmed, other fields are not currently modified
+	// (ie *Metadata messages).
+	TrimToMaxSize(maxSizeBytes int) AuditEvent
 }
 
-// Emitter creates and manages audit log streams
+// Emitter emits audit events.
 type Emitter interface {
-	// Emit emits a single audit event
+	// EmitAuditEvent emits a single audit event.
+	//
+	// NOTE: when implementing this interface, the context should have
+	// its cancel stripped via `context.WithoutCancel`
 	EmitAuditEvent(context.Context, AuditEvent) error
+}
+
+// PreparedSessionEvent is an event that has been prepared by
+// a [github.com/gravitational/teleport/lib/events.SessionEventPreparer].
+// More specifically, it is a wrapper around an AuditEvent that signifies
+// the event has been prepared and is ready to be recorded or emitted.
+type PreparedSessionEvent interface {
+	GetAuditEvent() AuditEvent
 }
 
 // Stream is used to create continuous ordered sequence of events
 // associated with a session.
 type Stream interface {
-	// Emitter allows stream to emit audit event in the context of the event stream
-	Emitter
+	// RecordEvent records a single session event if session recording is enabled.
+	RecordEvent(ctx context.Context, event PreparedSessionEvent) error
 	// Status returns channel broadcasting updates about the stream state:
 	// last event index that was uploaded and the upload ID
 	Status() <-chan StreamStatus

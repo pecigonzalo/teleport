@@ -1,41 +1,43 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
+	"testing"
+
 	"github.com/gravitational/trace"
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 )
 
-type AnonymizerSuite struct{}
+func TestHMACAnonymizer(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&AnonymizerSuite{})
-
-func (s *AnonymizerSuite) TestHMACAnonymizer(c *check.C) {
 	a, err := NewHMACAnonymizer(" ")
-	c.Assert(err, check.FitsTypeOf, trace.BadParameter(""))
-	c.Assert(a, check.IsNil)
+	require.IsType(t, err, trace.BadParameter(""))
+	require.Nil(t, a)
 
 	a, err = NewHMACAnonymizer("key")
-	c.Assert(err, check.IsNil)
-	c.Assert(a, check.NotNil)
+	require.NoError(t, err)
+	require.NotNil(t, a)
 
 	data := "secret"
 	result := a.Anonymize([]byte(data))
-	c.Assert(result, check.Not(check.Equals), "")
-	c.Assert(result, check.Not(check.Equals), data)
+	require.NotEmpty(t, result)
+	require.NotEqual(t, result, data)
 }

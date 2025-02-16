@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -20,20 +22,22 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
-
-	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh"
 )
 
 // ActivityTracker is a connection activity tracker,
@@ -56,6 +60,147 @@ type TrackingConn interface {
 	Close() error
 }
 
+// ConnectionMonitorConfig contains dependencies required by
+// the ConnectionMonitor.
+type ConnectionMonitorConfig struct {
+	// AccessPoint is used to retrieve cluster configuration.
+	AccessPoint AccessPoint
+	// LockWatcher ensures lock information is up to date.
+	LockWatcher *services.LockWatcher
+	// Clock is a clock, realtime or fixed in tests.
+	Clock clockwork.Clock
+	// ServerID is the host UUID of the server receiving connections.
+	ServerID string
+	// Emitter allows events to be emitted.
+	Emitter apievents.Emitter
+	// EmitterContext is long-lived context suitable to be used with Emitter
+	EmitterContext context.Context
+	// Logger emits log messages.
+	Logger *slog.Logger
+	// MonitorCloseChannel will be signaled when the monitor closes a connection.
+	// Used only for testing. Optional.
+	MonitorCloseChannel chan struct{}
+}
+
+// CheckAndSetDefaults checks values and sets defaults
+func (c *ConnectionMonitorConfig) CheckAndSetDefaults() error {
+	if c.AccessPoint == nil {
+		return trace.BadParameter("missing parameter AccessPoint")
+	}
+	if c.LockWatcher == nil {
+		return trace.BadParameter("missing parameter LockWatcher")
+	}
+	if c.Logger == nil {
+		return trace.BadParameter("missing parameter Logger")
+	}
+	if c.Emitter == nil {
+		return trace.BadParameter("missing parameter Emitter")
+	}
+	if c.EmitterContext == nil {
+		return trace.BadParameter("missing parameter EmitterContext")
+	}
+	if c.ServerID == "" {
+		return trace.BadParameter("missing parameter ServerID")
+	}
+	if c.Clock == nil {
+		c.Clock = clockwork.NewRealClock()
+	}
+	return nil
+}
+
+// ConnectionMonitor monitors the activity of connections and disconnects
+// them if the certificate expires, if a new lock is placed
+// that applies to the connection, or after periods of inactivity
+type ConnectionMonitor struct {
+	cfg ConnectionMonitorConfig
+}
+
+// NewConnectionMonitor returns a ConnectionMonitor that can be used to monitor
+// connection activity and terminate connections based on various cluster conditions.
+func NewConnectionMonitor(cfg ConnectionMonitorConfig) (*ConnectionMonitor, error) {
+	if err := cfg.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &ConnectionMonitor{cfg: cfg}, nil
+}
+
+func getTrackingReadConn(conn net.Conn) (*TrackingReadConn, bool) {
+	type netConn interface {
+		NetConn() net.Conn
+	}
+
+	for {
+		if tconn, ok := conn.(*TrackingReadConn); ok {
+			return tconn, true
+		}
+
+		connGetter, ok := conn.(netConn)
+		if !ok {
+			return nil, false
+		}
+		conn = connGetter.NetConn()
+	}
+}
+
+// MonitorConn ensures that the provided [net.Conn] is allowed per cluster configuration
+// and security controls. If at any point during the lifetime of the connection the
+// cluster controls dictate that the connection is not permitted it will be closed and the
+// returned [context.Context] will be canceled.
+func (c *ConnectionMonitor) MonitorConn(ctx context.Context, authzCtx *authz.Context, conn net.Conn) (context.Context, net.Conn, error) {
+	authPref, err := c.cfg.AccessPoint.GetAuthPreference(ctx)
+	if err != nil {
+		return ctx, conn, trace.Wrap(err)
+	}
+	netConfig, err := c.cfg.AccessPoint.GetClusterNetworkingConfig(ctx)
+	if err != nil {
+		return ctx, conn, trace.Wrap(err)
+	}
+
+	identity := authzCtx.Identity.GetIdentity()
+	checker := authzCtx.Checker
+
+	idleTimeout := checker.AdjustClientIdleTimeout(netConfig.GetClientIdleTimeout())
+
+	tconn, ok := getTrackingReadConn(conn)
+	if !ok {
+		tctx, cancel := context.WithCancelCause(ctx)
+		tconn, err = NewTrackingReadConn(TrackingReadConnConfig{
+			Conn:    conn,
+			Clock:   c.cfg.Clock,
+			Context: tctx,
+			Cancel:  cancel,
+		})
+		if err != nil {
+			return ctx, conn, trace.Wrap(err)
+		}
+	}
+
+	// Start monitoring client connection. When client connection is closed the monitor goroutine exits.
+	if err := StartMonitor(MonitorConfig{
+		LockWatcher:           c.cfg.LockWatcher,
+		LockTargets:           authzCtx.LockTargets(),
+		LockingMode:           authzCtx.Checker.LockingMode(authPref.GetLockingMode()),
+		DisconnectExpiredCert: authzCtx.GetDisconnectCertExpiry(authPref),
+		ClientIdleTimeout:     idleTimeout,
+		Conn:                  tconn,
+		Tracker:               tconn,
+		Context:               ctx,
+		Clock:                 c.cfg.Clock,
+		ServerID:              c.cfg.ServerID,
+		TeleportUser:          identity.Username,
+		Emitter:               c.cfg.Emitter,
+		EmitterContext:        c.cfg.EmitterContext,
+		Logger:                c.cfg.Logger,
+		IdleTimeoutMessage:    netConfig.GetClientIdleTimeoutMessage(),
+		MonitorCloseChannel:   c.cfg.MonitorCloseChannel,
+	}); err != nil {
+		return ctx, conn, trace.Wrap(err)
+	}
+
+	return tconn.cfg.Context, tconn, nil
+}
+
 // MonitorConfig is a wiretap configuration
 type MonitorConfig struct {
 	// LockWatcher is a lock watcher.
@@ -76,7 +221,8 @@ type MonitorConfig struct {
 	Tracker ActivityTracker
 	// Conn is a connection to close
 	Conn TrackingConn
-	// Context is an external context to cancel the operation
+	// Context is an external context. To reliably close the monitor and ensure no goroutine leak,
+	// make sure to pass a context which will be canceled on time.
 	Context context.Context
 	// Login is linux box login
 	Login string
@@ -86,13 +232,20 @@ type MonitorConfig struct {
 	ServerID string
 	// Emitter is events emitter
 	Emitter apievents.Emitter
-	// Entry is a logging entry
-	Entry log.FieldLogger
+	// EmitterContext is long-lived context suitable to be used with Emitter. Typically, a server exit context will be used here.
+	EmitterContext context.Context
+	// Logger emits log messages.
+	Logger *slog.Logger
 	// IdleTimeoutMessage is sent to the client when the idle timeout expires.
 	IdleTimeoutMessage string
+	// CertificateExpiredMessage is sent to the client when the certificate expires.
+	CertificateExpiredMessage string
 	// MessageWriter wraps a channel to send text messages to the client. Use
 	// for disconnection messages, etc.
 	MessageWriter io.StringWriter
+	// MonitorCloseChannel will be signaled when the monitor closes a connection.
+	// Used only for testing. Optional.
+	MonitorCloseChannel chan struct{}
 }
 
 // CheckAndSetDefaults checks values and sets defaults
@@ -109,14 +262,17 @@ func (m *MonitorConfig) CheckAndSetDefaults() error {
 	if m.Conn == nil {
 		return trace.BadParameter("missing parameter Conn")
 	}
-	if m.Entry == nil {
-		return trace.BadParameter("missing parameter Entry")
+	if m.Logger == nil {
+		return trace.BadParameter("missing parameter Logger")
 	}
 	if m.Tracker == nil {
 		return trace.BadParameter("missing parameter Tracker")
 	}
 	if m.Emitter == nil {
 		return trace.BadParameter("missing parameter Emitter")
+	}
+	if m.EmitterContext == nil {
+		return trace.BadParameter("missing parameter EmitterContext")
 	}
 	if m.Clock == nil {
 		m.Clock = clockwork.NewRealClock()
@@ -141,7 +297,16 @@ func StartMonitor(cfg MonitorConfig) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	go w.start(lockWatch)
+	go func() {
+		w.start(lockWatch)
+		if w.MonitorCloseChannel != nil {
+			// Non blocking send to the close channel.
+			select {
+			case w.MonitorCloseChannel <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	return nil
 }
 
@@ -158,7 +323,7 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 	lockWatchDoneC := lockWatch.Done()
 	defer func() {
 		if err := lockWatch.Close(); err != nil {
-			w.Entry.WithError(err).Warn("Failed to close lock watcher subscription.")
+			w.Logger.WarnContext(w.Context, "Failed to close lock watcher subscription", "error", err)
 		}
 	}()
 
@@ -193,27 +358,24 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 			clientLastActive := w.Tracker.GetClientLastActive()
 			since := w.Clock.Since(clientLastActive)
 			if since >= w.ClientIdleTimeout {
-				reason := "client reported no activity"
+				reason := "Client reported no activity"
 				if !clientLastActive.IsZero() {
-					reason = fmt.Sprintf("client is idle for %v, exceeded idle timeout of %v",
-						since, w.ClientIdleTimeout)
+					reason = fmt.Sprintf("Client exceeded idle timeout of %v", w.ClientIdleTimeout)
 				}
-				if err := w.emitDisconnectEvent(reason); err != nil {
-					w.Entry.WithError(err).Warn("Failed to emit audit event.")
-				}
-				if w.MessageWriter != nil && w.IdleTimeoutMessage != "" {
-					if _, err := w.MessageWriter.WriteString(w.IdleTimeoutMessage); err != nil {
-						w.Entry.WithError(err).Warn("Failed to send idle timeout message.")
+				if w.MessageWriter != nil {
+					msg := w.IdleTimeoutMessage
+					if msg == "" {
+						msg = reason
+					}
+					if _, err := w.MessageWriter.WriteString(msg); err != nil {
+						w.Logger.WarnContext(w.Context, "Failed to send idle timeout message", "error", err)
 					}
 				}
-				w.Entry.Debugf("Disconnecting client: %v", reason)
-				if err := w.Conn.Close(); err != nil {
-					w.Entry.WithError(err).Error("Failed to close connection.")
-				}
+				w.disconnectClient(reason)
 				return
 			}
 			next := w.ClientIdleTimeout - since
-			w.Entry.Debugf("Client activity detected %v ago; next check in %v", since, next)
+			w.Logger.DebugContext(w.Context, "Client activity detected", "last_active", since, "next_check", next)
 			idleTime = w.Clock.After(next)
 
 		// Lock in force.
@@ -223,7 +385,7 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 			case types.OpPut:
 				lock, ok := lockEvent.Resource.(types.Lock)
 				if !ok {
-					w.Entry.Warnf("Skipping unexpected lock event resource type %T.", lockEvent.Resource)
+					w.Logger.WarnContext(w.Context, "Skipping unexpected lock event resource type", "resource_kind", lockEvent.Resource.GetKind())
 				} else {
 					lockErr = services.LockInForceAccessDenied(lock)
 				}
@@ -234,7 +396,7 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 					lockErr = services.StrictLockingModeAccessDenied
 				}
 			default:
-				w.Entry.Warnf("Skipping unexpected lock event type %q.", lockEvent.Type)
+				w.Logger.WarnContext(w.Context, "Skipping unexpected lock event type", "event_type", lockEvent.Type)
 			}
 			if lockErr != nil {
 				w.handleLockInForce(lockErr)
@@ -242,7 +404,7 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 			}
 
 		case <-lockWatchDoneC:
-			w.Entry.WithError(lockWatch.Error()).Warn("Lock watcher subscription was closed.")
+			w.Logger.WarnContext(w.Context, "Lock watcher subscription was closed", "error", lockWatch.Error())
 			if w.DisconnectExpiredCert.IsZero() && w.ClientIdleTimeout == 0 {
 				return
 			}
@@ -250,7 +412,6 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 			lockWatchDoneC = nil
 
 		case <-w.Context.Done():
-			w.Entry.Debugf("Releasing associated resources - context has been closed.")
 			return
 		}
 	}
@@ -258,14 +419,38 @@ func (w *Monitor) start(lockWatch types.Watcher) {
 
 func (w *Monitor) disconnectClientOnExpiredCert() {
 	reason := fmt.Sprintf("client certificate expired at %v", w.Clock.Now().UTC())
+	if w.MessageWriter != nil {
+		msg := w.CertificateExpiredMessage
+		if msg == "" {
+			msg = reason
+		}
+		if _, err := w.MessageWriter.WriteString(msg); err != nil {
+			w.Logger.WarnContext(w.Context, "Failed to send certificate expiration message", "error", err)
+		}
+	}
+	w.disconnectClient(reason)
+}
 
-	w.Entry.Debugf("Disconnecting client: %v", reason)
-	if err := w.Conn.Close(); err != nil {
-		w.Entry.WithError(err).Error("Failed to close connection.")
+type withCauseCloser interface {
+	CloseWithCause(cause error) error
+}
+
+func (w *Monitor) disconnectClient(reason string) {
+	w.Logger.DebugContext(w.Context, "Disconnecting client", "reason", reason)
+
+	if connWithCauseCloser, ok := w.Conn.(withCauseCloser); ok {
+		if err := connWithCauseCloser.CloseWithCause(trace.AccessDenied("%s", reason)); err != nil {
+			w.Logger.ErrorContext(w.Context, "Failed to close connection", "error", err)
+		}
+	} else {
+		if err := w.Conn.Close(); err != nil {
+			w.Logger.ErrorContext(w.Context, "Failed to close connection", "error", err)
+		}
 	}
 
+	// emit audit event after client has been disconnected.
 	if err := w.emitDisconnectEvent(reason); err != nil {
-		w.Entry.WithError(err).Warn("Failed to emit audit event.")
+		w.Logger.WarnContext(w.Context, "Failed to emit audit event", "error", err)
 	}
 }
 
@@ -284,27 +469,22 @@ func (w *Monitor) emitDisconnectEvent(reason string) error {
 			RemoteAddr: w.Conn.RemoteAddr().String(),
 		},
 		ServerMetadata: apievents.ServerMetadata{
-			ServerID: w.ServerID,
+			ServerVersion: teleport.Version,
+			ServerID:      w.ServerID,
 		},
 		Reason: reason,
 	}
-	return trace.Wrap(w.Emitter.EmitAuditEvent(w.Context, event))
+	return trace.Wrap(w.Emitter.EmitAuditEvent(w.EmitterContext, event))
 }
 
 func (w *Monitor) handleLockInForce(lockErr error) {
 	reason := lockErr.Error()
-	if err := w.emitDisconnectEvent(reason); err != nil {
-		w.Entry.WithError(err).Warn("Failed to emit audit event.")
-	}
 	if w.MessageWriter != nil {
 		if _, err := w.MessageWriter.WriteString(reason); err != nil {
-			w.Entry.WithError(err).Warn("Failed to send lock-in-force message.")
+			w.Logger.WarnContext(w.Context, "Failed to send lock-in-force message", "error", err)
 		}
 	}
-	w.Entry.Debugf("Disconnecting client: %v.", reason)
-	if err := w.Conn.Close(); err != nil {
-		w.Entry.WithError(err).Error("Failed to close connection.")
-	}
+	w.disconnectClient(reason)
 }
 
 type trackingChannel struct {
@@ -340,7 +520,7 @@ type TrackingReadConnConfig struct {
 	// Context is an external context to cancel the operation.
 	Context context.Context
 	// Cancel is called whenever client context is closed.
-	Cancel context.CancelFunc
+	Cancel context.CancelCauseFunc
 }
 
 // CheckAndSetDefaults checks and sets defaults.
@@ -387,11 +567,23 @@ type TrackingReadConn struct {
 func (t *TrackingReadConn) Read(b []byte) (int, error) {
 	n, err := t.Conn.Read(b)
 	t.UpdateClientActivity()
-	return n, trace.Wrap(err)
+
+	// This has to use the original error type or else utilities using the connection
+	// (like io.Copy, which is used by the oxy forwarder) may incorrectly categorize
+	// the error produced by this and terminate the connection unnecessarily.
+	return n, err
 }
 
+// Close cancels the context with io.EOF and closes the underlying connection.
 func (t *TrackingReadConn) Close() error {
-	t.cfg.Cancel()
+	t.cfg.Cancel(io.EOF)
+	return t.Conn.Close()
+}
+
+// CloseWithCause cancels the context with provided cause and closes the
+// underlying connection.
+func (t *TrackingReadConn) CloseWithCause(cause error) error {
+	t.cfg.Cancel(cause)
 	return t.Conn.Close()
 }
 
@@ -407,4 +599,31 @@ func (t *TrackingReadConn) UpdateClientActivity() {
 	t.mtx.Lock()
 	defer t.mtx.Unlock()
 	t.lastActive = t.cfg.Clock.Now().UTC()
+}
+
+// See GetDisconnectExpiredCertFromIdentity
+func getDisconnectExpiredCertFromIdentityContext(
+	checker services.AccessChecker,
+	authPref types.AuthPreference,
+	identity *IdentityContext,
+) time.Time {
+	// In the case where both disconnect_expired_cert and require_session_mfa are enabled,
+	// the PreviousIdentityExpires value of the certificate will be used, which is the
+	// expiry of the certificate used to issue the short lived MFA verified certificate.
+	//
+	// See https://github.com/gravitational/teleport/issues/18544
+
+	// If the session doesn't need to be disconnected on cert expiry just return the default value.
+	if !checker.AdjustDisconnectExpiredCert(authPref.GetDisconnectExpiredCert()) {
+		return time.Time{}
+	}
+
+	if !identity.PreviousIdentityExpires.IsZero() {
+		// If this is a short-lived mfa verified cert, return the certificate extension
+		// that holds its' issuing cert's expiry value.
+		return identity.PreviousIdentityExpires
+	}
+
+	// Otherwise just return the current cert's expiration
+	return identity.CertValidBefore
 }

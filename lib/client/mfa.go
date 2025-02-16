@@ -1,252 +1,106 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package client
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"io"
-	"os"
-	"strings"
-	"sync"
 
-	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/lib/utils/prompt"
 	"github.com/gravitational/trace"
 
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
-	wancli "github.com/gravitational/teleport/lib/auth/webauthncli"
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/mfa"
+	libmfa "github.com/gravitational/teleport/lib/client/mfa"
+	"github.com/gravitational/teleport/lib/client/sso"
 )
 
-type (
-	OTPPrompt func(ctx context.Context, out io.Writer, in prompt.Reader, question string) (string, error)
-	WebPrompt func(
-		ctx context.Context,
-		origin, user string,
-		assertion *wanlib.CredentialAssertion,
-		prompt wancli.LoginPrompt) (*proto.MFAAuthenticateResponse, string, error)
-)
-
-// PlatformPrompt groups functions that prompt the user for inputs.
-// It's purpose is to allow tests to replace actual user prompts with other
-// functions.
-type PlatformPrompt struct {
-	// OTP is the OTP prompt function.
-	OTP OTPPrompt
-	// Webauthn is the WebAuth prompt function.
-	Webauthn WebPrompt
+// NewMFACeremony returns a new MFA ceremony configured for this client.
+func (tc *TeleportClient) NewMFACeremony() *mfa.Ceremony {
+	return &mfa.Ceremony{
+		CreateAuthenticateChallenge: tc.createAuthenticateChallenge,
+		PromptConstructor:           tc.NewMFAPrompt,
+		SSOMFACeremonyConstructor:   tc.NewSSOMFACeremony,
+	}
 }
 
-func (pp *PlatformPrompt) Reset() *PlatformPrompt {
-	pp.Swap(prompt.Input, wancli.Login)
-	return pp
+// createAuthenticateChallenge creates and returns MFA challenges for a users registered MFA devices.
+func (tc *TeleportClient) createAuthenticateChallenge(ctx context.Context, req *proto.CreateAuthenticateChallengeRequest) (*proto.MFAAuthenticateChallenge, error) {
+	clusterClient, err := tc.ConnectToCluster(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	rootClient, err := clusterClient.ConnectToRootCluster(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return rootClient.CreateAuthenticateChallenge(ctx, req)
 }
 
-func (pp *PlatformPrompt) Swap(otp OTPPrompt, web WebPrompt) {
-	pp.OTP = otp
-	pp.Webauthn = web
+// WebauthnLoginFunc is a function that performs WebAuthn login.
+// Mimics the signature of [webauthncli.Login].
+type WebauthnLoginFunc = libmfa.WebauthnLoginFunc
+
+// NewMFAPrompt creates a new MFA prompt from client settings.
+func (tc *TeleportClient) NewMFAPrompt(opts ...mfa.PromptOpt) mfa.Prompt {
+	cfg := tc.newPromptConfig(opts...)
+
+	var prompt mfa.Prompt = libmfa.NewCLIPrompt(&libmfa.CLIPromptConfig{
+		PromptConfig:     *cfg,
+		Writer:           tc.Stderr,
+		PreferOTP:        tc.PreferOTP,
+		PreferSSO:        tc.PreferSSO,
+		AllowStdinHijack: tc.AllowStdinHijack,
+		StdinFunc:        tc.StdinFunc,
+	})
+
+	if tc.MFAPromptConstructor != nil {
+		prompt = tc.MFAPromptConstructor(cfg)
+	}
+
+	return prompt
 }
 
-var prompts = (&PlatformPrompt{}).Reset()
+func (tc *TeleportClient) newPromptConfig(opts ...mfa.PromptOpt) *libmfa.PromptConfig {
+	cfg := libmfa.NewPromptConfig(tc.WebProxyAddr, opts...)
+	cfg.AuthenticatorAttachment = tc.AuthenticatorAttachment
+	if tc.WebauthnLogin != nil {
+		cfg.WebauthnLoginFunc = tc.WebauthnLogin
+		cfg.WebauthnSupported = true
+	}
 
-type noopPrompt struct{}
-
-func (p noopPrompt) PromptPIN() (string, error) {
-	// TODO(codingllama): Revisit? There may be authenticators out there that disagree.
-	// The main issue with PIN prompts in MFA is that prompts.OTP hijacks Stdin,
-	// so we'd have to make that into a password read and redirect it into either
-	// an OTP (not sensitive) or a PIN (sensitive).
-	return "", errors.New("PIN not supported for MFA")
+	return cfg
 }
 
-func (p noopPrompt) PromptAdditionalTouch() error {
-	return errors.New("additional touches not supported for MFA")
-}
-
-// PromptMFAChallenge prompts the user to complete MFA authentication
-// challenges.
-//
-// If promptDevicePrefix is set, it will be printed in prompts before "security
-// key" or "device". This is used to emphasize between different kinds of
-// devices, like registered vs new.
-func PromptMFAChallenge(
-	ctx context.Context,
-	proxyAddr string, c *proto.MFAAuthenticateChallenge, promptDevicePrefix string, quiet bool) (*proto.MFAAuthenticateResponse, error) {
-	// Is there a challenge present?
-	if c.TOTP == nil && c.WebauthnChallenge == nil {
-		return &proto.MFAAuthenticateResponse{}, nil
+// NewSSOMFACeremony creates a new SSO MFA ceremony.
+func (tc *TeleportClient) NewSSOMFACeremony(ctx context.Context) (mfa.SSOMFACeremony, error) {
+	rdConfig, err := tc.ssoRedirectorConfig(ctx, "" /*connectorDisplayName*/)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	hasTOTP := c.TOTP != nil
-	hasWebauthn := c.WebauthnChallenge != nil
-
-	// Does the current platform support hardware MFA? Adjust accordingly.
-	switch {
-	case !hasTOTP && !wancli.HasPlatformSupport():
-		return nil, trace.BadParameter("hardware device MFA not supported by your platform, please register an OTP device")
-	case !wancli.HasPlatformSupport():
-		// Do not prompt for hardware devices, it won't work.
-		hasWebauthn = false
+	rd, err := sso.NewRedirector(rdConfig)
+	if err != nil {
+		return nil, trace.Wrap(err, "failed to create a redirector for SSO MFA")
 	}
 
-	var numGoroutines int
-	if hasTOTP && hasWebauthn {
-		numGoroutines = 2
-	} else {
-		numGoroutines = 1
+	if tc.SSOMFACeremonyConstructor != nil {
+		return tc.SSOMFACeremonyConstructor(rd), nil
 	}
 
-	type response struct {
-		kind string
-		resp *proto.MFAAuthenticateResponse
-		err  error
-	}
-	respC := make(chan response, numGoroutines)
-
-	// Use ctx and wg to clean up after ourselves.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var wg sync.WaitGroup
-	cancelAndWait := func() {
-		cancel()
-		wg.Wait()
-	}
-
-	// Fire TOTP goroutine.
-	if hasTOTP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			const kind = "TOTP"
-			var msg string
-			if !quiet {
-				if hasWebauthn {
-					msg = fmt.Sprintf("Tap any %[1]ssecurity key or enter a code from a %[1]sOTP device", promptDevicePrefix, promptDevicePrefix)
-				} else {
-					msg = fmt.Sprintf("Enter an OTP code from a %sdevice", promptDevicePrefix)
-				}
-			}
-			code, err := prompts.OTP(ctx, os.Stderr, prompt.Stdin(), msg)
-			if err != nil {
-				respC <- response{kind: kind, err: err}
-				return
-			}
-			respC <- response{
-				kind: kind,
-				resp: &proto.MFAAuthenticateResponse{
-					Response: &proto.MFAAuthenticateResponse_TOTP{
-						TOTP: &proto.TOTPResponse{Code: code},
-					},
-				},
-			}
-		}()
-	} else if !quiet {
-		fmt.Fprintf(os.Stderr, "Tap any %ssecurity key\n", promptDevicePrefix)
-	}
-
-	// Fire Webauthn goroutine.
-	if hasWebauthn {
-		origin := proxyAddr
-		if !strings.HasPrefix(origin, "https://") {
-			origin = "https://" + origin
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			log.Debugf("WebAuthn: prompting devices with origin %q", origin)
-			const user = ""       // No ambiguity in MFA prompts.
-			var prompt noopPrompt // No PINs or additional touches required for MFA.
-			resp, _, err := prompts.Webauthn(ctx, origin, user, wanlib.CredentialAssertionFromProto(c.WebauthnChallenge), prompt)
-			respC <- response{kind: "WEBAUTHN", resp: resp, err: err}
-		}()
-	}
-
-	for i := 0; i < numGoroutines; i++ {
-		select {
-		case resp := <-respC:
-			if err := resp.err; err != nil {
-				log.WithError(err).Debugf("%s authentication failed", resp.kind)
-				continue
-			}
-
-			if hasTOTP {
-				fmt.Fprintln(os.Stderr) // Print a new line after the prompt
-			}
-
-			// Cleanup in-flight goroutines.
-			cancelAndWait()
-			return resp.resp, nil
-		case <-ctx.Done():
-			cancelAndWait()
-			return nil, trace.Wrap(ctx.Err())
-		}
-	}
-	cancelAndWait()
-	return nil, trace.BadParameter(
-		"failed to authenticate using all MFA devices, rerun the command with '-d' to see error details for each device")
-}
-
-// MFAAuthenticateChallenge is an MFA authentication challenge sent on user
-// login / authentication ceremonies.
-type MFAAuthenticateChallenge struct {
-	// WebauthnChallenge contains a WebAuthn credential assertion used for
-	// login/authentication ceremonies.
-	WebauthnChallenge *wanlib.CredentialAssertion `json:"webauthn_challenge"`
-	// TOTPChallenge specifies whether TOTP is supported for this user.
-	TOTPChallenge bool `json:"totp_challenge"`
-}
-
-// MakeAuthenticateChallenge converts proto to JSON format.
-func MakeAuthenticateChallenge(protoChal *proto.MFAAuthenticateChallenge) *MFAAuthenticateChallenge {
-	chal := &MFAAuthenticateChallenge{
-		TOTPChallenge: protoChal.GetTOTP() != nil,
-	}
-	if protoChal.GetWebauthnChallenge() != nil {
-		chal.WebauthnChallenge = wanlib.CredentialAssertionFromProto(protoChal.WebauthnChallenge)
-	}
-	return chal
-}
-
-type TOTPRegisterChallenge struct {
-	QRCode []byte `json:"qrCode"`
-}
-
-// MFARegisterChallenge is an MFA register challenge sent on new MFA register.
-type MFARegisterChallenge struct {
-	// Webauthn contains webauthn challenge.
-	Webauthn *wanlib.CredentialCreation `json:"webauthn"`
-	// TOTP contains TOTP challenge.
-	TOTP *TOTPRegisterChallenge `json:"totp"`
-}
-
-// MakeRegisterChallenge converts proto to JSON format.
-func MakeRegisterChallenge(protoChal *proto.MFARegisterChallenge) *MFARegisterChallenge {
-	switch protoChal.GetRequest().(type) {
-	case *proto.MFARegisterChallenge_TOTP:
-		return &MFARegisterChallenge{
-			TOTP: &TOTPRegisterChallenge{
-				QRCode: protoChal.GetTOTP().GetQRCode(),
-			},
-		}
-	case *proto.MFARegisterChallenge_Webauthn:
-		return &MFARegisterChallenge{
-			Webauthn: wanlib.CredentialCreationFromProto(protoChal.GetWebauthn()),
-		}
-	}
-	return nil
+	return sso.NewCLIMFACeremony(rd), nil
 }

@@ -1,31 +1,38 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package db contains methods for working with database connection profiles
 // that combine connection parameters for a particular database.
 //
 // For Postgres it's the connection service file:
-//   https://www.postgresql.org/docs/current/libpq-pgservice.html
+//
+//	https://www.postgresql.org/docs/current/libpq-pgservice.html
 //
 // For MySQL it's the option file:
-//   https://dev.mysql.com/doc/refman/8.0/en/option-files.html
+//
+//	https://dev.mysql.com/doc/refman/8.0/en/option-files.html
 package db
 
 import (
+	"context"
 	"fmt"
+
+	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/client/db/mysql"
@@ -33,25 +40,19 @@ import (
 	"github.com/gravitational/teleport/lib/client/db/profile"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/tlsca"
-
-	"github.com/gravitational/trace"
 )
 
 // Add updates database connection profile file.
-func Add(tc *client.TeleportClient, db tlsca.RouteToDatabase, clientProfile client.ProfileStatus) error {
-	// Out of supported databases, only Postgres and MySQL have a concept
-	// of the connection options file.
-	switch db.Protocol {
-	case defaults.ProtocolPostgres, defaults.ProtocolMySQL:
-	default:
+func Add(ctx context.Context, tc *client.TeleportClient, db tlsca.RouteToDatabase, clientProfile client.ProfileStatus) error {
+	if !IsSupported(db) {
 		return nil
 	}
-	profileFile, err := load(db)
+	profileFile, err := load(tc, db)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	rootClusterName, err := tc.RootClusterName()
+	rootClusterName, err := tc.RootClusterName(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -93,13 +94,13 @@ func New(tc *client.TeleportClient, db tlsca.RouteToDatabase, clientProfile clie
 		Insecure:   tc.InsecureSkipVerify,
 		CACertPath: clientProfile.CACertPathForCluster(rootCluster),
 		CertPath:   clientProfile.DatabaseCertPathForCluster(tc.SiteName, db.ServiceName),
-		KeyPath:    clientProfile.KeyPath(),
+		KeyPath:    clientProfile.DatabaseKeyPathForCluster(tc.SiteName, db.ServiceName),
 	}
 }
 
 // Env returns environment variables for the specified database profile.
 func Env(tc *client.TeleportClient, db tlsca.RouteToDatabase) (map[string]string, error) {
-	profileFile, err := load(db)
+	profileFile, err := load(tc, db)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -112,14 +113,10 @@ func Env(tc *client.TeleportClient, db tlsca.RouteToDatabase) (map[string]string
 
 // Delete removes the specified database connection profile.
 func Delete(tc *client.TeleportClient, db tlsca.RouteToDatabase) error {
-	// Out of supported databases, only Postgres and MySQL have a concept
-	// of the connection options file.
-	switch db.Protocol {
-	case defaults.ProtocolPostgres, defaults.ProtocolMySQL:
-	default:
+	if !IsSupported(db) {
 		return nil
 	}
-	profileFile, err := load(db)
+	profileFile, err := load(tc, db)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -130,12 +127,30 @@ func Delete(tc *client.TeleportClient, db tlsca.RouteToDatabase) error {
 	return nil
 }
 
+// IsSupported checks if provided database is supported.
+func IsSupported(db tlsca.RouteToDatabase) bool {
+	// Out of supported databases, only Postgres and MySQL have a concept
+	// of the connection options file.
+	switch db.Protocol {
+	case defaults.ProtocolPostgres, defaults.ProtocolMySQL:
+		return true
+	default:
+		return false
+	}
+}
+
 // load loads the appropriate database connection profile.
-func load(db tlsca.RouteToDatabase) (profile.ConnectProfileFile, error) {
+func load(tc *client.TeleportClient, db tlsca.RouteToDatabase) (profile.ConnectProfileFile, error) {
 	switch db.Protocol {
 	case defaults.ProtocolPostgres:
+		if tc.OverridePostgresServiceFilePath != "" {
+			return postgres.LoadFromPath(tc.OverridePostgresServiceFilePath)
+		}
 		return postgres.Load()
 	case defaults.ProtocolMySQL:
+		if tc.OverrideMySQLOptionFilePath != "" {
+			return mysql.LoadFromPath(tc.OverrideMySQLOptionFilePath)
+		}
 		return mysql.Load()
 	}
 	return nil, trace.BadParameter("unsupported database protocol %q",

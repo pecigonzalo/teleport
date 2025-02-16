@@ -1,18 +1,20 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -21,14 +23,12 @@ import (
 	"testing"
 	"time"
 
-	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/fixtures"
-	"github.com/gravitational/teleport/lib/utils"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/check.v1"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestMain(m *testing.M) {
@@ -36,57 +36,56 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-type ServicesSuite struct {
-}
-
-func TestServices(t *testing.T) { check.TestingT(t) }
-
-var _ = check.Suite(&ServicesSuite{})
-
 // TestOptions tests command options operations
-func (s *ServicesSuite) TestOptions(c *check.C) {
+func TestOptions(t *testing.T) {
+	t.Parallel()
+
 	// test empty scenario
 	out := AddOptions(nil)
-	c.Assert(out, check.HasLen, 0)
+	require.Empty(t, out)
 
 	// make sure original option list is not affected
-	in := []MarshalOption{}
-	out = AddOptions(in, WithResourceID(1))
-	c.Assert(out, check.HasLen, 1)
-	c.Assert(in, check.HasLen, 0)
+	var in []MarshalOption
+	out = AddOptions(in, WithRevision("abc"))
+	require.Len(t, out, 1)
+	require.Empty(t, in)
 	cfg, err := CollectOptions(out)
-	c.Assert(err, check.IsNil)
-	c.Assert(cfg.ID, check.Equals, int64(1))
+	require.NoError(t, err)
+	require.Equal(t, "abc", cfg.Revision)
 
 	// Add a couple of other parameters
-	out = AddOptions(in, WithResourceID(2), WithVersion(types.V2))
-	c.Assert(out, check.HasLen, 2)
-	c.Assert(in, check.HasLen, 0)
+	out = AddOptions(in, WithVersion(types.V2), WithRevision("xyz"))
+	require.Len(t, out, 2)
+	require.Empty(t, in)
 	cfg, err = CollectOptions(out)
-	c.Assert(err, check.IsNil)
-	c.Assert(cfg.ID, check.Equals, int64(2))
-	c.Assert(cfg.Version, check.Equals, types.V2)
+	require.NoError(t, err)
+	require.Equal(t, types.V2, cfg.Version)
+	require.Equal(t, "xyz", cfg.Revision)
 }
 
 // TestCommandLabels tests command labels
-func (s *ServicesSuite) TestCommandLabels(c *check.C) {
+func TestCommandLabels(t *testing.T) {
+	t.Parallel()
+
 	var l CommandLabels
 	out := l.Clone()
-	c.Assert(out, check.HasLen, 0)
+	require.Empty(t, out)
 
 	label := &types.CommandLabelV2{Command: []string{"ls", "-l"}, Period: types.Duration(time.Second)}
 	l = CommandLabels{"a": label}
 	out = l.Clone()
 
-	c.Assert(out, check.HasLen, 1)
-	fixtures.DeepCompare(c, out["a"], label)
+	require.Len(t, out, 1)
+	require.Empty(t, cmp.Diff(out["a"], label))
 
 	// make sure it's not a shallow copy
 	label.Command[0] = "/bin/ls"
-	c.Assert(label.Command[0], check.Not(check.Equals), out["a"].GetCommand())
+	require.NotEqual(t, label.Command[0], out["a"].GetCommand())
 }
 
-func (s *ServicesSuite) TestLabelKeyValidation(c *check.C) {
+func TestLabelKeyValidation(t *testing.T) {
+	t.Parallel()
+
 	tts := []struct {
 		label string
 		ok    bool
@@ -96,17 +95,18 @@ func (s *ServicesSuite) TestLabelKeyValidation(c *check.C) {
 		{label: "this-that", ok: true},
 		{label: "8675309", ok: true},
 		{label: "", ok: false},
-		{label: "spam:eggs", ok: false},
+		{label: "spam:eggs", ok: true},
 		{label: "cats dogs", ok: false},
 		{label: "wut?", ok: false},
 	}
 	for _, tt := range tts {
-		c.Assert(types.IsValidLabelKey(tt.label), check.Equals, tt.ok, check.Commentf("tt=%+v", tt))
+		require.Equal(t, types.IsValidLabelKey(tt.label), tt.ok)
 	}
 }
 
 func TestServerDeepCopy(t *testing.T) {
 	t.Parallel()
+
 	// setup
 	now := time.Date(1984, time.April, 4, 0, 0, 0, 0, time.UTC)
 	expires := now.Add(1 * time.Hour)
@@ -133,33 +133,6 @@ func TestServerDeepCopy(t *testing.T) {
 				GracePeriod: types.Duration(1 * time.Minute),
 				LastRotated: now.Add(-1 * time.Minute),
 			},
-			Apps: []*types.App{
-				{
-					Name:         "app",
-					StaticLabels: map[string]string{"label": "value"},
-					DynamicLabels: map[string]types.CommandLabelV2{
-						"app-cmd": {
-							Period:  types.Duration(1 * time.Second),
-							Command: []string{"app-cmd", "--app-flag"},
-						},
-					},
-					Rewrite: &types.Rewrite{
-						Redirect: []string{"host1", "host2"},
-					},
-				},
-			},
-			KubernetesClusters: []*types.KubernetesCluster{
-				{
-					Name:         "cluster",
-					StaticLabels: map[string]string{"label": "value"},
-					DynamicLabels: map[string]types.CommandLabelV2{
-						"cmd": {
-							Period:  types.Duration(1 * time.Second),
-							Command: []string{"cmd", "--flag"},
-						},
-					},
-				},
-			},
 		},
 	}
 
@@ -168,7 +141,7 @@ func TestServerDeepCopy(t *testing.T) {
 
 	// verify
 	require.Empty(t, cmp.Diff(srv, srv2))
-	require.IsType(t, srv2, &types.ServerV2{})
+	require.IsType(t, &types.ServerV2{}, srv2)
 
 	// Mutate the second value but expect the original to be unaffected
 	srv2.(*types.ServerV2).Metadata.Labels["foo"] = "bar"

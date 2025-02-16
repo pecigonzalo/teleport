@@ -1,18 +1,20 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -23,17 +25,12 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 )
 
-type KeepAliveSuite struct{}
+func TestServerClose(t *testing.T) {
+	t.Parallel()
 
-var _ = check.Suite(&KeepAliveSuite{})
-
-func TestSrv(t *testing.T) { check.TestingT(t) }
-
-func (s *KeepAliveSuite) TestServerClose(c *check.C) {
 	doneCh := make(chan bool, 1)
 	closeContext, closeCancel := context.WithCancel(context.Background())
 
@@ -57,7 +54,7 @@ func (s *KeepAliveSuite) TestServerClose(c *check.C) {
 
 	// Wait for a keep-alive to be sent.
 	err := waitForRequests(requestSender, 1)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Close the context (server), should cause the loop to stop as well.
 	closeCancel()
@@ -65,12 +62,14 @@ func (s *KeepAliveSuite) TestServerClose(c *check.C) {
 	// Wait 1 second for the keep-alive loop to stop, or return an error.
 	select {
 	case <-time.After(1 * time.Second):
-		c.Fatalf("Timeout waiting for keep-alive loop to stop.")
+		t.Fatalf("Timeout waiting for keep-alive loop to stop.")
 	case <-doneCh:
 	}
 }
 
-func (s *KeepAliveSuite) TestLoopClose(c *check.C) {
+func TestLoopClose(t *testing.T) {
+	t.Parallel()
+
 	doneCh := make(chan bool, 1)
 	closeContext, closeCancel := context.WithCancel(context.Background())
 
@@ -94,12 +93,12 @@ func (s *KeepAliveSuite) TestLoopClose(c *check.C) {
 
 	// Wait for a keep-alive to be sent.
 	err := waitForRequests(requestSender, 1)
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	// Wait 1 second for the keep-alive loop to stop, or return an error.
 	select {
 	case <-time.After(1 * time.Second):
-		c.Fatalf("Timeout waiting for keep-alive loop to stop.")
+		t.Fatalf("Timeout waiting for keep-alive loop to stop.")
 	case <-doneCh:
 	}
 }
@@ -123,8 +122,8 @@ func waitForRequests(requestSender *testRequestSender, count int) error {
 }
 
 type testRequestSender struct {
+	count int64 // intentionally placed first to ensure 64-bit alignment
 	reply bool
-	count int64
 }
 
 func (n *testRequestSender) SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error) {

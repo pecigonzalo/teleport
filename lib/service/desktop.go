@@ -1,78 +1,70 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package service
 
 import (
 	"crypto/tls"
+	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 
 	"github.com/gravitational/trace"
-	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/windows"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/multiplexer"
 	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/desktop"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
 func (process *TeleportProcess) initWindowsDesktopService() {
-	log := process.log.WithFields(logrus.Fields{
-		trace.Component: teleport.Component(teleport.ComponentWindowsDesktop, process.id),
-	})
-	process.registerWithAuthServer(types.RoleWindowsDesktop, WindowsDesktopIdentityEvent)
+	logger := process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentWindowsDesktop, process.id))
+	process.RegisterWithAuthServer(types.RoleWindowsDesktop, WindowsDesktopIdentityEvent)
 	process.RegisterCriticalFunc("windows_desktop.init", func() error {
-		eventsC := make(chan Event)
-		process.WaitForEvent(process.ExitContext(), WindowsDesktopIdentityEvent, eventsC)
-
-		var event Event
-		select {
-		case event = <-eventsC:
-			log.Debugf("Received event %q.", event.Name)
-		case <-process.ExitContext().Done():
-			log.Debug("Process is exiting.")
-			return nil
+		conn, err := process.WaitForConnector(WindowsDesktopIdentityEvent, logger)
+		if conn == nil {
+			return trace.Wrap(err)
 		}
 
-		conn, ok := (event.Payload).(*Connector)
-		if !ok {
-			return trace.BadParameter("unsupported connector type: %T", event.Payload)
-		}
-
-		err := process.initWindowsDesktopServiceRegistered(log, conn)
-		if err != nil {
-			warnOnErr(conn.Close(), log)
+		if err := process.initWindowsDesktopServiceRegistered(logger, conn); err != nil {
+			warnOnErr(process.ExitContext(), conn.Close(), logger)
 			return trace.Wrap(err)
 		}
 		return nil
 	})
 }
 
-func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.Entry, conn *Connector) (retErr error) {
+func (process *TeleportProcess) initWindowsDesktopServiceRegistered(logger *slog.Logger, conn *Connector) (retErr error) {
 	defer func() {
 		if err := process.closeImportedDescriptors(teleport.ComponentWindowsDesktop); err != nil {
-			log.WithError(err).Warn("Failed closing imported file descriptors.")
+			logger.WarnContext(process.ExitContext(), "Failed closing imported file descriptors.")
 		}
 	}()
 	cfg := process.Config
@@ -82,6 +74,8 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	proxyGetter := reversetunnel.NewConnectedProxyGetter()
 
 	useTunnel := conn.UseTunnel()
 	// This service can run in 2 modes:
@@ -97,40 +91,41 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 	// Filter out cases where both listen_addr and tunnel are set or both are
 	// not set.
 	case useTunnel && !cfg.WindowsDesktop.ListenAddr.IsEmpty():
-		return trace.BadParameter("either set windows_desktop_service.listen_addr if this process can be reached from a teleport proxy or point teleport.auth_servers to a proxy to dial out, but don't set both")
+		return trace.BadParameter("either set windows_desktop_service.listen_addr if this process can be reached from a teleport proxy or point teleport.proxy_server to a proxy to dial out, but don't set both")
 	case !useTunnel && cfg.WindowsDesktop.ListenAddr.IsEmpty():
-		return trace.BadParameter("set windows_desktop_service.listen_addr if this process can be reached from a teleport proxy or point teleport.auth_servers to a proxy to dial out")
+		return trace.BadParameter("set windows_desktop_service.listen_addr if this process can be reached from a teleport proxy or point teleport.proxy_server to a proxy to dial out")
 
 	// Start a local listener and let proxies dial in.
 	case !useTunnel && !cfg.WindowsDesktop.ListenAddr.IsEmpty():
-		log.Info("Using local listener and registering directly with auth server")
-		listener, err = process.importOrCreateListener(listenerWindowsDesktop, cfg.WindowsDesktop.ListenAddr.Addr)
+		logger.InfoContext(process.ExitContext(), "Using local listener and registering directly with auth server")
+		listener, err = process.importOrCreateListener(ListenerWindowsDesktop, cfg.WindowsDesktop.ListenAddr.Addr)
 		if err != nil {
 			return trace.Wrap(err)
 		}
 		defer func() {
 			if retErr != nil {
-				warnOnErr(listener.Close(), log)
+				warnOnErr(process.ExitContext(), listener.Close(), logger)
 			}
 		}()
 
 	// Dialed out to a proxy, start servicing the reverse tunnel as a listener.
 	case useTunnel && cfg.WindowsDesktop.ListenAddr.IsEmpty():
 		// create an adapter, from reversetunnel.ServerHandler to net.Listener.
-		shtl := reversetunnel.NewServerHandlerToListener(reversetunnel.LocalWindowsDesktop)
+		shtl := reversetunnel.NewServerHandlerToListener(reversetunnelclient.LocalWindowsDesktop)
 		listener = shtl
 		agentPool, err = reversetunnel.NewAgentPool(
 			process.ExitContext(),
 			reversetunnel.AgentPoolConfig{
-				Component:   teleport.ComponentWindowsDesktop,
-				HostUUID:    conn.ServerIdentity.ID.HostUUID,
-				Resolver:    conn.TunnelProxyResolver(),
-				Client:      conn.Client,
-				AccessPoint: accessPoint,
-				HostSigner:  conn.ServerIdentity.KeySigner,
-				Cluster:     conn.ServerIdentity.Cert.Extensions[utils.CertExtensionAuthority],
-				Server:      shtl,
-				FIPS:        process.Config.FIPS,
+				Component:            teleport.ComponentWindowsDesktop,
+				HostUUID:             conn.HostID(),
+				Resolver:             conn.TunnelProxyResolver(),
+				Client:               conn.Client,
+				AccessPoint:          accessPoint,
+				AuthMethods:          conn.ClientAuthMethods(),
+				Cluster:              conn.ClusterName(),
+				Server:               shtl,
+				FIPS:                 process.Config.FIPS,
+				ConnectedProxyGetter: proxyGetter,
 			})
 		if err != nil {
 			return trace.Wrap(err)
@@ -143,13 +138,13 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 				agentPool.Stop()
 			}
 		}()
-		log.Info("Using a reverse tunnel to register and handle proxy connections")
+		logger.InfoContext(process.ExitContext(), "Using a reverse tunnel to register and handle proxy connections")
 	}
 
 	lockWatcher, err := services.NewLockWatcher(process.ExitContext(), services.LockWatcherConfig{
 		ResourceWatcherConfig: services.ResourceWatcherConfig{
 			Component: teleport.ComponentWindowsDesktop,
-			Log:       log,
+			Logger:    process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentWindowsDesktop, process.id)),
 			Clock:     cfg.Clock,
 			Client:    conn.Client,
 		},
@@ -158,14 +153,24 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 		return trace.Wrap(err)
 	}
 
-	clusterName := conn.ServerIdentity.Cert.Extensions[utils.CertExtensionAuthority]
+	clusterName := conn.ClusterName()
 
-	authorizer, err := auth.NewAuthorizer(clusterName, accessPoint, lockWatcher)
+	authorizer, err := authz.NewAuthorizer(authz.AuthorizerOpts{
+		ClusterName: clusterName,
+		AccessPoint: accessPoint,
+		LockWatcher: lockWatcher,
+		Logger:      process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentWindowsDesktop, process.id)),
+		DeviceAuthorization: authz.DeviceAuthorizationOpts{
+			// Ignore the global device_trust.mode toggle, but allow role-based
+			// settings to be applied.
+			DisableGlobalMode: true,
+		},
+	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	tlsConfig, err := conn.ServerIdentity.TLSConfig(cfg.CipherSuites)
+	tlsConfig, err := conn.ServerTLSConfig(cfg.CipherSuites)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -177,10 +182,10 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 		if info.ServerName != "" {
 			clusterName, err = apiutils.DecodeClusterName(info.ServerName)
 			if err != nil && !trace.IsNotFound(err) {
-				log.Debugf("Ignoring unsupported cluster name %q.", info.ServerName)
+				logger.DebugContext(process.ExitContext(), "Ignoring unsupported cluster name.", "cluster_name", info.ServerName)
 			}
 		}
-		pool, err := auth.ClientCertPool(accessPoint, clusterName)
+		pool, _, _, err := authclient.DefaultClientCertPool(info.Context(), accessPoint, clusterName)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -189,10 +194,8 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 		return tlsCopy, nil
 	}
 
-	connLimiter, err := limiter.NewConnectionsLimiter(cfg.WindowsDesktop.ConnLimiter)
-	if err != nil {
-		return trace.Wrap(err)
-	}
+	connLimiter := limiter.NewConnectionsLimiter(cfg.WindowsDesktop.ConnLimiter.MaxConnections)
+
 	var publicAddr string
 	switch {
 	case useTunnel:
@@ -207,7 +210,8 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 
 	srv, err := desktop.NewWindowsService(desktop.WindowsServiceConfig{
 		DataDir:      process.Config.DataDir,
-		Log:          log,
+		LicenseStore: process.storage,
+		Logger:       process.logger.With(teleport.ComponentKey, teleport.Component(teleport.ComponentWindowsDesktop, process.id)),
 		Clock:        process.Clock,
 		Authorizer:   authorizer,
 		Emitter:      conn.Client,
@@ -216,41 +220,62 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 		ConnLimiter:  connLimiter,
 		LockWatcher:  lockWatcher,
 		AuthClient:   conn.Client,
+		Labels:       cfg.WindowsDesktop.Labels,
 		HostLabelsFn: cfg.WindowsDesktop.HostLabels.LabelsForHost,
 		Heartbeat: desktop.HeartbeatConfig{
 			HostUUID:    cfg.HostUUID,
 			PublicAddr:  publicAddr,
-			StaticHosts: cfg.WindowsDesktop.Hosts,
-			OnHeartbeat: process.onHeartbeat(teleport.ComponentWindowsDesktop),
+			StaticHosts: cfg.WindowsDesktop.StaticHosts,
+			OnHeartbeat: process.OnHeartbeat(teleport.ComponentWindowsDesktop),
 		},
-		LDAPConfig:           desktop.LDAPConfig(cfg.WindowsDesktop.LDAP),
-		DiscoveryBaseDN:      cfg.WindowsDesktop.Discovery.BaseDN,
-		DiscoveryLDAPFilters: cfg.WindowsDesktop.Discovery.Filters,
-		Hostname:             cfg.Hostname,
+		ShowDesktopWallpaper:         cfg.WindowsDesktop.ShowDesktopWallpaper,
+		LDAPConfig:                   windows.LDAPConfig(cfg.WindowsDesktop.LDAP),
+		KDCAddr:                      cfg.WindowsDesktop.KDCAddr,
+		PKIDomain:                    cfg.WindowsDesktop.PKIDomain,
+		DiscoveryBaseDN:              cfg.WindowsDesktop.Discovery.BaseDN,
+		DiscoveryLDAPFilters:         cfg.WindowsDesktop.Discovery.Filters,
+		DiscoveryLDAPAttributeLabels: cfg.WindowsDesktop.Discovery.LabelAttributes,
+		Hostname:                     cfg.Hostname,
+		ConnectedProxyGetter:         proxyGetter,
+		ResourceMatchers:             cfg.WindowsDesktop.ResourceMatchers,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	defer func() {
 		if retErr != nil {
-			warnOnErr(srv.Close(), log)
+			warnOnErr(process.ExitContext(), srv.Close(), logger)
 		}
 	}()
 	process.RegisterCriticalFunc("windows_desktop.serve", func() error {
 		if useTunnel {
-			log.Info("Starting Windows desktop service via proxy reverse tunnel.")
-			utils.Consolef(cfg.Console, log, teleport.ComponentWindowsDesktop,
-				"Windows desktop service %s:%s is starting via proxy reverse tunnel.",
-				teleport.Version, teleport.Gitref)
+			logger.InfoContext(process.ExitContext(), "Starting Windows desktop service via proxy reverse tunnel.")
 		} else {
-			log.Infof("Starting Windows desktop service on %v.", listener.Addr())
-			utils.Consolef(cfg.Console, log, teleport.ComponentWindowsDesktop,
-				"Windows desktop service %s:%s is starting on %v.",
-				teleport.Version, teleport.Gitref, listener.Addr())
+			logger.InfoContext(process.ExitContext(), "Starting Windows desktop service.", "listen_address", listener.Addr())
 		}
-		err := srv.Serve(listener)
+		process.BroadcastEvent(Event{Name: WindowsDesktopReady, Payload: nil})
+
+		mux, err := multiplexer.New(multiplexer.Config{
+			Context:             process.ExitContext(),
+			Listener:            listener,
+			PROXYProtocolMode:   multiplexer.PROXYProtocolOff, // Desktop service never should process unsigned PROXY headers.
+			ID:                  teleport.Component(teleport.ComponentWindowsDesktop),
+			CertAuthorityGetter: accessPoint.GetCertAuthority,
+			LocalClusterName:    clusterName,
+		})
 		if err != nil {
-			if err == http.ErrServerClosed {
+			return trace.Wrap(err)
+		}
+
+		go func() {
+			if err := mux.Serve(); err != nil && !utils.IsOKNetworkError(err) {
+				process.logger.ErrorContext(process.ExitContext(), "mux encountered error serving", "mux_id", mux.ID, "error", err)
+			}
+		}()
+
+		err = srv.Serve(mux.TLS())
+		if err != nil {
+			if errors.Is(err, http.ErrServerClosed) {
 				return nil
 			}
 			return trace.Wrap(err)
@@ -261,16 +286,16 @@ func (process *TeleportProcess) initWindowsDesktopServiceRegistered(log *logrus.
 	// Cleanup, when process is exiting.
 	process.OnExit("windows_desktop.shutdown", func(payload interface{}) {
 		// Fast shutdown.
-		warnOnErr(srv.Close(), log)
+		warnOnErr(process.ExitContext(), srv.Close(), logger)
 		agentPool.Stop()
 		if payload != nil {
 			// Graceful shutdown.
 			agentPool.Wait()
 		}
-		warnOnErr(listener.Close(), log)
-		warnOnErr(conn.Close(), log)
+		warnOnErr(process.ExitContext(), listener.Close(), logger)
+		warnOnErr(process.ExitContext(), conn.Close(), logger)
 
-		log.Info("Exited.")
+		logger.InfoContext(process.ExitContext(), "Exited.")
 	})
 	return nil
 }

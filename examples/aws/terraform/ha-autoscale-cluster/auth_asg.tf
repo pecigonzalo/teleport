@@ -10,8 +10,12 @@ resource "aws_autoscaling_group" "auth" {
   health_check_type         = "EC2"
   desired_capacity          = length(local.azs)
   force_delete              = false
-  launch_configuration      = aws_launch_configuration.auth.name
   vpc_zone_identifier       = aws_subnet.auth.*.id
+
+  launch_template {
+    name    = aws_launch_template.auth.name
+    version = aws_launch_template.auth.latest_version
+  }
 
   // These are target groups of the auth server network load balancer
   // this autoscaling group is associated with target groups of the NLB
@@ -29,6 +33,26 @@ resource "aws_autoscaling_group" "auth" {
     propagate_at_launch = true
   }
 
+  dynamic "tag" {
+    for_each = data.aws_default_tags.this.tags
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+
+  dynamic "instance_refresh" {
+    for_each = var.enable_auth_asg_instance_refresh ? [1] : []
+    content {
+      strategy = "Rolling"
+      preferences {
+        auto_rollback          = false
+        min_healthy_percentage = 0
+      }
+    }
+  }
+
   // external autoscale algos can modify these values,
   // so ignore changes to them
   lifecycle {
@@ -40,36 +64,67 @@ resource "aws_autoscaling_group" "auth" {
   }
 }
 
-resource "aws_launch_configuration" "auth" {
+resource "aws_launch_template" "auth" {
   lifecycle {
     create_before_destroy = true
   }
-  name_prefix                 = "${var.cluster_name}-auth-"
-  image_id                    = data.aws_ami.base.id
-  instance_type               = var.auth_instance_type
-  user_data                   = templatefile(
+  name_prefix   = "${var.cluster_name}-auth-"
+  image_id      = data.aws_ami.base.id
+  instance_type = var.auth_instance_type
+  user_data = base64encode(templatefile(
     "${path.module}/auth-user-data.tpl",
     {
       region                   = var.region
       locks_table_name         = aws_dynamodb_table.locks.name
       auth_server_addr         = aws_lb.auth.dns_name
+      teleport_auth_type       = var.teleport_auth_type
       cluster_name             = var.cluster_name
       dynamo_table_name        = aws_dynamodb_table.teleport.name
       dynamo_events_table_name = aws_dynamodb_table.teleport_events.name
       email                    = var.email
       domain_name              = var.route53_domain
       s3_bucket                = var.s3_bucket_name
-      influxdb_addr            = "http://${aws_lb.monitor.dns_name}:8086"
       license_path             = var.license_path
-      telegraf_version         = var.telegraf_version
       teleport_uid             = var.teleport_uid
       use_acm                  = var.use_acm
+      use_tls_routing          = var.use_tls_routing
     }
-  )
-  key_name                    = var.key_name
-  ebs_optimized               = true
-  associate_public_ip_address = false
-  security_groups             = [aws_security_group.auth.id]
-  iam_instance_profile        = aws_iam_instance_profile.auth.id
-}
+  ))
 
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      delete_on_termination = true
+      encrypted             = true
+      iops                  = 3000
+      throughput            = 125
+      volume_type           = "gp3"
+    }
+  }
+
+  key_name      = var.key_name
+  ebs_optimized = true
+
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.auth.id]
+  }
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.auth.name
+  }
+
+  dynamic "tag_specifications" {
+    for_each = ["instance", "volume", "network-interface"]
+    content {
+      resource_type = tag_specifications.value
+      tags          = data.aws_default_tags.this.tags
+    }
+  }
+}

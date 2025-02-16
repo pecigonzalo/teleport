@@ -1,36 +1,47 @@
 /*
-Copyright 2019-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package utils
 
 import (
+	"bytes"
 	"crypto/x509"
 	"fmt"
 	"io"
-	"strings"
+	"log/slog"
 	"testing"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gravitational/trace"
-
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
 func TestUserMessageFromError(t *testing.T) {
-	t.Skip("Enable after https://drone.gravitational.io/gravitational/teleport/3517 is merged.")
+	// Behavior is different in debug
+	defaultLogger := slog.Default()
+
+	var leveler slog.LevelVar
+	leveler.Set(slog.LevelInfo)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: &leveler})))
+	t.Cleanup(func() {
+		slog.SetDefault(defaultLogger)
+	})
+
 	tests := []struct {
 		comment   string
 		inError   error
@@ -48,28 +59,21 @@ func TestUserMessageFromError(t *testing.T) {
 		},
 		{
 			comment:   "outputs user message as provided",
-			inError:   trace.Errorf("\x1b[1mWARNING\x1b[0m"),
-			outString: `error: "\x1b[1mWARNING\x1b[0m"`,
+			inError:   trace.Errorf("bad thing occurred"),
+			outString: "\x1b[31mERROR: \x1b[0mbad thing occurred",
 		},
 	}
 
 	for _, tt := range tests {
 		message := UserMessageFromError(tt.inError)
-		require.True(t, strings.HasPrefix(message, tt.outString), tt.comment)
+		require.Contains(t, message, tt.outString)
 	}
-}
-
-// Regressions test - Consolef used to panic when component name was longer
-// than 8 bytes.
-func TestConsolefLongComponent(t *testing.T) {
-	require.NotPanics(t, func() {
-		component := strings.Repeat("na ", 10) + "batman!"
-		Consolef(io.Discard, logrus.New(), component, "test message")
-	})
 }
 
 // TestEscapeControl tests escape control
 func TestEscapeControl(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		in  string
 		out string
@@ -93,8 +97,10 @@ func TestEscapeControl(t *testing.T) {
 	}
 }
 
-// TestAllowNewlines tests escape control that allows newlines
-func TestAllowNewlines(t *testing.T) {
+// TestAllowWhitespace tests escape control that allows (some) whitespace characters.
+func TestAllowWhitespace(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		in  string
 		out string
@@ -108,20 +114,131 @@ func TestAllowNewlines(t *testing.T) {
 			out: "hello,\nworld!",
 		},
 		{
+			in:  "\thello, world!",
+			out: "\thello, world!",
+		},
+		{
+			in:  "\t\thello, world!",
+			out: "\t\thello, world!",
+		},
+		{
+			in:  "hello, world!\n",
+			out: "hello, world!\n",
+		},
+		{
+			in:  "hello, world!\n\n",
+			out: "hello, world!\n\n",
+		},
+		{
+			in:  string([]byte{0x68, 0x00, 0x68}),
+			out: "\"h\\x00h\"",
+		},
+		{
+			in:  string([]byte{0x68, 0x08, 0x68}),
+			out: "\"h\\bh\"",
+		},
+		{
+			in:  string([]int32{0x00000008, 0x00000009, 0x00000068}),
+			out: "\"\\b\"\th",
+		},
+		{
+			in:  string([]int32{0x00000090}),
+			out: "\"\\u0090\"",
+		},
+		{
 			in:  "hello,\r\tworld!",
-			out: `"hello,\r\tworld!"`,
+			out: `"hello,\r"` + "\tworld!",
 		},
 		{
 			in:  "hello,\n\r\tworld!",
-			out: "hello,\n" + `"\r\tworld!"`,
+			out: "hello,\n" + `"\r"` + "\tworld!",
 		},
 		{
 			in:  "hello,\t\n\r\tworld!",
-			out: `"hello,\t"` + "\n" + `"\r\tworld!"`,
+			out: "hello,\t\n" + `"\r"` + "\tworld!",
 		},
 	}
 
 	for i, tt := range tests {
-		require.Equal(t, tt.out, AllowNewlines(tt.in), fmt.Sprintf("test case %v", i))
+		require.Equal(t, tt.out, AllowWhitespace(tt.in), fmt.Sprintf("test case %v", i))
+	}
+}
+
+func TestUpdateAppUsageTemplate(t *testing.T) {
+	makeApp := func(usageWriter io.Writer) *kingpin.Application {
+		app := InitCLIParser("TestUpdateAppUsageTemplate", "some help message")
+		app.UsageWriter(usageWriter)
+		app.Terminate(func(int) {})
+
+		app.Command("hello", "Hello.")
+
+		create := app.Command("create", "Create.")
+		create.Command("box", "Box.")
+		create.Command("rocket", "Rocket.")
+		return app
+	}
+
+	tests := []struct {
+		name           string
+		inputArgs      []string
+		outputContains string
+	}{
+		{
+			name:      "command width aligned for app help",
+			inputArgs: []string{},
+			outputContains: `
+Commands:
+  help          Show help.
+  hello         Hello.
+  create box    Box.
+  create rocket Rocket.
+`,
+		},
+		{
+			name:      "command width aligned for command help",
+			inputArgs: []string{"create"},
+			outputContains: `
+Commands:
+  create box    Box.
+  create rocket Rocket.
+`,
+		},
+		{
+			name:      "command width aligned for unknown command error",
+			inputArgs: []string{"unknown"},
+			outputContains: `
+Commands:
+  help          Show help.
+  hello         Hello.
+  create box    Box.
+  create rocket Rocket.
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Run("help flag", func(t *testing.T) {
+				var buffer bytes.Buffer
+				app := makeApp(&buffer)
+				args := append(tt.inputArgs, "--help")
+				UpdateAppUsageTemplate(app, args)
+
+				app.Usage(args)
+				require.Contains(t, buffer.String(), tt.outputContains)
+			})
+
+			t.Run("help command", func(t *testing.T) {
+				var buffer bytes.Buffer
+				app := makeApp(&buffer)
+				args := append([]string{"help"}, tt.inputArgs...)
+				UpdateAppUsageTemplate(app, args)
+
+				// HelpCommand is triggered on PreAction during Parse.
+				// See kingpin.Application.init for more details.
+				_, err := app.Parse(args)
+				require.NoError(t, err)
+				require.Contains(t, buffer.String(), tt.outputContains)
+			})
+		})
 	}
 }

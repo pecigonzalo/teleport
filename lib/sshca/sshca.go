@@ -1,44 +1,118 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package sshca specifies interfaces for SSH certificate authorities
 package sshca
 
 import (
-	"github.com/gravitational/teleport/lib/services"
+	"time"
+
+	"github.com/gravitational/trace"
+	"golang.org/x/crypto/ssh"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
 )
 
 // Authority implements minimal key-management facility for generating OpenSSH
 // compatible public/private key pairs and OpenSSH certificates
 type Authority interface {
-	// GenerateKeyPair generates new keypair
-	GenerateKeyPair(passphrase string) (privKey []byte, pubKey []byte, err error)
-
-	// GetNewKeyPairFromPool returns new keypair from pre-generated in memory pool
-	GetNewKeyPairFromPool() (privKey []byte, pubKey []byte, err error)
-
 	// GenerateHostCert takes the private key of the CA, public key of the new host,
 	// along with metadata (host ID, node name, cluster name, roles, and ttl) and generates
 	// a host certificate.
-	GenerateHostCert(certParams services.HostCertParams) ([]byte, error)
+	GenerateHostCert(HostCertificateRequest) ([]byte, error)
 
-	// GenerateUserCert generates user certificate, it takes pkey as a signing
+	// GenerateUserCert generates user ssh certificate, it takes pkey as a signing
 	// private key (user certificate authority)
-	GenerateUserCert(certParams services.UserCertParams) ([]byte, error)
+	GenerateUserCert(UserCertificateRequest) ([]byte, error)
+}
 
-	// Close will close the key-management facility.
-	Close()
+// HostCertificateRequest is a request to generate a new ssh host certificate.
+type HostCertificateRequest struct {
+	// CASigner is the signer that will sign the public key of the host with the CA private key
+	CASigner ssh.Signer
+	// PublicHostKey is the public key of the host
+	PublicHostKey []byte
+	// HostID is used by Teleport to uniquely identify a node within a cluster (this is used to help infill
+	// Identity.Princiapals and is not a standalone cert field).
+	HostID string
+	// NodeName is the DNS name of the node (this is used to help infill Identity.Princiapals and is not a
+	// standalone cert field).
+	NodeName string
+	// TTL defines how long a certificate is valid for
+	TTL time.Duration
+	// Identity is the host identity to be encoded in the certificate.
+	Identity Identity
+}
+
+func (r *HostCertificateRequest) Check() error {
+	if r.CASigner == nil {
+		return trace.BadParameter("ssh host certificate request missing ca signer")
+	}
+	if r.HostID == "" && len(r.Identity.Principals) == 0 {
+		return trace.BadParameter("ssh host certificate request missing host ID and principals")
+	}
+	if r.Identity.ClusterName == "" {
+		return trace.BadParameter("ssh host certificate request missing cluster name")
+	}
+	if r.Identity.ValidBefore != 0 {
+		return trace.BadParameter("ValidBefore should not be set in host cert requests (derived from TTL)")
+	}
+	if r.Identity.ValidAfter != 0 {
+		return trace.BadParameter("ValidAfter should not be set in host cert requests (derived from TTL)")
+	}
+	if err := r.Identity.SystemRole.Check(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
+}
+
+// UserCertificateRequest is a request to generate a new ssh user certificate.
+type UserCertificateRequest struct {
+	// CASigner is the signer that will sign the public key of the user with the CA private key
+	CASigner ssh.Signer
+	// PublicUserKey is the public key of the user in SSH authorized_keys format.
+	PublicUserKey []byte
+	// TTL defines how long a certificate is valid for (if specified, ValidAfter/ValidBefore within the
+	// identity must not be set).
+	TTL time.Duration
+	// CertificateFormat is the format of the SSH certificate.
+	CertificateFormat string
+	// Identity is the user identity to be encoded in the certificate.
+	Identity Identity
+}
+
+func (r *UserCertificateRequest) CheckAndSetDefaults() error {
+	if r.CASigner == nil {
+		return trace.BadParameter("ssh user certificate request missing ca signer")
+	}
+	if r.TTL < apidefaults.MinCertDuration {
+		r.TTL = apidefaults.MinCertDuration
+	}
+	if len(r.Identity.Principals) == 0 {
+		return trace.BadParameter("ssh user identity missing allowed logins")
+	}
+	if r.Identity.ValidBefore != 0 {
+		return trace.BadParameter("ValidBefore should not be set in user cert requests (derived from TTL)")
+	}
+	if r.Identity.ValidAfter != 0 {
+		return trace.BadParameter("ValidAfter should not be set in user cert requests (derived from TTL)")
+	}
+
+	return nil
 }

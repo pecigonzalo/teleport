@@ -2,20 +2,22 @@
 // +build linux
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package cgroup
 
@@ -27,6 +29,7 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -34,31 +37,34 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
+	"github.com/gravitational/trace"
 	"golang.org/x/sys/unix"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/lib/defaults"
-
-	"github.com/gravitational/trace"
-
-	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
+	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
-var log = logrus.WithFields(logrus.Fields{
-	trace.Component: teleport.ComponentCgroup,
-})
+var logger = logutils.NewPackageLogger(teleport.ComponentKey, teleport.ComponentCgroup)
 
 // Config holds configuration for the cgroup service.
 type Config struct {
 	// MountPath is where the cgroupv2 hierarchy is mounted.
 	MountPath string
+	// RootPath directory where the Teleport managed cgroups are going to be
+	// placed.
+	RootPath string
 }
 
 // CheckAndSetDefaults checks BPF configuration.
 func (c *Config) CheckAndSetDefaults() error {
 	if c.MountPath == "" {
 		c.MountPath = defaults.CgroupPath
+	}
+	if c.RootPath == "" {
+		c.RootPath = teleportRoot
 	}
 	return nil
 }
@@ -81,7 +87,7 @@ func New(config *Config) (*Service, error) {
 
 	s := &Service{
 		Config:       config,
-		teleportRoot: filepath.Join(config.MountPath, teleportRoot, uuid.New().String()),
+		teleportRoot: filepath.Join(config.MountPath, config.RootPath, uuid.New().String()),
 	}
 
 	// Mount the cgroup2 filesystem.
@@ -90,15 +96,21 @@ func New(config *Config) (*Service, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	log.Debugf("Teleport session hierarchy mounted at: %v.", s.teleportRoot)
+	logger.DebugContext(context.TODO(), "Teleport session hierarchy mounted.", "hierarchy_root", s.teleportRoot)
 	return s, nil
 }
 
-// Close will unmount the cgroup filesystem.
-func (s *Service) Close() error {
+// Close will clean up the session cgroups and unmount the cgroup2 filesystem,
+// unless otherwise requested.
+func (s *Service) Close(skipUnmount bool) error {
 	err := s.cleanupHierarchy()
 	if err != nil {
 		return trace.Wrap(err)
+	}
+
+	if skipUnmount {
+		logger.DebugContext(context.TODO(), "Cleaned up Teleport session hierarchy.", "hierarchy_root", s.teleportRoot)
+		return nil
 	}
 
 	err = s.unmount()
@@ -106,7 +118,7 @@ func (s *Service) Close() error {
 		return trace.Wrap(err)
 	}
 
-	log.Debugf("Cleaned up and unmounted Teleport session hierarchy at: %v.", s.teleportRoot)
+	logger.DebugContext(context.TODO(), "Cleaned up and unmounted Teleport session hierarchy.", "hierarchy_root", s.teleportRoot)
 	return nil
 }
 
@@ -141,11 +153,11 @@ func (s *Service) Remove(sessionID string) error {
 		return trace.Wrap(err)
 	}
 
-	log.Debugf("Removed cgroup for session: %v.", sessionID)
+	logger.DebugContext(context.TODO(), "Removed cgroup for session.", "session_id", sessionID)
 	return nil
 }
 
-// Place  place a process in the cgroup for that session.
+// Place places a process in the cgroup for that session.
 func (s *Service) Place(sessionID string, pid int) error {
 	// Open cgroup.procs file for the cgroup.
 	filepath := filepath.Join(s.teleportRoot, sessionID, cgroupProcs)
@@ -161,13 +173,13 @@ func (s *Service) Place(sessionID string, pid int) error {
 		return trace.Wrap(err)
 	}
 
-	return nil
+	return trace.Wrap(f.Sync())
 }
 
 // readPids returns a slice of PIDs from a file. Used to get list of all PIDs
 // within a cgroup.
 func readPids(path string) ([]string, error) {
-	f, err := os.Open(path)
+	f, err := utils.OpenFileNoUnsafeLinks(path)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -178,7 +190,8 @@ func readPids(path string) ([]string, error) {
 	for scanner.Scan() {
 		pids = append(pids, scanner.Text())
 	}
-	if scanner.Err() != nil {
+	err = scanner.Err()
+	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -201,7 +214,7 @@ func writePids(path string, pids []string) error {
 		}
 	}
 
-	return nil
+	return trace.Wrap(f.Sync())
 }
 
 // cleanupHierarchy removes any cgroups for any exisiting sessions.
@@ -215,12 +228,17 @@ func (s *Service) cleanupHierarchy() error {
 			return nil
 		}
 
-		// Extract the session ID. Skip over cgroup.procs files not for sessions.
-		parts := strings.Split(path, string(filepath.Separator))
-		if len(parts) != 5 {
+		// Trim the path at which the cgroup hierarchy is mounted. This will
+		// remove the UUID used in the mount path for this cgroup hierarchy.
+		cleanpath := strings.TrimPrefix(path, filepath.Clean(s.teleportRoot))
+
+		// Extract the session ID from the remaining parts of the path that
+		// should look like ["" UUID cgroup.procs].
+		parts := strings.Split(cleanpath, string(os.PathSeparator))
+		if len(parts) != 3 {
 			return nil
 		}
-		sessionID, err := uuid.Parse(parts[3])
+		sessionID, err := uuid.Parse(parts[1])
 		if err != nil {
 			return nil
 		}
@@ -301,7 +319,7 @@ func (s *Service) mount() error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	log.Debugf("Mounted cgroup filesystem to %v.", s.MountPath)
+	logger.DebugContext(context.TODO(), "Mounted cgroup filesystem.", "mount_path", s.MountPath)
 
 	// Create cgroup that will hold Teleport sessions.
 	err = os.MkdirAll(s.teleportRoot, fileMode)

@@ -1,42 +1,41 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package concurrentqueue
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 // TestOrdering verifies that the queue yields items in the order of
 // insertion, rather than the order of completion.
 func TestOrdering(t *testing.T) {
 	const testItems = 1024
 
-	q := New(func(v interface{}) interface{} {
+	q := New(func(v int) int {
 		// introduce a short random delay to ensure that work
 		// completes out of order.
-		time.Sleep(time.Duration(rand.Int63n(int64(time.Millisecond * 12))))
+		time.Sleep(rand.N(time.Millisecond * 12))
 		return v
 	}, Workers(10))
 	t.Cleanup(func() { require.NoError(t, q.Close()) })
@@ -47,9 +46,7 @@ func TestOrdering(t *testing.T) {
 		// verify that queue outputs items in expected order
 		for i := 0; i < testItems; i++ {
 			itm := <-q.Pop()
-			val, ok := itm.(int)
-			require.True(t, ok)
-			require.Equal(t, i, val)
+			assert.Equal(t, i, itm)
 		}
 	}()
 
@@ -135,9 +132,9 @@ func runBackpressureScenario(t *testing.T, tt bpt) {
 	done := make(chan struct{})
 	defer close(done)
 
-	workfn := func(v interface{}) interface{} {
+	workfn := func(v int) int {
 		// simulate a blocking worker if necessary
-		if tt.deadlock || (tt.headOfLine && v.(int) == 0) {
+		if tt.deadlock || (tt.headOfLine && v == 0) {
 			<-done
 		}
 		return v
@@ -168,16 +165,16 @@ func runBackpressureScenario(t *testing.T, tt bpt) {
 }
 
 /*
-goos: linux
+goos: darwin
 goarch: amd64
 pkg: github.com/gravitational/teleport/lib/utils/concurrentqueue
-cpu: Intel(R) Core(TM) i9-10885H CPU @ 2.40GHz
-BenchmarkQueue-16    	     193	   6192192 ns/op
+cpu: Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz
+BenchmarkQueue-16    	     156	   7342841 ns/op
 */
 func BenchmarkQueue(b *testing.B) {
 	const workers = 16
 	const iters = 4096
-	workfn := func(v interface{}) interface{} {
+	workfn := func(v int) int {
 		// XXX: should we be doing something to
 		// add noise here?
 		return v

@@ -1,28 +1,29 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package protocol
 
 import (
 	"fmt"
 
+	"github.com/gravitational/trace"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
-
-	"github.com/gravitational/trace"
 )
 
 // MessageOpReply represents parsed OP_REPLY wire message.
@@ -49,7 +50,7 @@ func MakeOpReply(document bsoncore.Document) *MessageOpReply {
 	}
 }
 
-// MakeOpReply is a shorthand to create OP_REPLY message from a single document
+// MakeOpReplyWithFlags is a shorthand to create OP_REPLY message from a single document
 // with provided flags.
 func MakeOpReplyWithFlags(document bsoncore.Document, flags wiremessage.ReplyFlag) *MessageOpReply {
 	return &MessageOpReply{
@@ -123,7 +124,7 @@ func readOpReply(header MessageHeader, payload []byte) (*MessageOpReply, error) 
 	if !ok {
 		return nil, trace.BadParameter("malformed OP_REPLY: missing number returned %v", payload)
 	}
-	documents, _, ok := wiremessage.ReadReplyDocuments(rem)
+	documents, _, ok := ReadReplyDocuments(rem)
 	if !ok {
 		return nil, trace.BadParameter("malformed OP_REPLY: missing documents %v", payload)
 	}
@@ -136,6 +137,26 @@ func readOpReply(header MessageHeader, payload []byte) (*MessageOpReply, error) 
 		Documents:      documents,
 		bytes:          append(header.bytes[:], payload...),
 	}, nil
+}
+
+// ReadReplyDocuments reads multiple documents from the source.
+//
+// This function works in the same way as wiremessage.ReadReplyDocuments except, it can handle document of size 0.
+// When a document of size 0 is passed to wiremessage.ReadReplyDocuments, it will keep creating empty documents until
+// it uses all system memory/application crash.
+func ReadReplyDocuments(src []byte) (docs []bsoncore.Document, rem []byte, ok bool) {
+	rem = src
+	for {
+		var doc bsoncore.Document
+		doc, rem, ok = bsoncore.ReadDocument(rem)
+		if !ok || len(doc) == 0 {
+			break
+		}
+
+		docs = append(docs, doc)
+	}
+
+	return docs, rem, true
 }
 
 // ToWire converts this message to wire protocol message bytes.

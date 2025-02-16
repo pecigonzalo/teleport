@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package reversetunnel
 
@@ -22,14 +24,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/services"
-
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	log "github.com/sirupsen/logrus"
+
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/services/readonly"
 )
 
 func newClusterPeers(clusterName string) *clusterPeers {
@@ -79,7 +82,7 @@ func (p *clusterPeers) removePeer(connInfo types.TunnelConnection) {
 	delete(p.peers, connInfo.GetName())
 }
 
-func (p *clusterPeers) CachingAccessPoint() (auth.RemoteProxyAccessPoint, error) {
+func (p *clusterPeers) CachingAccessPoint() (authclient.RemoteProxyAccessPoint, error) {
 	peer, err := p.pickPeer()
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -87,7 +90,23 @@ func (p *clusterPeers) CachingAccessPoint() (auth.RemoteProxyAccessPoint, error)
 	return peer.CachingAccessPoint()
 }
 
-func (p *clusterPeers) GetClient() (auth.ClientI, error) {
+func (p *clusterPeers) NodeWatcher() (*services.GenericWatcher[types.Server, readonly.Server], error) {
+	peer, err := p.pickPeer()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return peer.NodeWatcher()
+}
+
+func (p *clusterPeers) GitServerWatcher() (*services.GenericWatcher[types.Server, readonly.Server], error) {
+	peer, err := p.pickPeer()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return peer.GitServerWatcher()
+}
+
+func (p *clusterPeers) GetClient() (authclient.ClientI, error) {
 	peer, err := p.pickPeer()
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -119,35 +138,32 @@ func (p *clusterPeers) GetLastConnected() time.Time {
 	return peer.GetLastConnected()
 }
 
-func (p *clusterPeers) DialAuthServer() (net.Conn, error) {
+func (p *clusterPeers) DialAuthServer(reversetunnelclient.DialParams) (net.Conn, error) {
 	return nil, trace.ConnectionProblem(nil, "unable to dial to auth server, this proxy has not been discovered yet, try again later")
 }
 
 // Dial is used to connect a requesting client (say, tsh) to an SSH server
 // located in a remote connected site, the connection goes through the
 // reverse proxy tunnel.
-func (p *clusterPeers) Dial(params DialParams) (conn net.Conn, err error) {
+func (p *clusterPeers) Dial(params reversetunnelclient.DialParams) (conn net.Conn, err error) {
 	return p.DialTCP(params)
 }
 
-func (p *clusterPeers) DialTCP(params DialParams) (conn net.Conn, err error) {
+func (p *clusterPeers) DialTCP(params reversetunnelclient.DialParams) (conn net.Conn, err error) {
 	return nil, trace.ConnectionProblem(nil, "unable to dial, this proxy has not been discovered yet, try again later")
 }
 
 // IsClosed always returns false because clusterPeers is never closed.
 func (p *clusterPeers) IsClosed() bool { return false }
 
+// Close always returns nil because a clusterPeers isn't closed.
+func (p *clusterPeers) Close() error { return nil }
+
 // newClusterPeer returns new cluster peer
 func newClusterPeer(srv *server, connInfo types.TunnelConnection, offlineThreshold time.Duration) (*clusterPeer, error) {
 	clusterPeer := &clusterPeer{
-		srv:      srv,
-		connInfo: connInfo,
-		log: log.WithFields(log.Fields{
-			trace.Component: teleport.ComponentReverseTunnelServer,
-			trace.ComponentFields: map[string]string{
-				"cluster": connInfo.GetClusterName(),
-			},
-		}),
+		srv:              srv,
+		connInfo:         connInfo,
 		clock:            clockwork.NewRealClock(),
 		offlineThreshold: offlineThreshold,
 	}
@@ -158,8 +174,6 @@ func newClusterPeer(srv *server, connInfo types.TunnelConnection, offlineThresho
 // clusterPeer is a remote cluster that has established
 // a tunnel to the peers
 type clusterPeer struct {
-	log *log.Entry
-
 	mu       sync.Mutex
 	connInfo types.TunnelConnection
 	srv      *server
@@ -184,11 +198,19 @@ func (s *clusterPeer) setConnInfo(ci types.TunnelConnection) {
 	s.connInfo = ci
 }
 
-func (s *clusterPeer) CachingAccessPoint() (auth.RemoteProxyAccessPoint, error) {
+func (s *clusterPeer) CachingAccessPoint() (authclient.RemoteProxyAccessPoint, error) {
 	return nil, trace.ConnectionProblem(nil, "unable to fetch access point, this proxy %v has not been discovered yet, try again later", s)
 }
 
-func (s *clusterPeer) GetClient() (auth.ClientI, error) {
+func (s *clusterPeer) NodeWatcher() (*services.GenericWatcher[types.Server, readonly.Server], error) {
+	return nil, trace.ConnectionProblem(nil, "unable to fetch node watcher, this proxy %v has not been discovered yet, try again later", s)
+}
+
+func (s *clusterPeer) GitServerWatcher() (*services.GenericWatcher[types.Server, readonly.Server], error) {
+	return nil, trace.ConnectionProblem(nil, "unable to fetch git server watcher, this proxy %v has not been discovered yet, try again later", s)
+}
+
+func (s *clusterPeer) GetClient() (authclient.ClientI, error) {
 	return nil, trace.ConnectionProblem(nil, "unable to fetch client, this proxy %v has not been discovered yet, try again later", s)
 }
 
@@ -219,7 +241,7 @@ func (s *clusterPeer) GetLastConnected() time.Time {
 // Dial is used to connect a requesting client (say, tsh) to an SSH server
 // located in a remote connected site, the connection goes through the
 // reverse proxy tunnel.
-func (s *clusterPeer) Dial(params DialParams) (conn net.Conn, err error) {
+func (s *clusterPeer) Dial(params reversetunnelclient.DialParams) (conn net.Conn, err error) {
 	return nil, trace.ConnectionProblem(nil, "unable to dial, this proxy %v has not been discovered yet, try again later", s)
 }
 

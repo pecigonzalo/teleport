@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package main
 
@@ -22,30 +24,24 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/gravitational/teleport/api/constants"
-	"github.com/gravitational/teleport/tool/tbot/botfs"
-	"github.com/gravitational/teleport/tool/tbot/config"
-	"github.com/gravitational/teleport/tool/tbot/identity"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+
+	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/lib/tbot/botfs"
+	"github.com/gravitational/teleport/lib/tbot/cli"
+	"github.com/gravitational/teleport/lib/tbot/config"
+	"github.com/gravitational/teleport/lib/tbot/identity"
 )
 
 // usernamesToTry contains a list of usernames we can use as ACL targets in
 // testing.
 var usernamesToTry = []string{"nobody", "ci", "root"}
-
-func contains(entries []string, entry string) bool {
-	for _, e := range entries {
-		if e == entry {
-			return true
-		}
-	}
-
-	return false
-}
 
 // filterUsers returns the input list of usernames except for those in the
 // exclude list.
@@ -53,7 +49,7 @@ func filterUsers(usernames, exclude []string) []string {
 	ret := []string{}
 
 	for _, username := range usernames {
-		if !contains(exclude, username) {
+		if !slices.Contains(exclude, username) {
 			ret = append(ret, username)
 		}
 	}
@@ -110,17 +106,23 @@ func getACLOptions() (*botfs.ACLOptions, error) {
 	}, nil
 }
 
-// testConfigFromCLI creates a BotConfig from the given CLI config.
-func testConfigFromCLI(t *testing.T, cf *config.CLIConf) *config.BotConfig {
-	cfg, err := config.FromCLIConf(cf)
+// testConfigFromString parses a YAML config file from a string.
+func testConfigFromString(t *testing.T, yamlStr string) *config.BotConfig {
+	// Load YAML to validate syntax.
+	cfg, err := config.ReadConfig(strings.NewReader(yamlStr), false)
+	require.NoError(t, err)
+	require.NoError(t, cfg.CheckAndSetDefaults())
+
+	// Reencode as a string
+	out := &strings.Builder{}
+	enc := yaml.NewEncoder(out)
+	enc.SetIndent(2)
+	err = enc.Encode(cfg)
 	require.NoError(t, err)
 
-	return cfg
-}
-
-// testConfigFromString parses a YAML config file from a string.
-func testConfigFromString(t *testing.T, yaml string) *config.BotConfig {
-	cfg, err := config.ReadConfig(strings.NewReader(yaml))
+	// Load and return the static config
+	globalArgs := cli.NewGlobalArgsWithStaticConfig(out.String())
+	cfg, err = cli.LoadConfigWithMutators(globalArgs)
 	require.NoError(t, err)
 
 	return cfg
@@ -128,15 +130,14 @@ func testConfigFromString(t *testing.T, yaml string) *config.BotConfig {
 
 // validateFileDestinations ensures all files in a destination exist on disk as
 // expected, and returns the destination.
-func validateFileDestination(t *testing.T, dest *config.DestinationConfig) *config.DestinationDirectory {
-	destImpl, err := dest.GetDestination()
-	require.NoError(t, err)
+func validateFileDestination(t *testing.T, svc config.Initable) *config.DestinationDirectory {
+	destImpl := svc.GetDestination()
 
 	destDir, ok := destImpl.(*config.DestinationDirectory)
 	require.True(t, ok)
 
 	for _, art := range identity.GetArtifacts() {
-		if !art.Matches(dest.Kinds...) {
+		if !art.Matches(identity.DestinationKinds()...) {
 			continue
 		}
 
@@ -150,17 +151,21 @@ func validateFileDestination(t *testing.T, dest *config.DestinationConfig) *conf
 // specified, this never tries to use ACLs.
 func TestInit(t *testing.T) {
 	dir := t.TempDir()
-	cf := &config.CLIConf{
-		AuthServer:     "example.com",
-		DestinationDir: dir,
+	cmd := &cli.InitCommand{
+		LegacyDestinationDirArgs: &cli.LegacyDestinationDirArgs{
+			DestinationDir: dir,
+		},
+		AuthProxyArgs: cli.NewStaticAuthServer("example.com"),
 	}
-	cfg := testConfigFromCLI(t, cf)
 
 	// Run init.
-	require.NoError(t, onInit(cfg, cf))
+	require.NoError(t, onInit(&cli.GlobalArgs{}, cmd))
+
+	cfg, err := cli.LoadConfigWithMutators(&cli.GlobalArgs{}, cmd)
+	require.NoError(t, err)
 
 	// Make sure everything was created.
-	_ = validateFileDestination(t, cfg.Destinations[0])
+	_ = validateFileDestination(t, cfg.GetInitables()[0])
 }
 
 // TestInitMaybeACLs tests defaults with ACLs possibly enabled, by supplying
@@ -174,9 +179,6 @@ func TestInitMaybeACLs(t *testing.T) {
 	}
 	require.NoError(t, err)
 
-	hasACLSupport, err := botfs.HasACLSupport()
-	require.NoError(t, err)
-
 	currentUser, err := user.Current()
 	require.NoError(t, err)
 
@@ -185,7 +187,7 @@ func TestInitMaybeACLs(t *testing.T) {
 
 	// Determine if we expect init to use ACLs.
 	expectACLs := false
-	if hasACLSupport {
+	if botfs.HasACLSupport() {
 		if err := testACL(t.TempDir(), currentUser, opts); err == nil {
 			expectACLs = true
 		}
@@ -194,27 +196,32 @@ func TestInitMaybeACLs(t *testing.T) {
 	// Note: we'll use the current user as owner as that's the only way to
 	// guarantee ACL write access.
 	dir := t.TempDir()
-	cf := &config.CLIConf{
-		AuthServer:     "example.com",
-		DestinationDir: dir,
-		BotUser:        opts.BotUser.Username,
-		ReaderUser:     opts.ReaderUser.Username,
+	cmd := &cli.InitCommand{
+		LegacyDestinationDirArgs: &cli.LegacyDestinationDirArgs{
+			DestinationDir: dir,
+		},
+		BotUser:    opts.BotUser.Username,
+		ReaderUser: opts.ReaderUser.Username,
 
 		// This isn't a default, but unfortunately we need to specify a
 		// non-nobody owner for CI purposes.
-		Owner: fmt.Sprintf("%s:%s", currentUser.Name, currentGroup.Name),
+		Owner: fmt.Sprintf("%s:%s", currentUser.Username, currentGroup.Name),
+
+		AuthProxyArgs: cli.NewStaticAuthServer("example.com"),
 	}
-	cfg := testConfigFromCLI(t, cf)
+
+	cfg, err := cli.LoadConfigWithMutators(&cli.GlobalArgs{}, cmd)
+	require.NoError(t, err)
 
 	// Run init.
-	require.NoError(t, onInit(cfg, cf))
+	require.NoError(t, onInit(&cli.GlobalArgs{}, cmd))
 
 	// Make sure everything was created.
-	destDir := validateFileDestination(t, cfg.Destinations[0])
+	destDir := validateFileDestination(t, cfg.GetInitables()[0])
 
 	// If we expect ACLs, verify them.
 	if expectACLs {
-		require.NoError(t, destDir.Verify(identity.ListKeys(cfg.Destinations[0].Kinds...)))
+		require.NoError(t, destDir.Verify(identity.ListKeys(identity.DestinationKinds()...)))
 	} else {
 		t.Logf("Skipping ACL check on %q as they should not be supported.", dir)
 	}
@@ -223,19 +230,20 @@ func TestInitMaybeACLs(t *testing.T) {
 // testInitSymlinksTemplate is a config template with a configurable symlinks
 // mode and ACLs disabled.
 const testInitSymlinksTemplate = `
+version: v2
 auth_server: example.com
-destinations:
-  - directory:
-      path: %s
-      acls: off
-      symlinks: %s
+outputs:
+- type: identity
+  destination:
+    type: directory
+    path: %s
+    acls: off
+    symlinks: %s
 `
 
 // TestInitSymlink tests tbot init with a symlink in the path.
 func TestInitSymlink(t *testing.T) {
-	secureWriteSupported, err := botfs.HasSecureWriteSupport()
-	require.NoError(t, err)
-	if !secureWriteSupported {
+	if !botfs.HasSecureWriteSupport() {
 		t.Skip("Secure write not supported on this system.")
 	}
 
@@ -246,15 +254,19 @@ func TestInitSymlink(t *testing.T) {
 	require.NoError(t, os.Symlink(realPath, dataDir))
 
 	// Should fail due to symlink in path.
-	cfg := testConfigFromString(t, fmt.Sprintf(testInitSymlinksTemplate, dataDir, botfs.SymlinksSecure))
-	require.Error(t, onInit(cfg, &config.CLIConf{}))
+	cfgStr := fmt.Sprintf(testInitSymlinksTemplate, dataDir, botfs.SymlinksSecure)
+	globals := cli.NewGlobalArgsWithStaticConfig(cfgStr)
+	require.Error(t, onInit(globals, &cli.InitCommand{}))
 
 	// Should succeed when writing to the dir directly.
-	cfg = testConfigFromString(t, fmt.Sprintf(testInitSymlinksTemplate, realPath, botfs.SymlinksSecure))
-	require.NoError(t, onInit(cfg, &config.CLIConf{}))
+	cfgStr = fmt.Sprintf(testInitSymlinksTemplate, realPath, botfs.SymlinksSecure)
+	globals = cli.NewGlobalArgsWithStaticConfig(cfgStr)
+	require.NoError(t, onInit(globals, &cli.InitCommand{}))
 
-	// Make sure everything was created.
-	_ = validateFileDestination(t, cfg.Destinations[0])
+	// Make sure everything was created. We'll have to rebuild the config from
+	// scratch since we don't have a copy available.
+	cfg := testConfigFromString(t, cfgStr)
+	_ = validateFileDestination(t, cfg.GetInitables()[0])
 }
 
 // TestInitSymlinksInsecure should work on all platforms.
@@ -266,6 +278,7 @@ func TestInitSymlinkInsecure(t *testing.T) {
 	require.NoError(t, os.Symlink(realPath, dataDir))
 
 	// Should succeed due to SymlinksInsecure
-	cfg := testConfigFromString(t, fmt.Sprintf(testInitSymlinksTemplate, dataDir, botfs.SymlinksInsecure))
-	require.Error(t, onInit(cfg, &config.CLIConf{}))
+
+	globals := cli.NewGlobalArgsWithStaticConfig(fmt.Sprintf(testInitSymlinksTemplate, dataDir, botfs.SymlinksInsecure))
+	require.Error(t, onInit(globals, &cli.InitCommand{}))
 }

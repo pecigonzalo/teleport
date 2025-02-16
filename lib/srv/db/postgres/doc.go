@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package postgres implements components of the database access subsystem
 // that proxy connections between Postgres clients (like, psql or pgAdmin)
@@ -26,14 +28,14 @@ limitations under the License.
 //
 // The package provides the following main types:
 //
-// * Proxy. Runs inside Teleport proxy and proxies connections from Postgres
-//   clients to appropriate database servers over reverse tunnel.
+//   - Proxy. Runs inside Teleport proxy and proxies connections from Postgres
+//     clients to appropriate database servers over reverse tunnel.
 //
-// * Engine. Runs inside Teleport database service, accepts connections
-//   coming from proxy over reversetunnel and proxies them to databases.
+//   - Engine. Runs inside Teleport database service, accepts connections
+//     coming from proxy over reversetunnel and proxies them to databases.
 //
-// * TestServer. Fake Postgres server that implements a small part of its
-//   wire protocol, used in functional tests.
+//   - TestServer. Fake Postgres server that implements a small part of its
+//     wire protocol, used in functional tests.
 //
 // Protocol
 // --------
@@ -55,23 +57,24 @@ limitations under the License.
 // The sequence diagram roughly looks like this:
 //
 // psql                   proxy
-//  |                       |
-//  | ---- SSLRequest ----> |
-//  |                       |
-//  | <------  'S' -------- |
-//  |                       |
-//  | -- StartupMessage --> |                     engine
-//  |                       |                       |
-//  |                       | -- StartupMessage --> |                  Postgres
-//  |                       |                       |                     |
-//  |                       |                       | ----- connect ----> |
-//  |                       |                       |                     |
-//  | <-------------- ReadyForQuery --------------- |                     |
-//  |                       |                       |                     |
-//  | ------------------------------ Query -----------------------------> |
-//  | <---------------------------- DataRow ----------------------------- |
-//  | <------------------------- ReadyForQuery -------------------------- |
-//  |                       |                       |                     |
-//  | ----------------------------- Terminate --------------------------> |
-//  |                       |                       |                     |
+//
+//	|                       |
+//	| ---- SSLRequest ----> |
+//	|                       |
+//	| <------  'S' -------- |
+//	|                       |
+//	| -- StartupMessage --> |                     engine
+//	|                       |                       |
+//	|                       | -- StartupMessage --> |                  Postgres
+//	|                       |                       |                     |
+//	|                       |                       | ----- connect ----> |
+//	|                       |                       |                     |
+//	| <-------------- ReadyForQuery --------------- |                     |
+//	|                       |                       |                     |
+//	| ------------------------------ Query -----------------------------> |
+//	| <---------------------------- DataRow ----------------------------- |
+//	| <------------------------- ReadyForQuery -------------------------- |
+//	|                       |                       |                     |
+//	| ----------------------------- Terminate --------------------------> |
+//	|                       |                       |                     |
 package postgres

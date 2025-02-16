@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package escape
 
@@ -20,15 +24,8 @@ import (
 	"io"
 	"testing"
 
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 )
-
-func Test(t *testing.T) { check.TestingT(t) }
-
-type ReaderSuite struct {
-}
-
-var _ = check.Suite(&ReaderSuite{})
 
 type readerTestCase struct {
 	inChunks [][]byte
@@ -40,8 +37,8 @@ type readerTestCase struct {
 	wantHelp          string
 }
 
-func (*ReaderSuite) runCase(c *check.C, t readerTestCase) {
-	in := &mockReader{chunks: t.inChunks, finalErr: t.inErr}
+func runCase(t *testing.T, tc readerTestCase) {
+	in := &mockReader{chunks: tc.inChunks, finalErr: tc.inErr}
 	helpOut := new(bytes.Buffer)
 	out := new(bytes.Buffer)
 	var disconnectErr error
@@ -51,48 +48,48 @@ func (*ReaderSuite) runCase(c *check.C, t readerTestCase) {
 	})
 
 	_, err := io.Copy(out, r)
-	c.Assert(err, check.Equals, t.wantReadErr)
-	c.Assert(disconnectErr, check.Equals, t.wantDisconnectErr)
-	c.Assert(out.String(), check.Equals, t.wantOut)
-	c.Assert(helpOut.String(), check.Equals, t.wantHelp)
+	require.Equal(t, tc.wantReadErr, err)
+	require.Equal(t, tc.wantDisconnectErr, disconnectErr)
+	require.Equal(t, tc.wantOut, out.String())
+	require.Equal(t, tc.wantHelp, helpOut.String())
 }
 
-func (s *ReaderSuite) TestNormalReads(c *check.C) {
-	c.Log("normal read")
-	s.runCase(c, readerTestCase{
+func TestNormalReads(t *testing.T) {
+	t.Log("normal read")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello world")},
 		wantOut:  "hello world",
 	})
 
-	c.Log("incomplete sequence")
-	s.runCase(c, readerTestCase{
+	t.Log("incomplete sequence")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello\r~world")},
 		wantOut:  "hello\r~world",
 	})
 
-	c.Log("escaped tilde character")
-	s.runCase(c, readerTestCase{
+	t.Log("escaped tilde character")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello\r~~world")},
 		wantOut:  "hello\r~world",
 	})
 
-	c.Log("other character between newline and tilde")
-	s.runCase(c, readerTestCase{
+	t.Log("other character between newline and tilde")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello\rw~orld")},
 		wantOut:  "hello\rw~orld",
 	})
 
-	c.Log("other character between newline and disconnect sequence")
-	s.runCase(c, readerTestCase{
+	t.Log("other character between newline and disconnect sequence")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello\rw~.orld")},
 		wantOut:  "hello\rw~.orld",
 	})
 }
 
-func (s *ReaderSuite) TestReadError(c *check.C) {
+func TestReadError(t *testing.T) {
 	customErr := errors.New("oh no")
 
-	s.runCase(c, readerTestCase{
+	runCase(t, readerTestCase{
 		inChunks:          [][]byte{[]byte("hello world")},
 		inErr:             customErr,
 		wantOut:           "hello world",
@@ -101,30 +98,30 @@ func (s *ReaderSuite) TestReadError(c *check.C) {
 	})
 }
 
-func (s *ReaderSuite) TestEscapeHelp(c *check.C) {
-	c.Log("single help sequence between reads")
-	s.runCase(c, readerTestCase{
+func TestEscapeHelp(t *testing.T) {
+	t.Log("single help sequence between reads")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello\r~?world")},
 		wantOut:  "hello\rworld",
 		wantHelp: helpText,
 	})
 
-	c.Log("single help sequence before any data")
-	s.runCase(c, readerTestCase{
+	t.Log("single help sequence before any data")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("~?hello world")},
 		wantOut:  "hello world",
 		wantHelp: helpText,
 	})
 
-	c.Log("repeated help sequences")
-	s.runCase(c, readerTestCase{
+	t.Log("repeated help sequences")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{[]byte("hello\r~?world\n~?")},
 		wantOut:  "hello\rworld\n",
 		wantHelp: helpText + helpText,
 	})
 
-	c.Log("help sequence split across reads")
-	s.runCase(c, readerTestCase{
+	t.Log("help sequence split across reads")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{
 			[]byte("hello\r"),
 			[]byte("~"),
@@ -136,9 +133,9 @@ func (s *ReaderSuite) TestEscapeHelp(c *check.C) {
 	})
 }
 
-func (s *ReaderSuite) TestEscapeDisconnect(c *check.C) {
-	c.Log("single disconnect sequence between reads")
-	s.runCase(c, readerTestCase{
+func TestEscapeDisconnect(t *testing.T) {
+	t.Log("single disconnect sequence between reads")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{
 			[]byte("hello"),
 			[]byte("\r~."),
@@ -149,15 +146,15 @@ func (s *ReaderSuite) TestEscapeDisconnect(c *check.C) {
 		wantDisconnectErr: ErrDisconnect,
 	})
 
-	c.Log("disconnect sequence before any data")
-	s.runCase(c, readerTestCase{
+	t.Log("disconnect sequence before any data")
+	runCase(t, readerTestCase{
 		inChunks:          [][]byte{[]byte("~.hello world")},
 		wantReadErr:       ErrDisconnect,
 		wantDisconnectErr: ErrDisconnect,
 	})
 
-	c.Log("disconnect sequence split across reads")
-	s.runCase(c, readerTestCase{
+	t.Log("disconnect sequence split across reads")
+	runCase(t, readerTestCase{
 		inChunks: [][]byte{
 			[]byte("hello\r"),
 			[]byte("~"),
@@ -170,7 +167,7 @@ func (s *ReaderSuite) TestEscapeDisconnect(c *check.C) {
 	})
 }
 
-func (*ReaderSuite) TestBufferOverflow(c *check.C) {
+func TestBufferOverflow(t *testing.T) {
 	in := &mockReader{chunks: [][]byte{make([]byte, 100)}}
 	helpOut := new(bytes.Buffer)
 	out := new(bytes.Buffer)
@@ -183,8 +180,8 @@ func (*ReaderSuite) TestBufferOverflow(c *check.C) {
 	go r.runReads()
 
 	_, err := io.Copy(out, r)
-	c.Assert(err, check.Equals, ErrTooMuchBufferedData)
-	c.Assert(disconnectErr, check.Equals, ErrTooMuchBufferedData)
+	require.Equal(t, err, ErrTooMuchBufferedData)
+	require.Equal(t, disconnectErr, ErrTooMuchBufferedData)
 }
 
 type mockReader struct {

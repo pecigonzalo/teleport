@@ -1,28 +1,30 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tdp
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"sync"
 
-	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/trace"
 )
 
@@ -30,7 +32,7 @@ import (
 // It converts between a stream of bytes (io.ReadWriter) and a stream of
 // Teleport Desktop Protocol (TDP) messages.
 type Conn struct {
-	rw        io.ReadWriter
+	rwc       io.ReadWriteCloser
 	bufr      *bufio.Reader
 	closeOnce sync.Once
 
@@ -52,13 +54,13 @@ type Conn struct {
 // NewConn creates a new Conn on top of a ReadWriter, for example a TCP
 // connection. If the provided ReadWriter also implements srv.TrackingConn,
 // then its LocalAddr() and RemoteAddr() will apply to this Conn.
-func NewConn(rw io.ReadWriter) *Conn {
+func NewConn(rwc io.ReadWriteCloser) *Conn {
 	c := &Conn{
-		rw:   rw,
-		bufr: bufio.NewReader(rw),
+		rwc:  rwc,
+		bufr: bufio.NewReader(rwc),
 	}
 
-	if tc, ok := rw.(srv.TrackingConn); ok {
+	if tc, ok := rwc.(srvTrackingConn); ok {
 		c.localAddr = tc.LocalAddr()
 		c.remoteAddr = tc.RemoteAddr()
 	}
@@ -66,19 +68,27 @@ func NewConn(rw io.ReadWriter) *Conn {
 	return c
 }
 
+// srvTrackingConn should be kept in sync with
+// lib/srv.TrackingConn. It is duplicated here
+// to avoid placing a dependency on the lib/srv
+// package, which is incompatible with Windows.
+type srvTrackingConn interface {
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+	Close() error
+}
+
 // Close closes the connection if the underlying reader can be closed.
 func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
-		if closer, ok := c.rw.(io.Closer); ok {
-			err = closer.Close()
-		}
+		err = c.rwc.Close()
 	})
 	return err
 }
 
-// InputMessage reads the next incoming message from the connection.
-func (c *Conn) InputMessage() (Message, error) {
+// ReadMessage reads the next incoming message from the connection.
+func (c *Conn) ReadMessage() (Message, error) {
 	m, err := decode(c.bufr)
 	if c.OnRecv != nil {
 		c.OnRecv(m)
@@ -86,23 +96,39 @@ func (c *Conn) InputMessage() (Message, error) {
 	return m, trace.Wrap(err)
 }
 
-// OutputMessage sends a message to the connection.
-func (c *Conn) OutputMessage(m Message) error {
+// WriteMessage sends a message to the connection.
+func (c *Conn) WriteMessage(m Message) error {
 	buf, err := m.Encode()
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
-	_, err = c.rw.Write(buf)
+	_, err = c.rwc.Write(buf)
 	if c.OnSend != nil {
 		c.OnSend(m, buf)
 	}
 	return trace.Wrap(err)
 }
 
-// SendError is a convenience function for sending an error message.
-func (c *Conn) SendError(message string) error {
-	return c.OutputMessage(Error{Message: message})
+// ReadClientScreenSpec reads the next message from the connection, expecting
+// it to be a ClientScreenSpec. If it is not, an error is returned.
+func (c *Conn) ReadClientScreenSpec() (*ClientScreenSpec, error) {
+	m, err := c.ReadMessage()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	spec, ok := m.(ClientScreenSpec)
+	if !ok {
+		return nil, trace.BadParameter("expected ClientScreenSpec, got %T", m)
+	}
+
+	return &spec, nil
+}
+
+// SendNotification is a convenience function for sending a Notification message.
+func (c *Conn) SendNotification(message string, severity Severity) error {
+	return c.WriteMessage(Alert{Message: message, Severity: severity})
 }
 
 // LocalAddr returns local address
@@ -113,4 +139,28 @@ func (c *Conn) LocalAddr() net.Addr {
 // RemoteAddr returns remote address
 func (c *Conn) RemoteAddr() net.Addr {
 	return c.remoteAddr
+}
+
+// IsNonFatalErr returns whether or not an error arising from
+// the tdp package should be interpreted as fatal or non-fatal
+// for an ongoing TDP connection.
+func IsNonFatalErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return errors.Is(err, clipDataMaxLenErr) ||
+		errors.Is(err, stringMaxLenErr) ||
+		errors.Is(err, fileReadWriteMaxLenErr) ||
+		errors.Is(err, mfaDataMaxLenErr)
+}
+
+// IsFatalErr returns the inverse of IsNonFatalErr
+// (except for if err == nil, for which both functions return false)
+func IsFatalErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return !IsNonFatalErr(err)
 }

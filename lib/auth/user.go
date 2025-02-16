@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package auth implements certificate signing authority and access control server
 // Authority server is composed of several parts:
@@ -20,154 +22,42 @@ limitations under the License.
 // * Authority server itself that implements signing and acl logic
 // * HTTP server wrapper for authority server
 // * HTTP client wrapper
-//
 package auth
 
 import (
 	"context"
 
+	"github.com/gravitational/trace"
+
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
+	"github.com/gravitational/teleport/lib/authz"
 	"github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/services"
-
-	"github.com/gravitational/trace"
+	usagereporter "github.com/gravitational/teleport/lib/usagereporter/teleport"
 )
-
-// CreateUser inserts a new user entry in a backend.
-func (s *Server) CreateUser(ctx context.Context, user types.User) error {
-	if user.GetCreatedBy().IsEmpty() {
-		user.SetCreatedBy(types.CreatedBy{
-			User: types.UserRef{Name: ClientUsername(ctx)},
-			Time: s.GetClock().Now().UTC(),
-		})
-	}
-
-	// TODO: ctx is being swallowed here because the current implementation of
-	// s.Identity.CreateUser is an older implementation that does not curently
-	// accept a context.
-	if err := s.Identity.CreateUser(user); err != nil {
-		return trace.Wrap(err)
-	}
-
-	var connectorName string
-	if user.GetCreatedBy().Connector == nil {
-		connectorName = constants.Local
-	} else {
-		connectorName = user.GetCreatedBy().Connector.ID
-	}
-
-	if err := s.emitter.EmitAuditEvent(ctx, &apievents.UserCreate{
-		Metadata: apievents.Metadata{
-			Type: events.UserCreateEvent,
-			Code: events.UserCreateCode,
-		},
-		UserMetadata: ClientUserMetadataWithUser(ctx, user.GetCreatedBy().User.Name),
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name:    user.GetName(),
-			Expires: user.Expiry(),
-		},
-		Connector: connectorName,
-		Roles:     user.GetRoles(),
-	}); err != nil {
-		log.WithError(err).Warn("Failed to emit user create event.")
-	}
-
-	return nil
-}
-
-// UpdateUser updates an existing user in a backend.
-func (s *Server) UpdateUser(ctx context.Context, user types.User) error {
-	if err := s.Identity.UpdateUser(ctx, user); err != nil {
-		return trace.Wrap(err)
-	}
-
-	var connectorName string
-	if user.GetCreatedBy().Connector == nil {
-		connectorName = constants.Local
-	} else {
-		connectorName = user.GetCreatedBy().Connector.ID
-	}
-
-	if err := s.emitter.EmitAuditEvent(ctx, &apievents.UserCreate{
-		Metadata: apievents.Metadata{
-			Type: events.UserUpdatedEvent,
-			Code: events.UserUpdateCode,
-		},
-		UserMetadata: ClientUserMetadata(ctx),
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name:    user.GetName(),
-			Expires: user.Expiry(),
-		},
-		Connector: connectorName,
-		Roles:     user.GetRoles(),
-	}); err != nil {
-		log.WithError(err).Warn("Failed to emit user update event.")
-	}
-
-	return nil
-}
-
-// UpsertUser updates a user.
-func (s *Server) UpsertUser(user types.User) error {
-	err := s.Identity.UpsertUser(user)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	var connectorName string
-	if user.GetCreatedBy().Connector == nil {
-		connectorName = constants.Local
-	} else {
-		connectorName = user.GetCreatedBy().Connector.ID
-	}
-
-	if err := s.emitter.EmitAuditEvent(s.closeCtx, &apievents.UserCreate{
-		Metadata: apievents.Metadata{
-			Type: events.UserCreateEvent,
-			Code: events.UserCreateCode,
-		},
-		UserMetadata: apievents.UserMetadata{
-			User: user.GetName(),
-		},
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name:    user.GetName(),
-			Expires: user.Expiry(),
-		},
-		Connector: connectorName,
-		Roles:     user.GetRoles(),
-	}); err != nil {
-		log.WithError(err).Warn("Failed to emit user upsert event.")
-	}
-
-	return nil
-}
 
 // CompareAndSwapUser updates a user but fails if the value on the backend does
 // not match the expected value.
-func (s *Server) CompareAndSwapUser(ctx context.Context, new, existing types.User) error {
-	err := s.Identity.CompareAndSwapUser(ctx, new, existing)
+func (a *Server) CompareAndSwapUser(ctx context.Context, new, existing types.User) error {
+	err := a.Services.CompareAndSwapUser(ctx, new, existing)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	var connectorName string
 	if new.GetCreatedBy().Connector == nil {
-		connectorName = constants.Local
+		connectorName = constants.LocalConnector
 	} else {
 		connectorName = new.GetCreatedBy().Connector.ID
 	}
 
-	if err := s.emitter.EmitAuditEvent(ctx, &apievents.UserCreate{
+	if err := a.emitter.EmitAuditEvent(ctx, &apievents.UserUpdate{
 		Metadata: apievents.Metadata{
 			Type: events.UserUpdatedEvent,
 			Code: events.UserUpdateCode,
 		},
-		UserMetadata: apievents.UserMetadata{
-			User:         ClientUsername(ctx),
-			Impersonator: ClientImpersonator(ctx),
-		},
+		UserMetadata: authz.ClientUserMetadata(ctx),
 		ResourceMetadata: apievents.ResourceMetadata{
 			Name:    new.GetName(),
 			Expires: new.Expiry(),
@@ -175,45 +65,10 @@ func (s *Server) CompareAndSwapUser(ctx context.Context, new, existing types.Use
 		Connector: connectorName,
 		Roles:     new.GetRoles(),
 	}); err != nil {
-		log.WithError(err).Warn("Failed to emit user update event.")
+		a.logger.WarnContext(ctx, "Failed to emit user update event", "error", err)
 	}
 
-	return nil
-}
-
-// DeleteUser deletes an existng user in a backend by username.
-func (s *Server) DeleteUser(ctx context.Context, user string) error {
-	role, err := s.Access.GetRole(ctx, services.RoleNameForUser(user))
-	if err != nil {
-		if !trace.IsNotFound(err) {
-			return trace.Wrap(err)
-		}
-	} else {
-		if err := s.Access.DeleteRole(ctx, role.GetName()); err != nil {
-			if !trace.IsNotFound(err) {
-				return trace.Wrap(err)
-			}
-		}
-	}
-
-	err = s.Identity.DeleteUser(ctx, user)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	// If the user was successfully deleted, emit an event.
-	if err := s.emitter.EmitAuditEvent(s.closeCtx, &apievents.UserDelete{
-		Metadata: apievents.Metadata{
-			Type: events.UserDeleteEvent,
-			Code: events.UserDeleteCode,
-		},
-		UserMetadata: ClientUserMetadata(ctx),
-		ResourceMetadata: apievents.ResourceMetadata{
-			Name: user,
-		},
-	}); err != nil {
-		log.WithError(err).Warn("Failed to emit user delete event.")
-	}
+	usagereporter.EmitEditorChangeEvent(new.GetName(), existing.GetRoles(), new.GetRoles(), a.AnonymizeAndSubmit)
 
 	return nil
 }

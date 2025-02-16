@@ -1,30 +1,40 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package webauthn
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"log/slog"
+	"slices"
 
-	"github.com/duo-labs/webauthn/protocol"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils"
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/gravitational/trace"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/gravitational/teleport"
+	"github.com/gravitational/teleport/api/types"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
+
+var log = logutils.NewPackageLogger(teleport.ComponentKey, "WebAuthn")
 
 // x5cFormats enumerates all attestation formats that supply an attestation
 // chain through the "x5c" field.
@@ -59,6 +69,18 @@ func verifyAttestation(cfg *types.Webauthn, obj protocol.AttestationObject) erro
 		return trace.Wrap(err, "invalid webauthn attestation_denied_ca")
 	}
 
+	verifyOptsBase := x509.VerifyOptions{
+		// TPM-bound certificates, like those issued for Windows Hello, set
+		// ExtKeyUsage OID 2.23.133.8.3, aka "AIK (Attestation Identity Key)
+		// certificate".
+		//
+		// There isn't an ExtKeyUsage constant for that, so we allow any.
+		//
+		// - https://learn.microsoft.com/en-us/windows/apps/develop/security/windows-hello#attestation
+		// - https://oid-base.com/get/2.23.133.8.3
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}
+
 	// Attestation check works as follows:
 	// 1. At least one certificate must belong to the allowed pool.
 	// 2. No certificates may belong to the denied pool.
@@ -69,11 +91,28 @@ func verifyAttestation(cfg *types.Webauthn, obj protocol.AttestationObject) erro
 	// so both checks (allowed and denied) may be true for the same cert.
 	allowed := len(cfg.AttestationAllowedCAs) == 0
 	for _, cert := range attestationChain {
-		if _, err := cert.Verify(x509.VerifyOptions{Roots: allowedPool}); err == nil {
+		opts := verifyOptsBase // take copy
+		opts.Roots = allowedPool
+		if _, err := cert.Verify(opts); err == nil {
 			allowed = true // OK, but keep checking
+		} else {
+			log.DebugContext(context.Background(),
+				"Attestation check for allowed CAs failed",
+				"subject", cert.Subject,
+				"error", err,
+			)
 		}
-		if _, err := cert.Verify(x509.VerifyOptions{Roots: deniedPool}); err == nil {
+
+		opts = verifyOptsBase // take copy
+		opts.Roots = deniedPool
+		if _, err := cert.Verify(opts); err == nil {
 			return trace.BadParameter("attestation certificate %q from issuer %q not allowed", cert.Subject, cert.Issuer)
+		} else if !errors.As(err, new(x509.UnknownAuthorityError)) {
+			log.DebugContext(context.Background(),
+				"Attestation check for denied CAs failed",
+				"subject", cert.Subject,
+				"error", err,
+			)
 		}
 	}
 	if !allowed {
@@ -94,7 +133,7 @@ func x509PEMsToCertPool(certPEMs []string) (*x509.CertPool, error) {
 }
 
 func getChainFromObj(obj protocol.AttestationObject) ([]*x509.Certificate, error) {
-	if utils.SliceContainsStr(x5cFormats, obj.Format) {
+	if slices.Contains(x5cFormats, obj.Format) {
 		return getChainFromX5C(obj)
 	}
 	if obj.Format == "none" {
@@ -134,13 +173,17 @@ func getChainFromX5C(obj protocol.AttestationObject) ([]*x509.Certificate, error
 
 	// Print out attestation certs if debug is enabled.
 	// This may come in handy for people having trouble with their setups.
-	if log.IsLevelEnabled(log.DebugLevel) {
+	ctx := context.Background()
+	if log.Handler().Enabled(ctx, slog.LevelDebug) {
 		for _, cert := range chain {
 			certPEM := pem.EncodeToMemory(&pem.Block{
 				Type:  "CERTIFICATE",
 				Bytes: cert.Raw,
 			})
-			log.Debugf("WebAuthn: got %q attestation certificate:\n\n%s", obj.Format, certPEM)
+			log.DebugContext(context.Background(), "got attestation certificate",
+				"format", obj.Format,
+				"certificate", string(certPEM),
+			)
 		}
 	}
 

@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gravitational/teleport/lib/benchmark"
@@ -34,7 +35,17 @@ func main() {
 	}
 
 	// Run Linear generator
-	results, err := benchmark.Run(context.TODO(), linear, "ls -l /", "host", "username", "teleport.example.com")
+	ctx := context.Background()
+	results, err := benchmark.Run(
+		ctx,
+		linear,
+		"host",
+		"username",
+		"teleport.example.com",
+		benchmark.SSHBenchmark{
+			Command: strings.Split("ls -l /", " "),
+		},
+	)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -49,7 +60,7 @@ func main() {
 
 	// Export latency profile
 	responseHistogram := results[0].Histogram
-	_, err = benchmark.ExportLatencyProfile("profiles/", responseHistogram, 1, 1.0)
+	_, err = benchmark.ExportLatencyProfile(ctx, "profiles/", responseHistogram, 1, 1.0)
 	if err != nil {
 		fmt.Println(err)
 	}

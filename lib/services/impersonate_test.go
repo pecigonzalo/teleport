@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
@@ -20,31 +22,31 @@ import (
 	"fmt"
 	"testing"
 
-	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/types"
-
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
 )
 
 func TestCheckImpersonate(t *testing.T) {
-	noLabelsRole := &types.RoleV5{
+	noLabelsRole := &types.RoleV6{
 		Metadata: types.Metadata{
 			Name:      "no-labels",
 			Namespace: apidefaults.Namespace,
 		},
-		Spec: types.RoleSpecV5{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Namespaces: []string{apidefaults.Namespace},
 			},
 		},
 	}
-	wildcardRole := &types.RoleV5{
+	wildcardRole := &types.RoleV6{
 		Metadata: types.Metadata{
 			Name:      "wildcard",
 			Namespace: apidefaults.Namespace,
 		},
-		Spec: types.RoleSpecV5{
+		Spec: types.RoleSpecV6{
 			Allow: types.RoleConditions{
 				Impersonate: &types.ImpersonateConditions{
 					Users: []string{types.Wildcard},
@@ -53,12 +55,12 @@ func TestCheckImpersonate(t *testing.T) {
 			},
 		},
 	}
-	wildcardDenyRole := &types.RoleV5{
+	wildcardDenyRole := &types.RoleV6{
 		Metadata: types.Metadata{
 			Name:      "wildcard-deny-user",
 			Namespace: apidefaults.Namespace,
 		},
-		Spec: types.RoleSpecV5{
+		Spec: types.RoleSpecV6{
 			Deny: types.RoleConditions{
 				Impersonate: &types.ImpersonateConditions{
 					Users: []string{types.Wildcard},
@@ -153,12 +155,12 @@ func TestCheckImpersonate(t *testing.T) {
 			name: "impersonate condition is limited to a certain set users and roles",
 			user: newUser("alice", empty),
 			roles: []types.Role{
-				&types.RoleV5{
+				&types.RoleV6{
 					Metadata: types.Metadata{
 						Name:      "limited",
 						Namespace: apidefaults.Namespace,
 					},
-					Spec: types.RoleSpecV5{
+					Spec: types.RoleSpecV6{
 						Allow: types.RoleConditions{
 							Impersonate: &types.ImpersonateConditions{
 								Users: []string{"bob"},
@@ -194,14 +196,14 @@ func TestCheckImpersonate(t *testing.T) {
 		},
 		{
 			name: "Alice can impersonate any user and role from dev team",
-			user: newUser("alice", props{traits: map[string][]string{"team": []string{"dev"}}}),
+			user: newUser("alice", props{traits: map[string][]string{"team": {"dev"}}}),
 			roles: []types.Role{
-				&types.RoleV5{
+				&types.RoleV6{
 					Metadata: types.Metadata{
 						Name:      "team-impersonator",
 						Namespace: apidefaults.Namespace,
 					},
-					Spec: types.RoleSpecV5{
+					Spec: types.RoleSpecV6{
 						Allow: types.RoleConditions{
 							Impersonate: &types.ImpersonateConditions{
 								Users: []string{types.Wildcard},
@@ -216,10 +218,10 @@ func TestCheckImpersonate(t *testing.T) {
 				{
 					allowed: true,
 					user: newUser("bob", props{
-						traits: map[string][]string{"team": []string{"dev"}},
+						traits: map[string][]string{"team": {"dev"}},
 					}),
 					roles: []types.Role{
-						&types.RoleV5{
+						&types.RoleV6{
 							Metadata: types.Metadata{
 								Name:      "dev",
 								Namespace: apidefaults.Namespace,
@@ -227,7 +229,7 @@ func TestCheckImpersonate(t *testing.T) {
 									"team": "dev",
 								},
 							},
-							Spec: types.RoleSpecV5{},
+							Spec: types.RoleSpecV6{},
 						},
 					},
 				},
@@ -235,11 +237,11 @@ func TestCheckImpersonate(t *testing.T) {
 					name:    "all roles in the set have to match where condition",
 					allowed: false,
 					user: newUser("bob", props{
-						traits: map[string][]string{"team": []string{"dev"}},
+						traits: map[string][]string{"team": {"dev"}},
 					}),
 					roles: []types.Role{
 						wildcardRole,
-						&types.RoleV5{
+						&types.RoleV6{
 							Metadata: types.Metadata{
 								Name:      "dev",
 								Namespace: apidefaults.Namespace,
@@ -247,7 +249,7 @@ func TestCheckImpersonate(t *testing.T) {
 									"team": "dev",
 								},
 							},
-							Spec: types.RoleSpecV5{},
+							Spec: types.RoleSpecV6{},
 						},
 					},
 				},

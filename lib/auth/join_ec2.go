@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -22,14 +24,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"time"
-
-	"github.com/gravitational/teleport/api/types"
-	apiutils "github.com/gravitational/teleport/api/utils"
-	"github.com/gravitational/teleport/lib/services"
-	"github.com/gravitational/teleport/lib/utils"
-
-	"github.com/gravitational/trace"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -38,8 +34,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/tracing/smithyoteltracing"
+	"github.com/digitorus/pkcs7"
+	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"go.mozilla.org/pkcs7"
+	"go.opentelemetry.io/otel"
+
+	"github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/aws/stsutils"
 )
 
 type ec2Client interface {
@@ -60,7 +65,9 @@ func ec2ClientFromConfig(ctx context.Context, cfg aws.Config) ec2Client {
 	if ok {
 		return ec2Client
 	}
-	return ec2.NewFromConfig(cfg)
+	return ec2.NewFromConfig(cfg, func(o *ec2.Options) {
+		o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+	})
 }
 
 // checkEC2AllowRules checks that the iid matches at least one of the allow
@@ -76,14 +83,14 @@ func checkEC2AllowRules(ctx context.Context, iid *imds.InstanceIdentityDocument,
 		}
 		// if this rule specifies any AWS regions, the IID must match one of them
 		if len(rule.AWSRegions) > 0 {
-			if !apiutils.SliceContainsStr(rule.AWSRegions, iid.Region) {
+			if !slices.Contains(rule.AWSRegions, iid.Region) {
 				continue
 			}
 		}
 		// iid matches this allow rule. Check if it is running.
 		return trace.Wrap(checkInstanceRunning(ctx, iid.InstanceID, iid.Region, rule.AWSRole))
 	}
-	return trace.AccessDenied("instance did not match any allow rules")
+	return trace.AccessDenied("instance %v did not match any allow rules in token %v", iid.InstanceID, provisionToken.GetName())
 }
 
 func checkInstanceRunning(ctx context.Context, instanceID, region, IAMRole string) error {
@@ -95,7 +102,9 @@ func checkInstanceRunning(ctx context.Context, instanceID, region, IAMRole strin
 
 	// assume the configured IAM role if necessary
 	if IAMRole != "" {
-		stsClient := sts.NewFromConfig(awsClientConfig)
+		stsClient := stsutils.NewFromConfig(awsClientConfig, func(o *sts.Options) {
+			o.TracerProvider = smithyoteltracing.Adapt(otel.GetTracerProvider())
+		})
 		creds := stscreds.NewAssumeRoleProvider(stsClient, IAMRole)
 		awsClientConfig.Credentials = aws.NewCredentialsCache(creds)
 	}
@@ -172,21 +181,15 @@ func checkPendingTime(iid *imds.InstanceIdentityDocument, provisionToken types.P
 }
 
 func nodeExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
-	namespaces, err := presence.GetNamespaces()
-	if err != nil {
+	_, err := presence.GetNode(ctx, defaults.Namespace, hostID)
+	switch {
+	case trace.IsNotFound(err):
+		return false, nil
+	case err != nil:
 		return false, trace.Wrap(err)
+	default:
+		return true, nil
 	}
-	for _, namespace := range namespaces {
-		_, err := presence.GetNode(ctx, namespace.GetName(), hostID)
-		if trace.IsNotFound(err) {
-			continue
-		} else if err != nil {
-			return false, trace.Wrap(err)
-		} else {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func proxyExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
@@ -203,12 +206,12 @@ func proxyExists(ctx context.Context, presence services.Presence, hostID string)
 }
 
 func kubeExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
-	kubes, err := presence.GetKubeServices(ctx)
+	kubes, err := presence.GetKubernetesServers(ctx)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
 	for _, kube := range kubes {
-		if kube.GetName() == hostID {
+		if kube.GetHostID() == hostID {
 			return true, nil
 		}
 	}
@@ -216,49 +219,67 @@ func kubeExists(ctx context.Context, presence services.Presence, hostID string) 
 }
 
 func appExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
-	namespaces, err := presence.GetNamespaces()
+	apps, err := presence.GetApplicationServers(ctx, defaults.Namespace)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
-	for _, namespace := range namespaces {
-		apps, err := presence.GetApplicationServers(ctx, namespace.GetName())
-		if err != nil {
-			return false, trace.Wrap(err)
-		}
-		for _, app := range apps {
-			if app.GetName() == hostID {
-				return true, nil
-			}
+
+	for _, app := range apps {
+		if app.GetName() == hostID {
+			return true, nil
 		}
 	}
+
 	return false, nil
 }
 
 func dbExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
-	namespaces, err := presence.GetNamespaces()
+	dbs, err := presence.GetDatabaseServers(ctx, defaults.Namespace)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
-	for _, namespace := range namespaces {
-		dbs, err := presence.GetDatabaseServers(ctx, namespace.GetName())
-		if err != nil {
-			return false, trace.Wrap(err)
+
+	for _, db := range dbs {
+		if db.GetName() == hostID {
+			return true, nil
 		}
-		for _, db := range dbs {
-			if db.GetName() == hostID {
-				return true, nil
-			}
+	}
+
+	return false, nil
+}
+
+func oktaExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
+	apps, err := presence.GetApplicationServers(ctx, defaults.Namespace)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+	for _, app := range apps {
+		if app.GetName() == hostID && app.Origin() == types.OriginOkta {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func desktopServiceExists(ctx context.Context, presence services.Presence, hostID string) (bool, error) {
+	svcs, err := presence.GetWindowsDesktopServices(ctx)
+	if err != nil {
+		return false, trace.Wrap(err)
+	}
+
+	for _, wds := range svcs {
+		if wds.GetName() == hostID {
+			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// checkInstanceUnique makes sure the instance which sent the request has not
-// already joined the cluster with the same role. Tokens should be limited to
-// only allow the roles which will actually be used by all expected instances so
-// that a stolen IID could not be used to join the cluster with a different
-// role.
-func (a *Server) checkInstanceUnique(ctx context.Context, req *types.RegisterUsingTokenRequest, iid *imds.InstanceIdentityDocument) error {
+// tryToDetectIdentityReuse performs a best-effort check to see if the specified role+id combination
+// is already in use by an instance. This will only detect re-use in the case where a recent heartbeat
+// clearly shows the combination in use since teleport maintains no long-term per-instance state.
+func (a *Server) tryToDetectIdentityReuse(ctx context.Context, req *types.RegisterUsingTokenRequest, iid *imds.InstanceIdentityDocument) error {
 	requestedHostID := req.HostID
 	expectedHostID := utils.NodeIDFromIID(iid)
 	if requestedHostID != expectedHostID {
@@ -279,6 +300,19 @@ func (a *Server) checkInstanceUnique(ctx context.Context, req *types.RegisterUsi
 		instanceExists, err = appExists(ctx, a, req.HostID)
 	case types.RoleDatabase:
 		instanceExists, err = dbExists(ctx, a, req.HostID)
+	case types.RoleWindowsDesktop:
+		instanceExists, err = desktopServiceExists(ctx, a, req.HostID)
+	case types.RoleOkta:
+		instanceExists, err = oktaExists(ctx, a, req.HostID)
+	case types.RoleInstance:
+		// no appropriate check exists for the Instance role
+		instanceExists = false
+	case types.RoleDiscovery:
+		// no appropriate check exists for the Discovery role
+		instanceExists = false
+	case types.RoleMDM:
+		// no appropriate check exists for the MDM role
+		instanceExists = false
 	default:
 		return trace.BadParameter("unsupported role: %q", req.Role)
 	}
@@ -287,8 +321,12 @@ func (a *Server) checkInstanceUnique(ctx context.Context, req *types.RegisterUsi
 		return trace.Wrap(err)
 	}
 	if instanceExists {
-		log.Warnf("Server with ID %q and role %q is attempting to join the cluster with a Simplified Node Joining request, but"+
-			" a server with this ID is already present in the cluster.", req.HostID, req.Role)
+		const msg = "Server is attempting to join the cluster with a Simplified Node Joining request, but" +
+			" a server with this ID is already present in the cluster"
+		a.logger.WarnContext(ctx, msg,
+			"host_id", req.HostID,
+			"role", req.Role,
+		)
 		return trace.AccessDenied("server with host ID %q and role %q already exists", req.HostID, req.Role)
 	}
 	return nil
@@ -296,11 +334,12 @@ func (a *Server) checkInstanceUnique(ctx context.Context, req *types.RegisterUsi
 
 // checkEC2JoinRequest checks register requests which use EC2 Simplified Node
 // Joining. This method checks that:
-// 1. The given Instance Identity Document has a valid signature (signed by AWS).
-// 2. A node has not already joined the cluster from this EC2 instance (to
-//    prevent re-use of a stolen Instance Identity Document).
-// 3. The signed instance attributes match one of the allow rules for the
-//    corresponding token.
+//  1. The given Instance Identity Document has a valid signature (signed by AWS).
+//  2. There is no obvious signs that a node already joined the cluster from this EC2 instance (to
+//     reduce the risk of re-use of a stolen Instance Identity Document).
+//  3. The signed instance attributes match one of the allow rules for the
+//     corresponding token.
+//
 // If the request does not include an Instance Identity Document, and the
 // token does not include any allow rules, this method returns nil and the
 // normal token checking logic resumes.
@@ -311,7 +350,7 @@ func (a *Server) checkEC2JoinRequest(ctx context.Context, req *types.RegisterUsi
 		return trace.Wrap(err)
 	}
 
-	log.Debugf("Received Simplified Node Joining request for host %q", req.HostID)
+	a.logger.DebugContext(ctx, "Received Simplified Node Joining request", "host_id", req.HostID)
 
 	if len(req.EC2IdentityDocument) == 0 {
 		return trace.AccessDenied("this token is only valid for the EC2 join " +
@@ -328,7 +367,7 @@ func (a *Server) checkEC2JoinRequest(ctx context.Context, req *types.RegisterUsi
 		return trace.Wrap(err)
 	}
 
-	if err := a.checkInstanceUnique(ctx, req, iid); err != nil {
+	if err := a.tryToDetectIdentityReuse(ctx, req, iid); err != nil {
 		return trace.Wrap(err)
 	}
 

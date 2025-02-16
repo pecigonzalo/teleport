@@ -1,0 +1,18 @@
+.PHONY: test
+test: test-access test-lib test-event-handler test-terraform-provider
+
+.PHONY: test-access
+test-access:
+	go test -v ./access/...
+
+.PHONY: test-lib
+test-lib:
+	go test ./lib/...
+
+.PHONY: test-event-handler
+test-event-handler:
+	make -C event-handler test
+
+.PHONY: test-terraform-provider
+test-terraform-provider:
+	make -C terraform test

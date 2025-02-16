@@ -17,30 +17,39 @@ limitations under the License.
 package sshutils
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/gravitational/teleport/api/constants"
-
 	"github.com/gravitational/trace"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/constants"
 )
+
+type Conn interface {
+	io.Closer
+	// RemoteAddr returns the remote address for this connection.
+	RemoteAddr() net.Addr
+	// LocalAddr returns the local address for this connection.
+	LocalAddr() net.Addr
+}
 
 // NewChConn returns a new net.Conn implemented over
 // SSH channel
-func NewChConn(conn ssh.Conn, ch ssh.Channel) *ChConn {
+func NewChConn(conn Conn, ch ssh.Channel) *ChConn {
 	return newChConn(conn, ch, false)
 }
 
 // NewExclusiveChConn returns a new net.Conn implemented over
 // SSH channel, whenever this connection closes
-func NewExclusiveChConn(conn ssh.Conn, ch ssh.Channel) *ChConn {
+func NewExclusiveChConn(conn Conn, ch ssh.Channel) *ChConn {
 	return newChConn(conn, ch, true)
 }
 
-func newChConn(conn ssh.Conn, ch ssh.Channel, exclusive bool) *ChConn {
+func newChConn(conn Conn, ch ssh.Channel, exclusive bool) *ChConn {
 	reader, writer := net.Pipe()
 	c := &ChConn{
 		Channel:   ch,
@@ -68,7 +77,7 @@ type ChConn struct {
 	mu sync.Mutex
 
 	ssh.Channel
-	conn ssh.Conn
+	conn Conn
 	// exclusive indicates that whenever this channel connection
 	// is getting closed, the underlying connection is closed as well
 	exclusive bool
@@ -128,7 +137,7 @@ func (c *ChConn) Read(data []byte) (int, error) {
 	// A lot of code relies on "use of closed network connection" error to
 	// gracefully handle terminated connections so convert the closed pipe
 	// error to it.
-	if err != nil && err == io.ErrClosedPipe {
+	if err != nil && errors.Is(err, io.ErrClosedPipe) {
 		return n, trace.ConnectionProblem(err, constants.UseOfClosedNetworkConnection)
 	}
 	// Do not wrap the error to avoid masking the underlying error such as

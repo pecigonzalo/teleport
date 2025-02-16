@@ -1,6 +1,6 @@
 ---
 authors: Sasha Klizhentas (sasha@goteleport.com)
-state: draft
+state: implemented
 ---
 
 # RFD 29 - Account Life-cycle: Recovery and Cancellation
@@ -56,8 +56,6 @@ domain names in the prefix about leaked tokens.
 * [ ] Each token can only be used one time successfully or unsuccessfully.
 * [ ] Teleport should store tokens hashed with `crypto/bcrypt` and compare using constant-time compare.
 Teleport should store the time when the tokens were generated alongside the hashed tokens.
-* [ ] Trying a wrong token 3 times in a row should lead to a temporary account lock following
-the same failed account login rate-limiting that exists for local users right now.
 * [ ] The reset endpoints should be rate-limited by account and IP to prevent brute-force scans.
 * [ ] UI should make it clear that these tokens are important and if lost, the account can not be recovered.
 * [ ] Set the following headers on the web page presenting the tokens:
@@ -455,7 +453,7 @@ User <email> and <email> have initiated lock at <time> at <devices> <locations>.
 
 * <Lock details>
 
-To remove the lock, login to the the locks UI and unfreeze the account.
+To remove the lock, login to the locks UI and unfreeze the account.
 ```
 
 To remove the lock, users should follow the same procedure, but in reverse order:
@@ -497,7 +495,7 @@ Please check documentation: https://goteleport.com/docs/cloud/locksmiths for mor
 * If account owner or locksmith can edit or create roles and users, display notification:
 
 ```
-A user <username> can lock the account or cancel it, but has too many privileges and can modifify roles
+A user <username> can lock the account or cancel it, but has too many privileges and can modify roles
 to override protections.
 
 To improve security and prevent account loss please add a second account locksmith.

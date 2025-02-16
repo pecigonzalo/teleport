@@ -1,18 +1,20 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package suite
 
@@ -20,26 +22,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gravitational/teleport/api/types"
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 
-	"gopkg.in/check.v1"
+	"github.com/gravitational/teleport/api/types"
 )
 
-func Test(t *testing.T) { check.TestingT(t) }
-
-type PresenceSuite struct {
-}
-
-var _ = check.Suite(&PresenceSuite{})
-
-func (s *PresenceSuite) TestServerLabels(c *check.C) {
+func TestServerLabels(t *testing.T) {
 	emptyLabels := make(map[string]string)
 	// empty
 	server := &types.ServerV2{}
-	c.Assert(server.GetAllLabels(), check.DeepEquals, emptyLabels)
-	c.Assert(server.LabelsString(), check.Equals, "")
-	c.Assert(server.MatchAgainst(emptyLabels), check.Equals, true)
-	c.Assert(server.MatchAgainst(map[string]string{"a": "b"}), check.Equals, false)
+	require.Empty(t, server.GetAllLabels())
+	require.True(t, types.MatchLabels(server, emptyLabels))
+	require.False(t, types.MatchLabels(server, map[string]string{"a": "b"}))
 
 	// more complex
 	server = &types.ServerV2{
@@ -50,7 +45,7 @@ func (s *PresenceSuite) TestServerLabels(c *check.C) {
 		},
 		Spec: types.ServerSpecV2{
 			CmdLabels: map[string]types.CommandLabelV2{
-				"time": types.CommandLabelV2{
+				"time": {
 					Period:  types.NewDuration(time.Second),
 					Command: []string{"time"},
 					Result:  "now",
@@ -59,14 +54,14 @@ func (s *PresenceSuite) TestServerLabels(c *check.C) {
 		},
 	}
 
-	c.Assert(server.GetAllLabels(), check.DeepEquals, map[string]string{
+	require.Empty(t, cmp.Diff(server.GetAllLabels(), map[string]string{
 		"role": "database",
 		"time": "now",
-	})
-	c.Assert(server.LabelsString(), check.Equals, "role=database,time=now")
-	c.Assert(server.MatchAgainst(emptyLabels), check.Equals, true)
-	c.Assert(server.MatchAgainst(map[string]string{"a": "b"}), check.Equals, false)
-	c.Assert(server.MatchAgainst(map[string]string{"role": "database"}), check.Equals, true)
-	c.Assert(server.MatchAgainst(map[string]string{"time": "now"}), check.Equals, true)
-	c.Assert(server.MatchAgainst(map[string]string{"time": "now", "role": "database"}), check.Equals, true)
+	}))
+
+	require.True(t, types.MatchLabels(server, emptyLabels))
+	require.False(t, types.MatchLabels(server, map[string]string{"a": "b"}))
+	require.True(t, types.MatchLabels(server, map[string]string{"role": "database"}))
+	require.True(t, types.MatchLabels(server, map[string]string{"time": "now"}))
+	require.True(t, types.MatchLabels(server, map[string]string{"time": "now", "role": "database"}))
 }

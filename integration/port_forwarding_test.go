@@ -1,24 +1,27 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package integration
 
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,13 +29,18 @@ import (
 	"testing"
 	"time"
 
-	apidefaults "github.com/gravitational/teleport/api/defaults"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
-	"github.com/gravitational/teleport/lib/client"
-	"github.com/gravitational/teleport/lib/session"
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
+
+	apidefaults "github.com/gravitational/teleport/api/defaults"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/integration/helpers"
+	"github.com/gravitational/teleport/lib/auth/authclient"
+	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/service/servicecfg"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func extractPort(svr *httptest.Server) (int, error) {
@@ -47,7 +55,7 @@ func extractPort(svr *httptest.Server) (int, error) {
 	return n, nil
 }
 
-func waitForSessionToBeEstablished(ctx context.Context, namespace string, site auth.ClientI) ([]session.Session, error) {
+func waitForSessionToBeEstablished(ctx context.Context, namespace string, site authclient.ClientI) ([]types.SessionTracker, error) {
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -58,7 +66,7 @@ func waitForSessionToBeEstablished(ctx context.Context, namespace string, site a
 			return nil, ctx.Err()
 
 		case <-ticker.C:
-			ss, err := site.GetSessions(namespace)
+			ss, err := site.GetActiveSessionTrackers(ctx)
 			if err != nil {
 				return nil, trace.Wrap(err)
 			}
@@ -69,20 +77,66 @@ func waitForSessionToBeEstablished(ctx context.Context, namespace string, site a
 	}
 }
 
+// testPingLocalServer checks whether or not an HTTP server is serving on
+// localhost at the given port.
+func testPingLocalServer(t *testing.T, port int, expectSuccess bool) {
+	addr := fmt.Sprintf("http://%s:%d/", "localhost", port)
+	r, err := http.Get(addr)
+
+	if r != nil {
+		r.Body.Close()
+	}
+
+	if expectSuccess {
+		require.NoError(t, err)
+		require.NotNil(t, r)
+	} else {
+		require.Error(t, err)
+	}
+}
+
 func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
+	invalidOSLogin := utils.GenerateLocalUsername(t)
+
+	// Providing our own logins to Teleport so we can verify that a user
+	// that exists within Teleport but does not exist on the local node
+	// cannot port forward.
+	logins := []string{
+		invalidOSLogin,
+		suite.Me.Username,
+	}
+
 	testCases := []struct {
 		desc                  string
 		portForwardingAllowed bool
 		expectSuccess         bool
+		login                 string
+		labels                map[string]string
 	}{
 		{
 			desc:                  "Enabled",
 			portForwardingAllowed: true,
 			expectSuccess:         true,
-		}, {
+			login:                 suite.Me.Username,
+		},
+		{
 			desc:                  "Disabled",
 			portForwardingAllowed: false,
 			expectSuccess:         false,
+			login:                 suite.Me.Username,
+		},
+		{
+			desc:                  "Enabled with invalid user",
+			portForwardingAllowed: true,
+			expectSuccess:         false,
+			login:                 invalidOSLogin,
+		},
+		{
+			desc:                  "Enabled with labels",
+			portForwardingAllowed: true,
+			expectSuccess:         true,
+			login:                 suite.Me.Username,
+			labels:                map[string]string{"foo": "bar"},
 		},
 	}
 
@@ -90,7 +144,6 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 		t.Run(tt.desc, func(t *testing.T) {
 			// Given a running teleport instance with port forwarding
 			// permissions set per the test case
-
 			recCfg, err := types.NewSessionRecordingConfigFromConfigFile(types.SessionRecordingConfigSpecV2{
 				Mode: types.RecordOff,
 			})
@@ -98,36 +151,109 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 
 			cfg := suite.defaultServiceConfig()
 			cfg.Auth.Enabled = true
+			cfg.Auth.Preference.SetSecondFactor("off")
+			cfg.Auth.NoAudit = true
 			cfg.Auth.SessionRecordingConfig = recCfg
 			cfg.Proxy.Enabled = true
 			cfg.Proxy.DisableWebService = false
 			cfg.Proxy.DisableWebInterface = true
 			cfg.SSH.Enabled = true
 			cfg.SSH.AllowTCPForwarding = tt.portForwardingAllowed
+			cfg.SSH.Labels = map[string]string{"foo": "bar"}
 
-			teleport := suite.newTeleportWithConfig(t, nil, nil, cfg)
-			defer teleport.StopAll()
+			privateKey, publicKey, err := testauthority.New().GenerateKeyPair()
+			require.NoError(t, err)
 
-			site := teleport.GetSiteAPI(Site)
+			instance := helpers.NewInstance(t, helpers.InstanceConfig{
+				ClusterName: helpers.Site,
+				HostID:      uuid.New().String(),
+				NodeName:    Host,
+				Priv:        privateKey,
+				Pub:         publicKey,
+				Logger:      utils.NewSlogLoggerForTests(),
+			})
 
-			// ...and a running dummy server
-			remoteSvr := httptest.NewServer(http.HandlerFunc(
+			for _, login := range logins {
+				instance.AddUser(login, []string{login})
+			}
+
+			// create and launch the auth server
+			err = instance.CreateEx(t, nil, cfg)
+			require.NoError(t, err)
+
+			require.NoError(t, instance.Start())
+			t.Cleanup(func() {
+				require.NoError(t, instance.StopAll())
+			})
+
+			// create an node instance
+			privateKey, publicKey, err = testauthority.New().GenerateKeyPair()
+			require.NoError(t, err)
+
+			node := helpers.NewInstance(t, helpers.InstanceConfig{
+				ClusterName: helpers.Site,
+				HostID:      uuid.New().String(),
+				NodeName:    Host,
+				Priv:        privateKey,
+				Pub:         publicKey,
+				Logger:      utils.NewSlogLoggerForTests(),
+			})
+
+			// Create node config.
+			nodeCfg := servicecfg.MakeDefaultConfig()
+			nodeCfg.SetAuthServerAddress(cfg.Auth.ListenAddr)
+			nodeCfg.SetToken("token")
+			nodeCfg.CachePolicy.Enabled = true
+			nodeCfg.DataDir = t.TempDir()
+			nodeCfg.Auth.Enabled = false
+			nodeCfg.Proxy.Enabled = false
+			nodeCfg.SSH.Enabled = true
+			nodeCfg.SSH.AllowTCPForwarding = tt.portForwardingAllowed
+			nodeCfg.SSH.Labels = map[string]string{"foo": "bar"}
+
+			err = node.CreateWithConf(t, nodeCfg)
+			require.NoError(t, err)
+
+			require.NoError(t, node.Start())
+			t.Cleanup(func() {
+				require.NoError(t, node.StopAll())
+			})
+
+			site := instance.GetSiteAPI(helpers.Site)
+
+			// ...and a pair of running dummy servers
+			handler := http.HandlerFunc(
 				func(w http.ResponseWriter, _ *http.Request) {
 					w.WriteHeader(http.StatusOK)
 					w.Write([]byte("Hello, World"))
-				}))
+				})
+			remoteListener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			remoteSvr := httptest.NewUnstartedServer(handler)
+			remoteSvr.Listener = remoteListener
+			remoteSvr.Start()
 			defer remoteSvr.Close()
 
+			localListener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			localSvr := httptest.NewUnstartedServer(handler)
+			localSvr.Listener = localListener
+			localSvr.Start()
+			defer localSvr.Close()
+
 			// ... and a client connection that was launched with port
-			// forwarding enabled to that dummy server
-			localPort := ports.PopInt()
-			remotePort, err := extractPort(remoteSvr)
+			// forwarding enabled to the dummy servers
+			localClientPort := newPortValue()
+			remoteServerPort, err := extractPort(remoteSvr)
+			require.NoError(t, err)
+			remoteClientPort := newPortValue()
+			localServerPort, err := extractPort(localSvr)
 			require.NoError(t, err)
 
-			nodeSSHPort := teleport.GetPortSSHInt()
-			cl, err := teleport.NewClient(ClientConfig{
-				Login:   suite.me.Username,
-				Cluster: Site,
+			nodeSSHPort := helpers.Port(t, instance.SSH)
+			cl, err := instance.NewClient(helpers.ClientConfig{
+				Login:   tt.login,
+				Cluster: helpers.Site,
 				Host:    Host,
 				Port:    nodeSSHPort,
 			})
@@ -135,17 +261,26 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 			cl.Config.LocalForwardPorts = []client.ForwardedPort{
 				{
 					SrcIP:    "127.0.0.1",
-					SrcPort:  localPort,
+					SrcPort:  localClientPort,
 					DestHost: "localhost",
-					DestPort: remotePort,
+					DestPort: remoteServerPort,
+				},
+			}
+			cl.Config.RemoteForwardPorts = []client.ForwardedPort{
+				{
+					SrcIP:    "localhost",
+					SrcPort:  remoteClientPort,
+					DestHost: "127.0.0.1",
+					DestPort: localServerPort,
 				},
 			}
 			term := NewTerminal(250)
 			cl.Stdout = term
 			cl.Stdin = term
+			cl.Labels = tt.labels
 
 			sshSessionCtx, sshSessionCancel := context.WithCancel(context.Background())
-			go cl.SSH(sshSessionCtx, []string{}, false)
+			go cl.SSH(sshSessionCtx, []string{})
 			defer sshSessionCancel()
 
 			timeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -154,20 +289,13 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 			require.NoError(t, err)
 
 			// When everything is *finally* set up, and I attempt to use the
-			// forwarded connection
-			localURL := fmt.Sprintf("http://%s:%d/", "localhost", localPort)
-			r, err := http.Get(localURL)
-
-			if r != nil {
-				r.Body.Close()
-			}
-
-			if tt.expectSuccess {
-				require.NoError(t, err)
-				require.NotNil(t, r)
-			} else {
-				require.Error(t, err)
-			}
+			// forwarded connections
+			t.Run("local forwarding", func(t *testing.T) {
+				testPingLocalServer(t, localClientPort, tt.expectSuccess)
+			})
+			t.Run("remote forwarding", func(t *testing.T) {
+				testPingLocalServer(t, remoteClientPort, tt.expectSuccess)
+			})
 		})
 	}
 }

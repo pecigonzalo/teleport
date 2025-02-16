@@ -1,32 +1,40 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"regexp"
+
+	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/parse"
-
-	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 )
+
+// maxMismatchedTraitValuesLogged indicates the maximum number of trait values (that do not match a
+// certain expression) to be shown in the log
+const maxMismatchedTraitValuesLogged = 100
 
 // TraitsToRoles maps the supplied traits to a list of teleport role names.
 // Returns the list of roles mapped from traits.
@@ -74,32 +82,57 @@ func TraitsToRoleMatchers(ms types.TraitMappingSet, traits map[string][]string) 
 
 // traitsToRoles maps the supplied traits to teleport role names and passes them to a collector.
 func traitsToRoles(ms types.TraitMappingSet, traits map[string][]string, collect func(role string, expanded bool)) (warnings []string) {
+TraitMappingLoop:
 	for _, mapping := range ms {
+		var regexpIgnoreCase *regexp.Regexp
+		var regexp *regexp.Regexp
+
 		for traitName, traitValues := range traits {
 			if traitName != mapping.Trait {
 				continue
 			}
+			var mismatched []string
 		TraitLoop:
 			for _, traitValue := range traitValues {
 				for _, role := range mapping.Roles {
+					// this ensures that the case-insensitive regexp is compiled at most once, and only if strictly needed;
+					// after this if, regexpIgnoreCase must be non-nil
+					if regexpIgnoreCase == nil {
+						var err error
+						regexpIgnoreCase, err = utils.RegexpWithConfig(mapping.Value, utils.RegexpConfig{IgnoreCase: true})
+						if err != nil {
+							warnings = append(warnings, fmt.Sprintf("case-insensitive expression %q is not a valid regexp", mapping.Value))
+							continue TraitMappingLoop
+						}
+					}
+
 					// Run the initial replacement case-insensitively. Doing so will filter out all literal non-matches
 					// but will match on case discrepancies. We do another case-sensitive match below to see if the
 					// case is different
-					outRole, err := utils.ReplaceRegexpWithConfig(mapping.Value, role, traitValue, utils.RegexpConfig{IgnoreCase: true})
+					outRole, err := utils.ReplaceRegexpWith(regexpIgnoreCase, role, traitValue)
 					switch {
 					case err != nil:
-						if trace.IsNotFound(err) {
-							log.WithError(err).Debugf("Failed to match expression %q, replace with: %q input: %q.", mapping.Value, role, traitValue)
-						}
 						// this trait value clearly did not match, move on to another
+						mismatched = append(mismatched, traitValue)
 						continue TraitLoop
 					case outRole == "":
 					case outRole != "":
+						// this ensures that the case-sensitive regexp is compiled at most once, and only if strictly needed;
+						// after this if, regexp must be non-nil
+						if regexp == nil {
+							var err error
+							regexp, err = utils.RegexpWithConfig(mapping.Value, utils.RegexpConfig{})
+							if err != nil {
+								warnings = append(warnings, fmt.Sprintf("case-sensitive expression %q is not a valid regexp", mapping.Value))
+								continue TraitMappingLoop
+							}
+						}
+
 						// Run the replacement case-sensitively to see if it matches.
 						// If there's no match, the trait specifies a mapping which is case-sensitive;
 						// we should log a warning but return an error.
 						// See https://github.com/gravitational/teleport/issues/6016 for details.
-						if _, err := utils.ReplaceRegexp(mapping.Value, role, traitValue); err != nil {
+						if _, err := utils.ReplaceRegexpWith(regexp, role, traitValue); err != nil {
 							warnings = append(warnings, fmt.Sprintf("trait %q matches value %q case-insensitively and would have yielded %q role", traitValue, mapping.Value, outRole))
 							continue
 						}
@@ -108,9 +141,27 @@ func traitsToRoles(ms types.TraitMappingSet, traits map[string][]string, collect
 					}
 				}
 			}
+
+			// show at most maxMismatchedTraitValuesLogged trait values to prevent huge log lines
+			switch l := len(mismatched); {
+			case l > maxMismatchedTraitValuesLogged:
+				slog.
+					DebugContext(context.Background(), "trait value(s) did not match (showing first %d values)",
+						"mismatch_count", len(mismatched),
+						"max_mismatch_logged", maxMismatchedTraitValuesLogged,
+						"expression", mapping.Value,
+						"values", mismatched[0:maxMismatchedTraitValuesLogged],
+					)
+			case l > 0:
+				slog.DebugContext(context.Background(), "trait value(s) did not match",
+					"mismatch_count", len(mismatched),
+					"expression", mapping.Value,
+					"values", mismatched,
+				)
+			}
 		}
 	}
-	return warnings
+	return
 }
 
 // literalMatcher is used to "escape" values which are not allowed to
@@ -121,3 +172,11 @@ type literalMatcher struct {
 }
 
 func (m literalMatcher) Match(in string) bool { return m.value == in }
+
+func literalMatchers(literals []string) []parse.Matcher {
+	matchers := make([]parse.Matcher, 0, len(literals))
+	for _, literal := range literals {
+		matchers = append(matchers, literalMatcher{literal})
+	}
+	return matchers
+}

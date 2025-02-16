@@ -1,5 +1,5 @@
 ---
-authors: Zac Bergquist <zac@goteleport.com
+authors: Zac Bergquist <zac@goteleport.com>
 state: Implemented
 ---
 
@@ -77,7 +77,7 @@ running our own proxy is warranted.
 Committing the vendor directory has led to a number of minor issues, and
 dropping it would result in an improved developer experience.
 
-First, comitting these changes results in repo bloat. Since go.mod and go.sum
+First, committing these changes results in repo bloat. Since go.mod and go.sum
 already contain everything needed for a reproducible build, the teleport repo
 ends up being larger than necessary. This causes clone operations to take longer,
 increases the time taken for CI builds, etc.

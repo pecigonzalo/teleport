@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package teleport
 
@@ -49,6 +51,9 @@ const (
 	// MetricFailedLoginAttempts counts failed login attempts
 	MetricFailedLoginAttempts = "failed_login_attempts_total"
 
+	// MetricConnectToNodeAttempts counts ssh attempts
+	MetricConnectToNodeAttempts = "connect_to_node_attempts_total"
+
 	// MetricFailedConnectToNodeAttempts counts failed ssh attempts
 	MetricFailedConnectToNodeAttempts = "failed_connect_to_node_attempts_total"
 
@@ -79,8 +84,41 @@ const (
 	// MetricMissingSSHTunnels returns the number of missing SSH tunnels for this proxy.
 	MetricMissingSSHTunnels = "proxy_missing_ssh_tunnels"
 
+	// MetricMigrations tracks for each migration if it is active or not.
+	MetricMigrations = "migrations"
+
+	// TagMigration is a metric tag for a migration
+	TagMigration = "migration"
+
+	// MetricIncompleteSessionUploads returns the number of incomplete session uploads
+	MetricIncompleteSessionUploads = "incomplete_session_uploads_total"
+
 	// TagCluster is a metric tag for a cluster
 	TagCluster = "cluster"
+
+	// MetricTotalInstances provides an instance count
+	MetricTotalInstances = "total_instances"
+
+	// MetricEnrolledInUpgrades provides total number of instances that advertise an upgrader.
+	MetricEnrolledInUpgrades = "enrolled_in_upgrades"
+
+	// MetricUpgraderCounts provides instance count per-upgrader.
+	MetricUpgraderCounts = "upgrader_counts"
+
+	// TagUpgrader is a metric tag for upgraders.
+	TagUpgrader = "upgrader"
+
+	// MetricsAccessRequestsCreated provides total number of created access requests.
+	MetricAccessRequestsCreated = "access_requests_created"
+	// TagRoles is a number of roles requested as a part of access request.
+	TagRoles = "roles"
+	// TagResources is a number of resources requested as a part of access request.
+	TagResources = "resources"
+
+	// UserCertificatesCreated provides total number of user certificates generated.
+	MetricUserCertificatesGenerated = "user_certificates_generated"
+	// TagPrivateKeyPolicy is a private key policy associated with a user's certificates.
+	TagPrivateKeyPolicy = "private_key_policy"
 )
 
 const (
@@ -141,8 +179,34 @@ const (
 	// MetricBackendWriteRequests measures backend write requests count
 	MetricBackendWriteRequests = "backend_write_requests_total"
 
+	// MetricBackendWrites tallies all individual backend writes (this is distinct from backend write
+	// requests in that bulk writes count as multiple writes).
+	MetricBackendWrites = "backend_writes_total"
+
 	// MetricBackendWriteFailedRequests measures failed backend write requests count
 	MetricBackendWriteFailedRequests = "backend_write_requests_failed_total"
+
+	// MetricBackendWriteFailedPreconditionRequests measures the portion of failed backend write requests
+	// that failed due to a custom precondition (existence, revision, value, etc).
+	MetricBackendWriteFailedPreconditionRequests = "backend_write_requests_failed_precondition_total"
+
+	// MetricBackendAtomicWriteRequests measures backend atomic write requests count
+	MetricBackendAtomicWriteRequests = "backend_atomic_write_requests_total"
+
+	// MetricBackendAtomicWriteFailedRequests measures failed backend atomic write requests count
+	MetricBackendAtomicWriteFailedRequests = "backend_atomic_write_requests_failed_total"
+
+	// MetricBackendAtomicWriteConditionFailed measures the amount of atomic write requests that result in condition failure.
+	MetricBackendAtomicWriteConditionFailed = "backend_atomic_write_condition_failed_total"
+
+	// MetricBackendAtomicWriteHistogram measures histogram of backend write latencies
+	MetricBackendAtomicWriteHistogram = "backend_atomic_write_seconds"
+
+	// MetricBackendAtomicWriteSize measures the histogram of atomic write batch sizes
+	MetricBackendAtomicWriteSize = "backend_atomic_write_size"
+
+	// MetricBackendAtomicWriteContention counts the amount of times atomic writes experience internal retries due to contention.
+	MetricBackendAtomicWriteContention = "backend_atomic_write_contention"
 
 	// MetricBackendBatchWriteRequests measures batch backend writes count
 	MetricBackendBatchWriteRequests = "backend_batch_write_requests_total"
@@ -152,6 +216,10 @@ const (
 
 	// MetricBackendReadRequests measures backend read requests count
 	MetricBackendReadRequests = "backend_read_requests_total"
+
+	// MetricBackendReads tallies all individual backend reads (this is distinct from backend read
+	// requests in that bulk reads count as multiple reads).
+	MetricBackendReads = "backend_reads_total"
 
 	// MetricBackendFailedReadRequests measures failed backend read requests count
 	MetricBackendFailedReadRequests = "backend_read_requests_failed_total"
@@ -195,8 +263,19 @@ const (
 	// MetricRegisteredServers tracks the number of Teleport servers that have successfully registered with the Teleport cluster and have not reached the end of their ttl
 	MetricRegisteredServers = "registered_servers"
 
+	// MetricRegisteredServersByInstallMethods tracks the number of Teleport servers, and their installation method,
+	// that have successfully registered with the Teleport cluster and have not reached the end of their ttl
+	MetricRegisteredServersByInstallMethods = "registered_servers_by_install_methods"
+
 	// MetricReverseSSHTunnels defines the number of connected SSH reverse tunnels to the proxy
 	MetricReverseSSHTunnels = "reverse_tunnels_connected"
+
+	// MetricHostedPluginStatus tracks the current status
+	// (as defined by types.PluginStatus) for a plugin instance
+	MetricHostedPluginStatus = "hosted_plugin_status"
+
+	// MetricTeleportServices tracks which services are currently running in the current Teleport Process.
+	MetricTeleportServices = "services"
 
 	// TagRange is a tag specifying backend requests
 	TagRange = "range"
@@ -227,4 +306,76 @@ const (
 
 	// TagType is a prometheus label for type of resource or tunnel connected
 	TagType = "type"
+
+	// TagServer is a prometheus label to indicate what server the metric is tied to
+	TagServer = "server"
+
+	// TagClient is a prometheus label to indicate what client the metric is tied to
+	TagClient = "client"
+
+	// TagInstallMethods is a prometheus label to indicate what installation methods
+	// were used for the agent.
+	// This value comes from UpstreamInventoryAgentMetadata (sourced in lib/inventory/metadata.fetchInstallMethods).
+	TagInstallMethods = "install_methods"
+
+	// TagServiceName is the prometheus label to indicate what services are running in the current proxy.
+	// Those services are monitored using the Supervisor.
+	// Only a subset of services are monitored. See [lib/service.metricsServicesRunningMap]
+	// Eg, discovery_service
+	TagServiceName = "service_name"
+
+	// TagAutomaticUpdates is a prometheus label to indicate whether the instance
+	// is enrolled in automatic updates.
+	TagAutomaticUpdates = "automatic_updates"
+)
+
+const (
+	// MetricUsageEventsSubmitted is a count of usage events that have been generated.
+	MetricUsageEventsSubmitted = "usage_events_submitted_total"
+
+	// MetricUsageBatches is a count of batches enqueued for submission.
+	MetricUsageBatches = "usage_batches_total"
+
+	// MetricUsageEventsRequeued is a count of events that were requeued after a
+	// submission failed.
+	MetricUsageEventsRequeued = "usage_events_requeued_total"
+
+	// MetricUsageBatchSubmissionDuration is a histogram of durations it took to
+	// submit a batch.
+	MetricUsageBatchSubmissionDuration = "usage_batch_submission_duration_seconds"
+
+	// MetricUsageBatchesSubmitted is a count of event batches successfully
+	// submitted.
+	MetricUsageBatchesSubmitted = "usage_batch_submitted_total"
+
+	// MetricUsageBatchesFailed is a count of event batches that failed to
+	// submit.
+	MetricUsageBatchesFailed = "usage_batch_failed_total"
+
+	// MetricUsageEventsDropped is a count of events dropped due to the
+	// submission buffer reaching a length limit.
+	MetricUsageEventsDropped = "usage_events_dropped_total"
+)
+
+// athena audit log metrics
+const (
+	// MetricParquetlogConsumerBatchPorcessingDuration is a histogram of durations it
+	// took to process single batch of events.
+	MetricParquetlogConsumerBatchPorcessingDuration = "audit_parquetlog_batch_processing_seconds"
+	// MetricParquetlogConsumerS3FlushDuration is a histogram of durations it took to
+	// flush and close parquet files on s3.
+	MetricParquetlogConsumerS3FlushDuration = "audit_parquetlog_s3_flush_seconds"
+	// MetricParquetlogConsumerDeleteEventsDuration is a histogram of durations it
+	// took to delete events from SQS.
+	MetricParquetlogConsumerDeleteEventsDuration = "audit_parquetlog_delete_events_seconds"
+	// MetricParquetlogConsumerBatchSize is a histogram of sizes of single batch of events.
+	MetricParquetlogConsumerBatchSize = "audit_parquetlog_batch_size"
+	// MetricParquetlogConsumerBatchCount is a count of number of events in single batch.
+	MetricParquetlogConsumerBatchCount = "audit_parquetlog_batch_count"
+	// MetricParquetlogConsumerLastProcessedTimestamp is a timestamp of last finished consumer execution.
+	MetricParquetlogConsumerLastProcessedTimestamp = "audit_parquetlog_last_processed_timestamp"
+	// MetricParquetlogConsumerOldestProcessedMessage is age of oldest processed message.
+	MetricParquetlogConsumerOldestProcessedMessage = "audit_parquetlog_age_oldest_processed_message"
+	// MetricAthenaConsumerCollectFailed is a count of number of errors received from sqs collect.
+	MetricParquetlogConsumerCollectFailed = "audit_parquetlog_errors_from_collect_count"
 )
